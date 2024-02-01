@@ -1,24 +1,66 @@
 const std = @import("std");
+const net = std.net;
+const testing = std.testing;
 
-pub fn main() !void {
-    // Prints to stderr (it's a shortcut based on `std.io.getStdErr()`)
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
+const client_msg = "Hello";
+const server_msg = "Good Bye";
 
-    // stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    const stdout_file = std.io.getStdOut().writer();
-    var bw = std.io.bufferedWriter(stdout_file);
-    const stdout = bw.writer();
+const Server = struct {
+    stream_server: net.StreamServer,
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+    pub fn init() !Server {
+        const address = net.Address.initIp4([4]u8{ 127, 0, 0, 1 }, 8080);
+        var server = net.StreamServer.init(.{ .reuse_address = true });
+        try server.listen(address);
 
-    try bw.flush(); // don't forget to flush!
+        return Server{ .stream_server = server };
+    }
+
+    pub fn deinit(self: *Server) void {
+        self.stream_server.deinit();
+    }
+
+    pub fn accept(self: *Server) !void {
+        // accepting incoming client connection
+        const conn = try self.stream_server.accept();
+        defer conn.stream.close();
+
+        // initialize a buffer to keep the client message
+        var buf: [1024]u8 = undefined;
+        const msg_size = try conn.stream.read(buf[0..]);
+
+        // assert client message is "Hello"
+        try testing.expectEqualSlices(u8, client_msg, buf[0..msg_size]);
+
+        // send "Good Bye" to client
+        _ = try conn.stream.write(server_msg);
+    }
+};
+
+fn sendMsgToServer(server_address: net.Address) !void {
+    // connect to server
+    const conn = try net.tcpConnectToAddress(server_address);
+    defer conn.close();
+
+    // send "Hello" to client
+    _ = try conn.write(client_msg);
+
+    // initialize a buffer to keep the server response
+    var buf: [1024]u8 = undefined;
+    const resp_size = try conn.read(buf[0..]);
+
+    // assert server response is "Good Bye"
+    try testing.expectEqualSlices(u8, server_msg, buf[0..resp_size]);
 }
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+pub fn main() !void {
+    var server = try Server.init();
+    defer server.deinit();
+
+    // spawn a new client thread to send "Hello"
+    const client_thread = try std.Thread.spawn(.{}, sendMsgToServer, .{server.stream_server.listen_address});
+    defer client_thread.join();
+
+    // accept incoming connection
+    try server.accept();
 }
