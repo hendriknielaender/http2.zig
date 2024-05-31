@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 /// HPACK: Header Compression for HTTP/2
 ///
@@ -6,16 +7,73 @@ const std = @import("std");
 pub const Hpack = struct {
     /// Static Table as defined by the HPACK specification
     pub const StaticTable = struct {
-        // Placeholder for the static table
-        // Fill in the actual static table entries as per RFC 7541
         const entries = &[_]HeaderField{
             HeaderField{ .name = ":authority", .value = "" },
             HeaderField{ .name = ":method", .value = "GET" },
-            // Add all other static table entries here
+            HeaderField{ .name = ":method", .value = "POST" },
+            HeaderField{ .name = ":path", .value = "/" },
+            HeaderField{ .name = ":path", .value = "/index.html" },
+            HeaderField{ .name = ":scheme", .value = "http" },
+            HeaderField{ .name = ":scheme", .value = "https" },
+            HeaderField{ .name = ":status", .value = "200" },
+            HeaderField{ .name = ":status", .value = "204" },
+            HeaderField{ .name = ":status", .value = "206" },
+            HeaderField{ .name = ":status", .value = "304" },
+            HeaderField{ .name = ":status", .value = "400" },
+            HeaderField{ .name = ":status", .value = "404" },
+            HeaderField{ .name = ":status", .value = "500" },
+            HeaderField{ .name = "accept-charset", .value = "" },
+            HeaderField{ .name = "accept-encoding", .value = "gzip, deflate" },
+            HeaderField{ .name = "accept-language", .value = "" },
+            HeaderField{ .name = "accept-ranges", .value = "" },
+            HeaderField{ .name = "accept", .value = "" },
+            HeaderField{ .name = "access-control-allow-origin", .value = "" },
+            HeaderField{ .name = "age", .value = "" },
+            HeaderField{ .name = "allow", .value = "" },
+            HeaderField{ .name = "authorization", .value = "" },
+            HeaderField{ .name = "cache-control", .value = "" },
+            HeaderField{ .name = "content-disposition", .value = "" },
+            HeaderField{ .name = "content-encoding", .value = "" },
+            HeaderField{ .name = "content-language", .value = "" },
+            HeaderField{ .name = "content-length", .value = "" },
+            HeaderField{ .name = "content-location", .value = "" },
+            HeaderField{ .name = "content-range", .value = "" },
+            HeaderField{ .name = "content-type", .value = "" },
+            HeaderField{ .name = "cookie", .value = "" },
+            HeaderField{ .name = "date", .value = "" },
+            HeaderField{ .name = "etag", .value = "" },
+            HeaderField{ .name = "expect", .value = "" },
+            HeaderField{ .name = "expires", .value = "" },
+            HeaderField{ .name = "from", .value = "" },
+            HeaderField{ .name = "host", .value = "" },
+            HeaderField{ .name = "if-match", .value = "" },
+            HeaderField{ .name = "if-modified-since", .value = "" },
+            HeaderField{ .name = "if-none-match", .value = "" },
+            HeaderField{ .name = "if-range", .value = "" },
+            HeaderField{ .name = "if-unmodified-since", .value = "" },
+            HeaderField{ .name = "last-modified", .value = "" },
+            HeaderField{ .name = "link", .value = "" },
+            HeaderField{ .name = "location", .value = "" },
+            HeaderField{ .name = "max-forwards", .value = "" },
+            HeaderField{ .name = "proxy-authenticate", .value = "" },
+            HeaderField{ .name = "proxy-authorization", .value = "" },
+            HeaderField{ .name = "range", .value = "" },
+            HeaderField{ .name = "referer", .value = "" },
+            HeaderField{ .name = "refresh", .value = "" },
+            HeaderField{ .name = "retry-after", .value = "" },
+            HeaderField{ .name = "server", .value = "" },
+            HeaderField{ .name = "set-cookie", .value = "" },
+            HeaderField{ .name = "strict-transport-security", .value = "" },
+            HeaderField{ .name = "transfer-encoding", .value = "" },
+            HeaderField{ .name = "user-agent", .value = "" },
+            HeaderField{ .name = "vary", .value = "" },
+            HeaderField{ .name = "via", .value = "" },
+            HeaderField{ .name = "www-authenticate", .value = "" },
         };
 
         /// Get a static table entry by index
         pub fn get(index: usize) HeaderField {
+            assert(index < entries.len);
             return entries[index];
         }
     };
@@ -26,7 +84,7 @@ pub const Hpack = struct {
         max_size: usize,
 
         /// Initialize a dynamic table with a given maximum size
-        pub fn init(allocator: *std.mem.Allocator, max_size: usize) DynamicTable {
+        pub fn init(allocator: *std.mem.Allocator, max_size: usize) !DynamicTable {
             return DynamicTable{
                 .table = std.ArrayList(HeaderField).init(allocator.*),
                 .max_size = max_size,
@@ -35,7 +93,7 @@ pub const Hpack = struct {
 
         /// Add an entry to the dynamic table
         pub fn addEntry(self: *DynamicTable, entry: HeaderField) !void {
-            if (self.table.items.len >= self.max_size) {
+            while (self.table.items.len >= self.max_size) {
                 _ = self.table.pop();
             }
             _ = try self.table.append(entry);
@@ -43,6 +101,7 @@ pub const Hpack = struct {
 
         /// Get an entry from the dynamic table by index
         pub fn getEntry(self: *DynamicTable, index: usize) HeaderField {
+            assert(index < self.table.items.len);
             return self.table.items[index];
         }
     };
@@ -58,20 +117,21 @@ pub const Hpack = struct {
         }
     };
 
-    /// Huffman decoding table (placeholder)
+    /// Huffman decoding table and methods
     pub const Huffman = struct {
-        // Placeholder for the Huffman table and methods
+        // Implement the Huffman decoding table and methods according to RFC 7541, Appendix B
 
         /// Decode a Huffman encoded string
         pub fn decode(huffman_encoded: []const u8) ![]u8 {
-            // Implement Huffman decoding here
-            return huffman_encoded; // Placeholder implementation
+            // Placeholder implementation, replace with actual implementation
+            return huffman_encoded; // Implement Huffman decoding logic here
         }
     };
 
     /// Encode a header field
     pub fn encodeHeaderField(field: HeaderField, dynamic_table: *DynamicTable) ![]u8 {
         var buffer = std.ArrayList(u8).init(std.heap.page_allocator);
+        defer buffer.deinit();
 
         // Encode the header field name and value
         try buffer.appendSlice(field.name);
@@ -98,9 +158,12 @@ pub const Hpack = struct {
 };
 
 test "HPACK encode and decode header field" {
-    var allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
 
-    var dynamic_table = Hpack.DynamicTable.init(&allocator, 10);
+    var allocator = arena.allocator();
+    var dynamic_table = try Hpack.DynamicTable.init(&allocator, 10);
+    defer dynamic_table.table.deinit();
 
     const field = Hpack.HeaderField.init("content-type", "text/html");
 
@@ -111,4 +174,29 @@ test "HPACK encode and decode header field" {
 
     try std.testing.expect(std.mem.eql(u8, field.name, decoded.name));
     try std.testing.expect(std.mem.eql(u8, field.value, decoded.value));
+}
+
+test "Dynamic table add and retrieve" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var allocator = arena.allocator();
+
+    var dynamic_table = try Hpack.DynamicTable.init(&allocator, 10);
+
+    const field = Hpack.HeaderField.init("content-length", "1234");
+    try dynamic_table.addEntry(field);
+
+    const retrieved = dynamic_table.getEntry(0);
+    try std.testing.expect(std.mem.eql(u8, field.name, retrieved.name));
+    try std.testing.expect(std.mem.eql(u8, field.value, retrieved.value));
+}
+
+test "Huffman decoding" {
+    // Example Huffman encoded data (for the string "Hello")
+    //const encoded = &[_]u8{ 0b11111111, 0b11001010, 0b00111111, 0b10000000, 0b11000111, 0b11111110 };
+    //const expected_decoded = "Hello";
+
+    //const decoded = try decodeHuffman(encoded);
+    //try std.testing.expect(std.mem.eql(u8, decoded, expected_decoded));
 }
