@@ -3,6 +3,10 @@ const assert = std.debug.assert;
 
 const http2_preface: []const u8 = "\x50\x52\x49\x20\x2A\x20\x48\x54\x54\x50\x2F\x32\x2E\x30\x0D\x0A\x0D\x0A\x53\x4D\x0D\x0A\x0D\x0A";
 
+/// Represents an HTTP/2 Connection
+///
+/// @param ReaderType - The type of the reader to use for reading from the connection
+/// @param WriterType - The type of the writer to use for writing to the connection
 pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
     return struct {
         allocator: *std.mem.Allocator,
@@ -11,6 +15,13 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         is_server: bool,
         settings: Settings,
 
+        /// Initializes a new HTTP/2 connection
+        ///
+        /// @param allocator - The allocator to use for memory management
+        /// @param reader - The reader to use for the connection
+        /// @param writer - The writer to use for the connection
+        /// @param is_server - Indicates if the connection is server-side
+        /// @return - A new instance of the connection
         pub fn init(allocator: *std.mem.Allocator, reader: ReaderType, writer: WriterType, is_server: bool) !@This() {
             const self = @This(){
                 .allocator = allocator,
@@ -27,10 +38,17 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             return self;
         }
 
+        /// Sends the HTTP/2 connection preface
+        ///
+        /// This method is called during initialization for client-side connections to
+        /// send the HTTP/2 connection preface.
         fn sendPreface(self: @This()) !void {
             try self.writer.writeAll(http2_preface);
         }
 
+        /// Sends the HTTP/2 settings frame
+        ///
+        /// This method serializes and sends the settings frame containing the HTTP/2 settings.
         fn sendSettings(self: @This()) !void {
             const settings = [_][2]u32{
                 .{ 1, self.settings.header_table_size },
@@ -49,6 +67,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
         }
 
+        /// Receives and processes the HTTP/2 settings frame
+        ///
+        /// This method reads the settings frame from the connection and applies the settings.
         pub fn receiveSettings(self: @This()) !void {
             const settings_frame_header_size = 9;
             var frame_header: [settings_frame_header_size]u8 = undefined;
@@ -74,6 +95,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
         }
 
+        /// Closes the HTTP/2 connection by sending a GOAWAY frame
+        ///
+        /// This method is called to gracefully close the connection by sending a GOAWAY frame.
         fn close(self: @This()) !void {
             var goaway_frame: [17]u8 = undefined;
             std.mem.writeInt(u24, goaway_frame[0..3], 8, .big);
@@ -86,6 +110,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
     };
 }
 
+/// Represents the HTTP/2 settings
 const Settings = struct {
     header_table_size: u32 = 4096,
     enable_push: bool = true,
@@ -94,6 +119,9 @@ const Settings = struct {
     max_frame_size: u32 = 16384,
     max_header_list_size: u32 = 8192,
 
+    /// Returns the default HTTP/2 settings
+    ///
+    /// @return - An instance of Settings with default values
     pub fn default() Settings {
         return Settings{};
     }
