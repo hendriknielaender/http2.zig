@@ -1,7 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const Huffman = struct {
+pub const Huffman = struct {
     // Huffman code table as defined in RFC 7541, Appendix B
     const HuffmanEntry = struct {
         symbol: union(enum) { byte: u8, eos: void },
@@ -291,12 +291,14 @@ const Huffman = struct {
         }
 
         if (bit_count > 0) {
-            const cast_buffer: u8 = @intCast(bit_buffer >> 56);
-            try encoded.append(cast_buffer);
+            // Add the remaining bits to the output
+            const remaining_bits = bit_buffer >> @intCast(64 - bit_count);
+            const remaining_byte: u8 = @truncate(remaining_bits << @intCast(8 - bit_count % 8));
+            try encoded.append(remaining_byte);
         }
 
         const result = encoded.toOwnedSlice();
-        //std.debug.print("Encoded: {any}\n", .{result});
+        //std.debug.print("Encoded result: {any}\n", .{result});
         return result;
     }
 
@@ -314,7 +316,6 @@ const Huffman = struct {
             while (bit_count >= 5) {
                 var matched = false;
 
-                // Attempt to match short codes first (5 to 7 bits)
                 if (bit_count >= 5) {
                     const short_code: u32 = @truncate(bit_buffer >> @intCast(bit_count - 5));
                     if (short_code < 32) {
@@ -330,7 +331,6 @@ const Huffman = struct {
                     }
                 }
 
-                // Attempt to match longer codes
                 if (!matched) {
                     for (huffmanTable) |entry| {
                         if (entry.bits <= bit_count) {
@@ -352,23 +352,16 @@ const Huffman = struct {
             }
         }
 
-        // Ensure proper handling of any remaining bits (EOS symbol handling)
-        if (bit_count > 0) {
-            for (huffmanTable) |entry| {
-                if (entry.bits == bit_count) {
-                    const bits: u32 = @truncate(bit_buffer);
-                    if (bits == entry.code) {
-                        if (entry.symbol == .eos) break;
-                        try decoded.append(entry.symbol.byte);
-                        break;
-                    }
-                }
-            }
-        }
-
         const result = decoded.toOwnedSlice();
-        //std.debug.print("Decoded: {any}\n", .{result});
+        //std.debug.print("Decoded result: {any}\n", .{result});
         return result;
+    }
+
+    fn findHuffmanEntry(byte: u8) !HuffmanEntry {
+        for (huffmanTable) |entry| {
+            if (entry.symbol == .byte and entry.symbol.byte == byte) return entry;
+        }
+        return error.InvalidInput;
     }
 
     fn decodeHuffmanSymbol(bits: u32) ?HuffmanEntry {
@@ -379,13 +372,6 @@ const Huffman = struct {
             }
         }
         return null;
-    }
-
-    fn findHuffmanEntry(byte: u8) !HuffmanEntry {
-        for (huffmanTable) |entry| {
-            if (entry.symbol == .byte and entry.symbol.byte == byte) return entry;
-        }
-        return error.InvalidInput;
     }
 };
 
