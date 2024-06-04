@@ -353,7 +353,6 @@ pub const Huffman = struct {
         }
 
         const result = decoded.toOwnedSlice();
-        //std.debug.print("Decoded result: {any}\n", .{result});
         return result;
     }
 
@@ -385,7 +384,6 @@ test "Huffman encoding and decoding" {
     const decoded = try Huffman.decode(encoded, &allocator);
     defer allocator.free(decoded);
 
-    // Compare contents directly
     try std.testing.expect(std.mem.eql(u8, decoded, input));
 }
 
@@ -406,7 +404,6 @@ test "Huffman encode decode consistency" {
         const decoded = try Huffman.decode(encoded, &allocator);
         defer allocator.free(decoded);
 
-        // Compare contents directly
         try std.testing.expect(std.mem.eql(u8, decoded, input));
     }
 }
