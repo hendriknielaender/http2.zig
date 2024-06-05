@@ -124,16 +124,12 @@ pub const Hpack = struct {
         var buffer = std.ArrayList(u8).init(allocator);
         defer buffer.deinit();
 
-        std.debug.print("Encoding field: name={s}, value={s}\n", .{ field.name, field.value });
-
         // Huffman encode the header field name and value
         const encoded_name = try huffman.encode(field.name, &allocator);
         defer allocator.free(encoded_name);
-        std.debug.print("Encoded name (raw): {any}\n", .{encoded_name});
 
         const encoded_value = try huffman.encode(field.value, &allocator);
         defer allocator.free(encoded_value);
-        std.debug.print("Encoded value (raw): {any}\n", .{encoded_value});
 
         // Encode the header field name and value
         try buffer.appendSlice(encoded_name);
@@ -144,7 +140,6 @@ pub const Hpack = struct {
         try dynamic_table.addEntry(field);
 
         const encoded_field = buffer.toOwnedSlice();
-        std.debug.print("Encoded field: {any}\n", .{encoded_field});
         return encoded_field;
     }
 
