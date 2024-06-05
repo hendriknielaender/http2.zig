@@ -146,11 +146,7 @@ pub const Hpack = struct {
     pub fn decodeHeaderField(encoded: []const u8, dynamic_table: *DynamicTable) !HeaderField {
         var allocator = std.heap.page_allocator;
 
-        std.debug.print("Decoding encoded field: {any}\n", .{encoded});
-
         const name_end_index = std.mem.indexOfScalar(u8, encoded, 0x3A) orelse return error.InvalidEncoding;
-        std.debug.print("Name end index: {d}\n", .{name_end_index});
-
         if (name_end_index == 0 or name_end_index >= encoded.len - 1) {
             return error.InvalidEncoding;
         }
