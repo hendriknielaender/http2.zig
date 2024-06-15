@@ -17,7 +17,7 @@ pub const StreamState = enum {
 pub const Stream = struct {
     id: u31,
     state: StreamState,
-    conn: *Connection,
+    conn: *Connection(@TypeOf(std.io.fixedBufferStream(&[_]u8{}).reader()), @TypeOf(std.io.fixedBufferStream(&[_]u8{}).writer())),
     recv_window_size: i32,
     send_window_size: i32,
     recv_headers: std.ArrayList(u8),
@@ -26,17 +26,17 @@ pub const Stream = struct {
     send_data: std.ArrayList(u8),
 
     /// Initializes a new stream
-    pub fn init(allocator: *std.mem.Allocator, conn: *Connection, id: u31) !Stream {
+    pub fn init(allocator: *std.mem.Allocator, conn: *Connection(@TypeOf(std.io.fixedBufferStream(&[_]u8{}).reader()), @TypeOf(std.io.fixedBufferStream(&[_]u8{}).writer())), id: u31) !Stream {
         return Stream{
             .id = id,
             .state = .Idle,
             .conn = conn,
             .recv_window_size = 65535, // Default initial window size
             .send_window_size = 65535, // Default initial window size
-            .recv_headers = try std.ArrayList(u8).init(allocator),
-            .send_headers = try std.ArrayList(u8).init(allocator),
-            .recv_data = try std.ArrayList(u8).init(allocator),
-            .send_data = try std.ArrayList(u8).init(allocator),
+            .recv_headers = std.ArrayList(u8).init(allocator),
+            .send_headers = std.ArrayList(u8).init(allocator),
+            .recv_data = std.ArrayList(u8).init(allocator),
+            .send_data = std.ArrayList(u8).init(allocator),
         };
     }
 
@@ -135,11 +135,13 @@ test "create and handle stream" {
     const reader = buffer_stream.reader();
     const writer = buffer_stream.writer();
 
+    // Define the correct Connection type with reader and writer
     const ConnectionType = Connection(@TypeOf(reader), @TypeOf(writer));
-    var allocator = arena.allocator();
-    const conn = try ConnectionType.init(&allocator, reader, writer, false);
 
-    var stream = try Stream.init(&allocator, conn, 1);
+    var allocator = arena.allocator();
+    var conn = try ConnectionType.init(&allocator, reader, writer, false);
+
+    var stream = try Stream.init(&allocator, &conn, 1);
 
     // Simulate receiving a headers frame
     const headers_frame = Frame{
