@@ -3,6 +3,13 @@
 </h1>
 
 <div align="center">A HTTP/2 Zig library according to the HTTP/2 RFCs.</div>
+<div align="center">
+   
+[![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
+![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/hendriknielaender/http2.zig)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/CONTRIBUTING.md)
+
+</div>
 
 ## Features
 
