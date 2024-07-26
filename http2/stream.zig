@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const Frame = @import("frame.zig").Frame;
 const FrameHeader = @import("frame.zig").FrameHeader;
 const FrameType = @import("frame.zig").FrameType;
+const FrameFlags = @import("frame.zig").FrameFlags;
 const Connection = @import("connection.zig").Connection;
 
 pub const StreamState = enum {
@@ -17,7 +18,7 @@ pub const StreamState = enum {
 pub const Stream = struct {
     id: u31,
     state: StreamState,
-    conn: *Connection(@TypeOf(std.io.fixedBufferStream(&[_]u8{}).reader()), @TypeOf(std.io.fixedBufferStream(&[_]u8{}).writer())),
+    conn: *Connection(std.io.AnyReader, std.io.AnyWriter),
     recv_window_size: i32,
     send_window_size: i32,
     recv_headers: std.ArrayList(u8),
@@ -25,18 +26,17 @@ pub const Stream = struct {
     recv_data: std.ArrayList(u8),
     send_data: std.ArrayList(u8),
 
-    /// Initializes a new stream
-    pub fn init(allocator: *std.mem.Allocator, conn: *Connection(@TypeOf(std.io.fixedBufferStream(&[_]u8{}).reader()), @TypeOf(std.io.fixedBufferStream(&[_]u8{}).writer())), id: u31) !Stream {
+    pub fn init(allocator: *std.mem.Allocator, conn: *Connection(std.io.AnyReader, std.io.AnyWriter), id: u31) !Stream {
         return Stream{
             .id = id,
             .state = .Idle,
             .conn = conn,
             .recv_window_size = 65535, // Default initial window size
             .send_window_size = 65535, // Default initial window size
-            .recv_headers = std.ArrayList(u8).init(allocator),
-            .send_headers = std.ArrayList(u8).init(allocator),
-            .recv_data = std.ArrayList(u8).init(allocator),
-            .send_data = std.ArrayList(u8).init(allocator),
+            .recv_headers = std.ArrayList(u8).init(allocator.*),
+            .send_headers = std.ArrayList(u8).init(allocator.*),
+            .recv_data = std.ArrayList(u8).init(allocator.*),
+            .send_data = std.ArrayList(u8).init(allocator.*),
         };
     }
 
@@ -126,41 +126,39 @@ pub const Stream = struct {
 };
 
 test "create and handle stream" {
-    const testing = std.testing;
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     var buffer: [4096]u8 = undefined;
     var buffer_stream = std.io.fixedBufferStream(&buffer);
-    const reader = buffer_stream.reader();
-    const writer = buffer_stream.writer();
 
-    // Define the correct Connection type with reader and writer
+    const reader = buffer_stream.reader().any();
+    const writer = buffer_stream.writer().any();
+
     const ConnectionType = Connection(@TypeOf(reader), @TypeOf(writer));
-
     var allocator = arena.allocator();
     var conn = try ConnectionType.init(&allocator, reader, writer, false);
 
     var stream = try Stream.init(&allocator, &conn, 1);
 
-    // Simulate receiving a headers frame
+    // Manually set the flags value for the end_headers flag
+    const end_headers_flag: u8 = 0x4; // Assuming 0x4 represents END_HEADERS
     const headers_frame = Frame{
         .header = FrameHeader{
             .length = 16,
             .frame_type = .HEADERS,
-            .flags = .{ .end_headers = true },
+            .flags = FrameFlags.init(end_headers_flag),
+            .reserved = false,
             .stream_id = 1,
         },
         .payload = &[_]u8{ 0x82, 0x86, 0x44, 0x89 }, // Example header block
     };
     try stream.handleFrame(headers_frame);
-    try testing.expectEqual(@as(usize, 4), stream.recv_headers.items.len);
+    try std.testing.expectEqual(@as(usize, 4), stream.recv_headers.items.len);
 
-    // Simulate sending data
     const data = "Hello, world!";
     try stream.sendData(data);
 
-    // Ensure data is written to the connection
     const writtenData = buffer_stream.getWritten();
-    try testing.expect(writtenData.len > 0);
+    try std.testing.expect(writtenData.len > 0);
 }
