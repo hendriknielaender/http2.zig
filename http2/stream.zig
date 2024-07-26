@@ -46,7 +46,7 @@ pub const Stream = struct {
             FrameType.HEADERS => try self.handleHeaders(frame),
             FrameType.DATA => try self.handleData(frame),
             FrameType.WINDOW_UPDATE => try self.handleWindowUpdate(frame),
-            FrameType.RST_STREAM => try self.handleRstStream(frame),
+            FrameType.RST_STREAM => try self.handleRstStream(),
             else => {},
         }
     }
@@ -56,7 +56,7 @@ pub const Stream = struct {
             self.state = .Open;
         }
         try self.recv_headers.appendSlice(frame.payload);
-        if (frame.header.flags.end_stream) {
+        if (frame.header.flags.isEndStream()) {
             self.state = .HalfClosedRemote;
         }
     }
@@ -70,15 +70,28 @@ pub const Stream = struct {
         if (self.recv_window_size < 0) {
             return error.FlowControlError;
         }
-        if (frame.header.flags.end_stream) {
+        if (frame.header.flags.isEndStream()) {
             self.state = .HalfClosedRemote;
         }
     }
 
     fn handleWindowUpdate(self: *Stream, frame: Frame) !void {
-        const increment = std.mem.readInt(u31, frame.payload, .big);
+        // Ensure the payload is at least 4 bytes long
+        if (frame.payload.len < 4) {
+            return error.InvalidFrameSize;
+        }
+
+        // Read the first 4 bytes as a u32, assuming the data is in big-endian order
+        const pay: *const [4]u8 = @ptrCast(frame.payload[0..4]);
+        const increment = std.mem.readInt(u32, pay, .big);
+
+        // Ensure the increment does not exceed the u31 limit
+        if (increment > 0x7FFFFFFF) {
+            return error.FlowControlError;
+        }
+
         self.send_window_size += @intCast(increment);
-        if (self.send_window_size > 2147483647) {
+        if (self.send_window_size > 2147483647) { // u31 maximum value
             return error.FlowControlError;
         }
     }
@@ -97,15 +110,25 @@ pub const Stream = struct {
         }
         try self.send_data.appendSlice(data);
         self.send_window_size -= @intCast(data.len);
-        const frame = Frame{
+
+        var flags = FrameFlags.init(0); // Initialize with no flags
+
+        // Condition to set the END_STREAM flag
+        if (self.send_data.items.len == data.len) { // This is the last data chunk
+            flags.setEndStream();
+        }
+
+        var frame = Frame{
             .header = FrameHeader{
                 .length = @intCast(data.len),
                 .frame_type = .DATA,
-                .flags = .{ .end_stream = false }, // Set appropriately
+                .flags = flags,
+                .reserved = false,
                 .stream_id = self.id,
             },
             .payload = data,
         };
+
         try frame.write(self.conn.writer);
     }
 
