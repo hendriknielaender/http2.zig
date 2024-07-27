@@ -1,86 +1,107 @@
 const std = @import("std");
 
-const Frame = @import("frame.zig").Frame;
-const FrameHeader = @import("frame.zig").FrameHeader;
-const FrameType = @import("frame.zig").FrameType;
-const FrameFlags = @import("frame.zig").FrameFlags;
-const Hpack = @import("hpack.zig").Hpack;
+// Import generated BoringSSL bindings
+const boringssl = @import("boringssl/boringssl-bindings.zig");
 
-const openssl = @cImport({
-    @cInclude("boringssl/ssl.h");
-    @cInclude("boringssl/err.h");
-});
+pub const TlsError = error{
+    InitFailed,
+    HandshakeFailed,
+    WriteFailed,
+    ReadFailed,
+    InvalidContext,
+    InvalidSocket,
+};
 
 pub const TlsContext = struct {
+    ctx: ?*boringssl.SSL_CTX,
+    ssl: ?*boringssl.SSL,
     allocator: *std.mem.Allocator,
-    // Other necessary fields for the TLS context
 
-    pub fn init(allocator: *std.mem.Allocator) TlsContext {
+    pub fn init(allocator: *std.mem.Allocator) !TlsContext {
+        boringssl.SSL_library_init();
+        boringssl.SSL_load_error_strings();
+
+        const method = boringssl.SSLv23_method();
+        if (method == null) return TlsError.InitFailed;
+
+        const ctx = boringssl.SSL_CTX_new(method);
+        if (ctx == null) return TlsError.InitFailed;
+
         return TlsContext{
+            .ctx = ctx,
+            .ssl = null,
             .allocator = allocator,
-            // Initialize other fields as necessary
         };
     }
 
-    pub fn performHandshake(self: *TlsContext, conn: anytype) !void {
-        // Implement the TLS handshake logic
-        // This involves sending and receiving handshake frames
-        // Example: sending ClientHello, receiving ServerHello, etc.
-        // The actual implementation will require detailed cryptographic operations
+    pub fn connect(self: *TlsContext, fd: std.os.fd_t) !void {
+        if (fd == std.os.invalid_fd) return TlsError.InvalidSocket;
 
-        var frame = Frame{
-            .header = FrameHeader{
-                .length = 0,
-                .frame_type = FrameType.SETTINGS,
-                .flags = FrameFlags.init(0),
-                .reserved = false,
-                .stream_id = 0,
-            },
-            .payload = &[_]u8{},
-        };
+        self.ssl = boringssl.SSL_new(self.ctx);
+        if (self.ssl == null) return TlsError.InvalidContext;
 
-        // This is a placeholder. In a real scenario, you would implement
-        // the handshake process, which involves exchanging cryptographic data.
-        try frame.write(conn.writer);
+        if (boringssl.SSL_set_fd(self.ssl, @intCast(fd)) == 0) {
+            return TlsError.InvalidContext;
+        }
+
+        if (boringssl.SSL_connect(self.ssl) != 1) {
+            return TlsError.HandshakeFailed;
+        }
     }
 
-    pub fn encrypt(self: *TlsContext, plaintext: []const u8) ![]u8 {
-        // Encrypt the plaintext data using the session key
-        // Actual encryption logic will depend on the cryptographic library used
-        var buffer = try self.allocator.alloc(u8, plaintext.len);
-        std.mem.copy(u8, buffer, plaintext);
-        return buffer; // This should be the ciphertext in a real implementation
+    pub fn write(self: *TlsContext, data: []const u8) !void {
+        if (self.ssl == null) return TlsError.InvalidContext;
+        if (boringssl.SSL_write(self.ssl, data.ptr, @intCast(data.len)) <= 0) {
+            return TlsError.WriteFailed;
+        }
     }
 
-    pub fn decrypt(self: *TlsContext, ciphertext: []const u8) ![]u8 {
-        // Decrypt the ciphertext data using the session key
-        // Actual decryption logic will depend on the cryptographic library used
-        var buffer = try self.allocator.alloc(u8, ciphertext.len);
-        std.mem.copy(u8, buffer, ciphertext);
-        return buffer; // This should be the plaintext in a real implementation
+    pub fn read(self: *TlsContext, buffer: []u8) !usize {
+        if (self.ssl == null) return TlsError.InvalidContext;
+        const ret = boringssl.SSL_read(self.ssl, buffer.ptr, @intCast(buffer.len));
+        if (ret <= 0) return TlsError.ReadFailed;
+        return @intCast(ret);
     }
 
     pub fn deinit(self: *TlsContext) void {
-        // Clean up the context, zero out sensitive data
-        // Make sure to securely wipe any sensitive data
+        if (self.ssl) |ssl| {
+            boringssl.SSL_free(ssl);
+        }
+        if (self.ctx) |ctx| {
+            boringssl.SSL_CTX_free(ctx);
+        }
     }
 };
 
+// Unit test for TLS context initialization and data transmission
 test "TLS context initialization and encryption/decryption" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     var allocator = arena.allocator();
 
-    var ctx = TlsContext.init(&allocator);
+    var ctx = try TlsContext.init(&allocator);
     defer ctx.deinit();
 
-    const plaintext = "Hello, TLS!";
-    const encrypted = try ctx.encrypt(plaintext);
-    defer allocator.free(encrypted);
+    // Test environment setup - connect to a test server
+    // For actual tests, a local TLS server or a mock server is required
+    const server_address = "127.0.0.1";
+    const server_port = 4433;
+    const addr = try std.net.Address.parseIp(server_address, server_port);
+    var conn = try std.net.tcpConnect(addr);
+    defer conn.close();
 
-    const decrypted = try ctx.decrypt(encrypted);
-    defer allocator.free(decrypted);
+    try ctx.connect(conn.handle);
 
-    try std.testing.expect(std.mem.eql(u8, plaintext, decrypted));
+    // Test writing data
+    const message = "Hello, secure world!";
+    try ctx.write(message);
+
+    // Test reading data
+    var buffer: [1024]u8 = undefined;
+    const len = try ctx.read(&buffer);
+    const response = buffer[0..len];
+    std.debug.print("Received: {s}\n", .{response});
+
+    try std.testing.expect(response.len > 0);
 }

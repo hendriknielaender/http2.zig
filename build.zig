@@ -19,8 +19,6 @@ pub fn build(b: *std.Build) void {
 
     const lib = b.addStaticLibrary(.{
         .name = "http2.zig",
-        // In this case the main source file is merely a path, however, in more
-        // complicated build scripts, this could be a generated file.
         .root_source_file = b.path("http2.zig"),
         .target = target,
         .optimize = optimize,
@@ -32,7 +30,7 @@ pub fn build(b: *std.Build) void {
     lib.linkSystemLibrary("ssl");
     lib.linkSystemLibrary("crypto");
 
-    lib.addIncludePath(b.path("boringssl/include"));
+    lib.addIncludePath(b.path("boringssl/include/openssl"));
 
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
