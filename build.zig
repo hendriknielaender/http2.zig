@@ -42,6 +42,14 @@ pub fn build(b: *std.Build) void {
 
     const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
 
+    lib_unit_tests.linkLibC();
+
+    // Link OpenSSL libraries
+    lib_unit_tests.linkSystemLibrary("ssl");
+    lib_unit_tests.linkSystemLibrary("crypto");
+
+    lib_unit_tests.addIncludePath(b.path("boringssl/include/openssl"));
+
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
     // running the unit tests.

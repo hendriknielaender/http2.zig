@@ -18,8 +18,8 @@ pub const TlsContext = struct {
     allocator: *std.mem.Allocator,
 
     pub fn init(allocator: *std.mem.Allocator) !TlsContext {
-        boringssl.SSL_library_init();
-        boringssl.SSL_load_error_strings();
+        _ = boringssl.SSL_library_init();
+        _ = boringssl.SSL_load_error_strings();
 
         const method = boringssl.SSLv23_method();
         if (method == null) return TlsError.InitFailed;
@@ -34,8 +34,8 @@ pub const TlsContext = struct {
         };
     }
 
-    pub fn connect(self: *TlsContext, fd: std.os.fd_t) !void {
-        if (fd == std.os.invalid_fd) return TlsError.InvalidSocket;
+    pub fn connect(self: *TlsContext, fd: c_int) !void {
+        if (fd == -1) return TlsError.InvalidSocket;
 
         self.ssl = boringssl.SSL_new(self.ctx);
         if (self.ssl == null) return TlsError.InvalidContext;
@@ -88,7 +88,7 @@ test "TLS context initialization and encryption/decryption" {
     const server_address = "127.0.0.1";
     const server_port = 4433;
     const addr = try std.net.Address.parseIp(server_address, server_port);
-    var conn = try std.net.tcpConnect(addr);
+    var conn = try std.net.tcpConnectToAddress(addr);
     defer conn.close();
 
     try ctx.connect(conn.handle);
