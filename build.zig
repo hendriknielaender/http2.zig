@@ -28,6 +28,12 @@ pub fn build(b: *std.Build) void {
 
     lib.linkLibC();
 
+    // Link OpenSSL libraries
+    lib.linkSystemLibrary("ssl");
+    lib.linkSystemLibrary("crypto");
+
+    lib.addIncludePath(b.path("boringssl/include"));
+
     // Creates a step for unit testing. This only builds the test executable
     // but does not run it.
     const lib_unit_tests = b.addTest(.{

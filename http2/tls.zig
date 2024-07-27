@@ -6,6 +6,11 @@ const FrameType = @import("frame.zig").FrameType;
 const FrameFlags = @import("frame.zig").FrameFlags;
 const Hpack = @import("hpack.zig").Hpack;
 
+const openssl = @cImport({
+    @cInclude("boringssl/ssl.h");
+    @cInclude("boringssl/err.h");
+});
+
 pub const TlsContext = struct {
     allocator: *std.mem.Allocator,
     // Other necessary fields for the TLS context
