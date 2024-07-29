@@ -17,6 +17,9 @@ pub fn build(b: *std.Build) void {
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
 
+    const boringssl_include_path = b.path("boringssl/include/openssl");
+    const boringssl_lib_path = b.path("boringssl/build");
+
     const lib = b.addStaticLibrary(.{
         .name = "http2.zig",
         .root_source_file = b.path("http2.zig"),
@@ -29,6 +32,9 @@ pub fn build(b: *std.Build) void {
     // Link OpenSSL libraries
     lib.linkSystemLibrary("ssl");
     lib.linkSystemLibrary("crypto");
+
+    lib.addIncludePath(boringssl_include_path);
+    lib.addLibraryPath(boringssl_lib_path);
 
     lib.addIncludePath(b.path("boringssl/include/openssl"));
 
@@ -48,7 +54,8 @@ pub fn build(b: *std.Build) void {
     lib_unit_tests.linkSystemLibrary("ssl");
     lib_unit_tests.linkSystemLibrary("crypto");
 
-    lib_unit_tests.addIncludePath(b.path("boringssl/include/openssl"));
+    lib.addIncludePath(boringssl_include_path);
+    lib.addLibraryPath(boringssl_lib_path);
 
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request
