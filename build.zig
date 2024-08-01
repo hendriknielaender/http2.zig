@@ -54,8 +54,8 @@ pub fn build(b: *std.Build) void {
     lib_unit_tests.linkSystemLibrary("ssl");
     lib_unit_tests.linkSystemLibrary("crypto");
 
-    lib.addIncludePath(boringssl_include_path);
-    lib.addLibraryPath(boringssl_lib_path);
+    lib_unit_tests.addIncludePath(boringssl_include_path);
+    lib_unit_tests.addLibraryPath(boringssl_lib_path);
 
     // Similar to creating the run step earlier, this exposes a `test` step to
     // the `zig build --help` menu, providing a way for the user to request

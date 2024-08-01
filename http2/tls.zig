@@ -1,6 +1,4 @@
 const std = @import("std");
-
-// Import generated BoringSSL bindings
 const boringssl = @import("boringssl/boringssl-bindings.zig");
 
 pub const TlsError = error{
@@ -40,11 +38,52 @@ pub const TlsContext = struct {
         self.ssl = boringssl.SSL_new(self.ctx);
         if (self.ssl == null) return TlsError.InvalidContext;
 
+        // Load client certificate
+        const client_cert_file = "client_cert.pem";
+        const client_key_file = "client_key.pem";
+
+        const max_bytes = std.math.maxInt(usize);
+        const client_cert = try std.fs.cwd().readFileAlloc(self.allocator.*, client_cert_file, max_bytes);
+        defer self.allocator.free(client_cert);
+
+        const client_key = try std.fs.cwd().readFileAlloc(self.allocator.*, client_key_file, max_bytes);
+        defer self.allocator.free(client_key);
+
+        const cert_len: c_long = @intCast(client_cert.len);
+        const bio_cert = boringssl.BIO_new_mem_buf(client_cert.ptr, cert_len);
+        if (bio_cert == null) return TlsError.InvalidContext;
+        defer _ = boringssl.BIO_free(bio_cert);
+
+        const x509_cert = boringssl.PEM_read_bio_X509(bio_cert, null, null, null);
+        if (x509_cert == null) return TlsError.InvalidContext;
+        defer boringssl.X509_free(x509_cert);
+
+        const client_len: c_long = @intCast(client_key.len);
+        const bio_key = boringssl.BIO_new_mem_buf(client_key.ptr, client_len);
+        if (bio_key == null) return TlsError.InvalidContext;
+        defer _ = boringssl.BIO_free(bio_key);
+
+        const pkey = boringssl.PEM_read_bio_PrivateKey(bio_key, null, null, null);
+        if (pkey == null) return TlsError.InvalidContext;
+        defer boringssl.EVP_PKEY_free(pkey);
+
+        if (boringssl.SSL_use_certificate(self.ssl, x509_cert) != 1) {
+            return TlsError.InvalidContext;
+        }
+
+        if (boringssl.SSL_use_PrivateKey(self.ssl, pkey) != 1) {
+            return TlsError.InvalidContext;
+        }
+
         if (boringssl.SSL_set_fd(self.ssl, @intCast(fd)) == 0) {
             return TlsError.InvalidContext;
         }
 
-        if (boringssl.SSL_connect(self.ssl) != 1) {
+        const result = boringssl.SSL_connect(self.ssl);
+        if (result != 1) {
+            const error_code: u32 = @intCast(boringssl.SSL_get_error(self.ssl, result));
+            const error_str = boringssl.ERR_error_string(error_code, null);
+            std.debug.print("SSL_connect failed with error code: {d}, error: {s}\n", .{ error_code, error_str });
             return TlsError.HandshakeFailed;
         }
     }
@@ -83,8 +122,6 @@ test "TLS context initialization and encryption/decryption" {
     var ctx = try TlsContext.init(&allocator);
     defer ctx.deinit();
 
-    // Test environment setup - connect to a test server
-    // For actual tests, a local TLS server or a mock server is required
     const server_address = "127.0.0.1";
     const server_port = 4433;
     const addr = try std.net.Address.parseIp(server_address, server_port);
@@ -93,11 +130,9 @@ test "TLS context initialization and encryption/decryption" {
 
     try ctx.connect(conn.handle);
 
-    // Test writing data
     const message = "Hello, secure world!";
     try ctx.write(message);
 
-    // Test reading data
     var buffer: [1024]u8 = undefined;
     const len = try ctx.read(&buffer);
     const response = buffer[0..len];
