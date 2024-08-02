@@ -6,4 +6,6 @@ key.pem
 client_cert.pem
 client_key.pem
 
+dhparam.pem
+
 server.log

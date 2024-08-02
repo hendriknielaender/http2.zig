@@ -5,6 +5,7 @@ SERVER_CERT_FILE=cert.pem
 SERVER_KEY_FILE=key.pem
 CLIENT_CERT_FILE=client_cert.pem
 CLIENT_KEY_FILE=client_key.pem
+DH_PARAMS_FILE=dhparam.pem
 PORT=4433
 LOG_FILE=server.log
 
@@ -21,10 +22,14 @@ $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE):
 	openssl req -x509 -newkey rsa:4096 -keyout $(CLIENT_KEY_FILE) -out $(CLIENT_CERT_FILE) -days 365 -nodes \
 	-subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=client.example.com"
 
+# Target to generate DH parameters
+$(DH_PARAMS_FILE):
+	openssl dhparam -out $(DH_PARAMS_FILE) 2048
+
 # Target to start the OpenSSL server in the background
-start_server: $(SERVER_CERT_FILE) $(SERVER_KEY_FILE)
+start_server: $(SERVER_CERT_FILE) $(SERVER_KEY_FILE) $(DH_PARAMS_FILE)
 	@echo "Starting OpenSSL server..."
-	@openssl s_server -accept $(PORT) -cert $(SERVER_CERT_FILE) -key $(SERVER_KEY_FILE) -CAfile $(SERVER_CERT_FILE) -Verify 1 > $(LOG_FILE) 2>&1 &
+	@openssl s_server -accept $(PORT) -cert $(SERVER_CERT_FILE) -key $(SERVER_KEY_FILE) -CAfile $(SERVER_CERT_FILE) -dhparam $(DH_PARAMS_FILE) -cipher "AES128-GCM-SHA256" -Verify 1 -www > $(LOG_FILE) 2>&1 &
 	@sleep 2 # Wait a moment for the server to start
 
 # Target to run Zig tests
@@ -37,7 +42,7 @@ test: $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE) start_server
 
 # Target to clean up generated files
 clean:
-	rm -f $(SERVER_CERT_FILE) $(SERVER_KEY_FILE) $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE) $(LOG_FILE)
+	rm -f $(SERVER_CERT_FILE) $(SERVER_KEY_FILE) $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE) $(DH_PARAMS_FILE) $(LOG_FILE)
 
 # Target to stop the server if needed
 stop_server:
