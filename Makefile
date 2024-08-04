@@ -29,24 +29,26 @@ $(DH_PARAMS_FILE):
 # Target to start the OpenSSL server in the background
 start_server: $(SERVER_CERT_FILE) $(SERVER_KEY_FILE) $(DH_PARAMS_FILE)
 	@echo "Starting OpenSSL server..."
-	@openssl s_server -accept $(PORT) -cert $(SERVER_CERT_FILE) -key $(SERVER_KEY_FILE) -CAfile $(SERVER_CERT_FILE) -dhparam $(DH_PARAMS_FILE) -cipher "AES128-GCM-SHA256" -Verify 1 -www > $(LOG_FILE) 2>&1 &
+	@openssl s_server -accept $(PORT) -cert $(SERVER_CERT_FILE) -key $(SERVER_KEY_FILE) -CAfile $(SERVER_CERT_FILE) -dhparam $(DH_PARAMS_FILE) -cipher "AES128-GCM-SHA256" -Verify 1 -www -debug > $(LOG_FILE) 2>&1 &
 	@sleep 2 # Wait a moment for the server to start
+
+# Target to stop the OpenSSL server
+stop_server:
+	@echo "Stopping OpenSSL server..."
+	@pkill -f "openssl s_server"
+	@sleep 2 # Ensure the server has stopped
 
 # Target to run Zig tests
 test: $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE) start_server
 	@echo "Running Zig tests..."
 	zig test http2/tls.zig -I./boringssl/include -L./boringssl/build/ssl -L./boringssl/build/crypto -lssl -lcrypto -lc++
-	@pkill -f "openssl s_server" # Stop the OpenSSL server after tests
+	$(MAKE) stop_server
 	@echo "Checking OpenSSL server log..."
 	@cat $(LOG_FILE)
 
 # Target to clean up generated files
 clean:
 	rm -f $(SERVER_CERT_FILE) $(SERVER_KEY_FILE) $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE) $(DH_PARAMS_FILE) $(LOG_FILE)
-
-# Target to stop the server if needed
-stop_server:
-	@pkill -f "openssl s_server"
 
 .PHONY: all start_server test clean stop_server
 

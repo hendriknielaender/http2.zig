@@ -1,11 +1,13 @@
 zig-out/
 .zig-cache/
 
-cert.pem
-key.pem
+server_cert.pem
+server_key.pem
 client_cert.pem
 client_key.pem
 
 dhparam.pem
 
 server.log
+
+start.sh

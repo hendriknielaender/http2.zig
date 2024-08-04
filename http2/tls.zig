@@ -79,6 +79,7 @@ pub const TlsContext = struct {
             return TlsError.InvalidContext;
         }
 
+        std.debug.print("Attempting SSL connect...\n", .{});
         const result = boringssl.SSL_connect(self.ssl);
         if (result != 1) {
             const error_code: u32 = @intCast(boringssl.SSL_get_error(self.ssl, result));
@@ -86,19 +87,55 @@ pub const TlsContext = struct {
             std.debug.print("SSL_connect failed with error code: {d}, error: {s}\n", .{ error_code, error_str });
             return TlsError.HandshakeFailed;
         }
+        std.debug.print("SSL connect successful.\n", .{});
     }
 
     pub fn write(self: *TlsContext, data: []const u8) !void {
         if (self.ssl == null) return TlsError.InvalidContext;
-        if (boringssl.SSL_write(self.ssl, data.ptr, @intCast(data.len)) <= 0) {
+        std.debug.print("Attempting SSL write...\n", .{});
+        const bytes_written = boringssl.SSL_write(self.ssl, data.ptr, @intCast(data.len));
+        if (bytes_written <= 0) {
+            const error_code = boringssl.SSL_get_error(self.ssl, bytes_written);
+            const error_str = boringssl.ERR_error_string(@intCast(error_code), null);
+            std.debug.print("SSL_write failed with error code: {d}, error: {s}\n", .{ error_code, error_str });
             return TlsError.WriteFailed;
         }
+        std.debug.print("SSL write successful.\n", .{});
     }
 
     pub fn read(self: *TlsContext, buffer: []u8) !usize {
         if (self.ssl == null) return TlsError.InvalidContext;
-        const ret = boringssl.SSL_read(self.ssl, buffer.ptr, @intCast(buffer.len));
-        if (ret <= 0) return TlsError.ReadFailed;
+        std.debug.print("Attempting SSL read...\n", .{});
+
+        const timeout_ms = 5000; // 5 seconds timeout
+        const start_time = std.time.milliTimestamp();
+        var ret: c_int = 0;
+
+        while (true) {
+            const current_time = std.time.milliTimestamp();
+            const elapsed_time = current_time - start_time;
+            std.debug.print("SSL_read loop: start_time={d}, current_time={d}, elapsed_time={d}\n", .{ start_time, current_time, elapsed_time });
+            ret = boringssl.SSL_read(self.ssl, buffer.ptr, @intCast(buffer.len));
+            if (ret > 0) break;
+
+            const error_code = boringssl.SSL_get_error(self.ssl, ret);
+            std.debug.print("SSL_read result={d}, error_code={d}\n", .{ ret, error_code });
+            if (error_code == boringssl.SSL_ERROR_WANT_READ or error_code == boringssl.SSL_ERROR_WANT_WRITE) {
+                if (elapsed_time > timeout_ms) {
+                    std.debug.print("SSL_read timed out after {d} milliseconds.\n", .{timeout_ms});
+                    return TlsError.ReadFailed;
+                }
+                std.debug.print("SSL_read retrying after 10 milliseconds.\n", .{});
+                std.time.sleep(10 * std.time.ns_per_ms); // Sleep for 10 milliseconds
+                continue;
+            } else {
+                const error_str = boringssl.ERR_error_string(@intCast(error_code), null);
+                std.debug.print("SSL_read failed with error code: {d}, error: {s}\n", .{ error_code, error_str });
+                return TlsError.ReadFailed;
+            }
+        }
+
+        std.debug.print("SSL read successful, read {d} bytes.\n", .{ret});
         return @intCast(ret);
     }
 
@@ -119,20 +156,27 @@ test "TLS context initialization and encryption/decryption" {
 
     var allocator = arena.allocator();
 
+    std.debug.print("Initializing TLS context...\n", .{});
     var ctx = try TlsContext.init(&allocator);
     defer ctx.deinit();
 
+    std.debug.print("Parsing server address...\n", .{});
     const server_address = "127.0.0.1";
     const server_port = 4433;
     const addr = try std.net.Address.parseIp(server_address, server_port);
+
+    std.debug.print("Connecting to server...\n", .{});
     var conn = try std.net.tcpConnectToAddress(addr);
     defer conn.close();
 
+    std.debug.print("Establishing TLS connection...\n", .{});
     try ctx.connect(conn.handle);
 
     const message = "Hello, secure world!";
+    std.debug.print("Sending message: {s}\n", .{message});
     try ctx.write(message);
 
+    std.debug.print("Reading response...\n", .{});
     var buffer: [1024]u8 = undefined;
     const len = try ctx.read(&buffer);
     const response = buffer[0..len];
