@@ -1,0 +1,29 @@
+name: HTTP/2 Conformance Test
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Build http2.zig
+        run: zig build
+
+      - name: Start HTTP/2 server
+        run: ./zig-out/bin/http2
+        env:
+          PORT: 8080
+
+      - name: Run h2spec tests
+        run: |
+          docker pull summerwind/h2spec
+          docker run --network host summerwind/h2spec -h 127.0.0.1 -p 8080 --tls
