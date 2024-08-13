@@ -3,7 +3,7 @@ const assert = std.debug.assert;
 
 const http2_preface: []const u8 = "\x50\x52\x49\x20\x2A\x20\x48\x54\x54\x50\x2F\x32\x2E\x30\x0D\x0A\x0D\x0A\x53\x4D\x0D\x0A\x0D\x0A";
 
-pub fn Connection(ReaderType: type, WriterType: type) type {
+pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
     return struct {
         allocator: *std.mem.Allocator,
         reader: ReaderType,

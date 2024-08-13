@@ -132,8 +132,6 @@ pub const Frame = struct {
         }
 
         const payload = try allocator.alloc(u8, payload_length);
-        defer allocator.free(payload);
-
         _ = try reader.readAll(payload);
 
         if (padding_length != null) {
