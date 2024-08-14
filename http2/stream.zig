@@ -42,20 +42,39 @@ pub const Stream = struct {
 
     /// Handles incoming frames for the stream
     pub fn handleFrame(self: *Stream, frame: Frame) !void {
+        std.debug.print("Handling frame type: {d}, stream ID: {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
+
         switch (frame.header.frame_type) {
-            FrameType.HEADERS => try self.handleHeaders(frame),
-            FrameType.DATA => try self.handleData(frame),
+            FrameType.HEADERS => {
+                std.debug.print("Handling HEADERS frame\n", .{});
+                try self.handleHeaders(frame);
+
+                // Ensure only actual data is written, not zeros
+                try self.conn.writer.writeAll(frame.payload);
+            },
+            FrameType.DATA => {
+                std.debug.print("Handling DATA frame\n", .{});
+                try self.handleData(frame);
+            },
             FrameType.WINDOW_UPDATE => try self.handleWindowUpdate(frame),
             FrameType.RST_STREAM => try self.handleRstStream(),
             else => {},
         }
+
+        std.debug.print("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
     }
 
     fn handleHeaders(self: *Stream, frame: Frame) !void {
+        std.debug.print("Appending headers data of length: {d}\n", .{frame.payload.len});
+
         if (self.state == .Idle or self.state == .HalfClosedRemote) {
             self.state = .Open;
         }
+
         try self.recv_headers.appendSlice(frame.payload);
+
+        std.debug.print("Total received headers data length: {d}\n", .{self.recv_headers.items.len});
+
         if (frame.header.flags.isEndStream()) {
             self.state = .HalfClosedRemote;
         }
@@ -98,6 +117,14 @@ pub const Stream = struct {
 
     fn handleRstStream(self: *Stream) !void {
         self.state = .Closed;
+    }
+
+    /// Updates the send window size for the stream
+    pub fn updateSendWindow(self: *Stream, increment: i32) !void {
+        self.send_window_size += increment;
+        if (self.send_window_size > 2147483647) { // u31 maximum value
+            return error.FlowControlError;
+        }
     }
 
     /// Sends data over the stream
