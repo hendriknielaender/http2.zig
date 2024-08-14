@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     const boringssl_lib_path = b.path("boringssl/build");
 
     const lib = b.addStaticLibrary(.{
-        .name = "http2.zig",
+        .name = "http2",
         .root_source_file = b.path("http2/connection.zig"),
         .target = target,
         .optimize = optimize,
