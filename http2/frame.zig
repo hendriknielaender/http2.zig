@@ -123,6 +123,8 @@ pub const Frame = struct {
     pub fn read(reader: anytype, allocator: *std.mem.Allocator) !Frame {
         const header = try FrameHeader.read(reader);
 
+        std.debug.print("Read FrameHeader: {any}\n", .{header});
+
         var payload_length = header.length;
         var padding_length: ?u8 = null;
 
@@ -147,17 +149,24 @@ pub const Frame = struct {
     }
 
     pub fn write(self: *Frame, writer: anytype) !void {
+        // Write the frame header first
         try self.header.write(writer);
 
+        std.debug.print("Frame.write called with payload length: {d}\n", .{self.payload.len});
+
+        // Write the payload only if it's not empty
+        if (self.payload.len > 0) {
+            try writer.writeAll(self.payload[0..self.header.length]);
+        }
+
+        // Clearing the payload might cause issues here; remove or delay this if it’s causing problems
+        // self.payload = &[]u8{};
+
+        // Handle padding if necessary
         if (self.header.flags.isPadded()) {
             const padding_length = self.padding_length orelse unreachable;
-            try writer.writeByte(padding_length);
-            try writer.writeAll(self.payload);
-            // Write padding bytes (all zeros)
             var padding: [255]u8 = undefined; // Max padding length per frame is 255
             try writer.writeAll(padding[0..padding_length]);
-        } else {
-            try writer.writeAll(self.payload);
         }
     }
 };
@@ -170,7 +179,7 @@ test "frame header read and write" {
 
     var header = FrameHeader{
         .length = 16,
-        .frame_type = .SETTINGS, // Ensure this is a valid enum value
+        .frame_type = .SETTINGS,
         .flags = FrameFlags.init(0),
         .reserved = false,
         .stream_id = 0,
@@ -182,7 +191,6 @@ test "frame header read and write" {
     // Write to the buffer
     try header.write(&writer);
 
-    // Debugging output: check what was actually written
     std.debug.print("Written buffer: {x}\n", .{buffer});
 
     // Recreate the FixedBufferStream to reset the read position
@@ -214,6 +222,7 @@ test "frame read and write" {
         byte.* = 0xaa;
     }
 
+    // Create the frame with the payload
     var frame = Frame.init(FrameHeader{
         .length = 16,
         .frame_type = .SETTINGS,
@@ -226,7 +235,7 @@ test "frame read and write" {
 
     std.debug.print("Written buffer: {x}\n", .{buffer[0..25]});
 
-    // Manually copy the data from buffer to read_buffer
+    // Copy the data from buffer to read_buffer
     var read_buffer: [4096]u8 = undefined;
     for (buffer, 0..) |byte, i| {
         read_buffer[i] = byte;
@@ -239,14 +248,19 @@ test "frame read and write" {
     // Read the frame back from the buffer
     const read_frame = try Frame.read(&reader, &allocator);
 
+    std.debug.print("Read FrameHeader: {any}\n", .{read_frame.header});
+    std.debug.print("Read payload: {x}\n", .{read_frame.payload});
+    std.debug.print("Original payload: {x}\n", .{frame.payload});
+
     // Assert that the read frame matches the written frame
     assert(read_frame.header.length == frame.header.length);
     assert(read_frame.header.frame_type == frame.header.frame_type);
     assert(read_frame.header.flags.value == frame.header.flags.value);
     assert(read_frame.header.reserved == frame.header.reserved);
     assert(read_frame.header.stream_id == frame.header.stream_id);
+
+    // Compare payloads directly; should be the same
     assert(std.mem.eql(u8, read_frame.payload, frame.payload));
 
-    // Debugging output: check the read frame payload
     std.debug.print("Read frame payload: {x}\n", .{read_frame.payload});
 }
