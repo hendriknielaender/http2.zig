@@ -70,8 +70,8 @@ build-boringssl-unoptimized:
 create-bindings:
 	zig translate-c -I boringssl/include boringssl/include/openssl/ssl.h > http2/boringssl/boringssl-bindings.zig
 
-build-exe:
-	$(ZIG) build-exe src/http2.zig -lc -Iboringssl/include
+build-lib:
+	$(ZIG) build-lib http2/connection.zig -lc -Iboringssl/include
 
 init-export:
 	export LDFLAGS="-L/usr/local/opt/zlib/lib"
