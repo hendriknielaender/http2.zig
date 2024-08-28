@@ -4,8 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const opts = .{ .target = target, .optimize = optimize };
-    const http2_module = b.dependency("http2", opts).module("http2");
+    const http2 = b.dependency("http2", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const http2_module = http2.module("http2");
 
     const exe = b.addExecutable(.{
         .name = "hello_world_server",
@@ -22,6 +26,7 @@ pub fn build(b: *std.Build) void {
     exe.addLibraryPath(b.path("../../http2/boringssl/build"));
 
     exe.root_module.addImport("http2", http2_module);
+    exe.linkLibrary(http2.artifact("http2"));
 
     const run_cmd = b.addRunArtifact(exe);
     const run_step = b.step("run", "Run the example HTTP/2 server");
