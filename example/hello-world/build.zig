@@ -22,11 +22,13 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("ssl");
     exe.linkSystemLibrary("crypto");
 
-    exe.addIncludePath(b.path("../../http2/boringssl/include/openssl"));
-    exe.addLibraryPath(b.path("../../http2/boringssl/build"));
+    exe.addIncludePath(b.path("../../boringssl/include/openssl"));
+    exe.addLibraryPath(b.path("../../boringssl/build"));
 
     exe.root_module.addImport("http2", http2_module);
     exe.linkLibrary(http2.artifact("http2"));
+
+    b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
     const run_step = b.step("run", "Run the example HTTP/2 server");
