@@ -3,6 +3,7 @@ const Stream = @import("stream.zig").Stream;
 const Frame = @import("frame.zig").Frame;
 const FrameHeader = @import("frame.zig").FrameHeader;
 const FrameFlags = @import("frame.zig").FrameFlags;
+const FrameType = @import("frame.zig").FrameType;
 const assert = std.debug.assert;
 
 const http2_preface: []const u8 = "\x50\x52\x49\x20\x2A\x20\x48\x54\x54\x50\x2F\x32\x2E\x30\x0D\x0A\x0D\x0A\x53\x4D\x0D\x0A\x0D\x0A";
@@ -77,18 +78,49 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
         }
 
-        pub fn receiveSettings(self: @This()) !void {
+        pub fn receiveFrame(self: *@This()) !Frame {
+            var header_buf: [9]u8 = undefined; // Frame header size is 9 bytes
+            _ = try self.reader.readAll(&header_buf);
+
+            const frame_type_u8: u8 = @intCast(header_buf[3]);
+            const frame_type: FrameType = @enumFromInt(frame_type_u8);
+
+            const stream_id_u32: u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
+            const stream_id: u31 = @intCast(stream_id_u32);
+
+            const frame_header = FrameHeader{
+                .length = std.mem.readInt(u24, header_buf[0..3], .big),
+                .frame_type = frame_type,
+                .flags = FrameFlags.init(header_buf[4]),
+                .reserved = (header_buf[5] & 0x80) != 0,
+                .stream_id = stream_id,
+            };
+
+            const payload: []u8 = try self.allocator.alloc(u8, frame_header.length);
+            defer self.allocator.free(payload);
+
+            _ = try self.reader.readAll(payload);
+
+            return Frame{
+                .header = frame_header,
+                .payload = payload,
+            };
+        }
+
+        pub fn receiveSettings(self: *@This()) !void {
             const settings_frame_header_size = 9;
             var frame_header: [settings_frame_header_size]u8 = undefined;
-            try self.reader.readAll(&frame_header);
+            _ = try self.reader.readAll(&frame_header);
             const length = std.mem.readInt(u24, frame_header[0..3], .big);
             if (length % 6 != 0) return error.InvalidSettingsFrameSize;
 
             var settings_payload: []u8 = try self.allocator.alloc(u8, length);
             defer self.allocator.free(settings_payload);
-            try self.reader.readAll(settings_payload);
+            _ = try self.reader.readAll(settings_payload);
 
-            for (settings_payload.chunks(6)) |setting| {
+            var i: usize = 0;
+            while (i < settings_payload.len) {
+                const setting = settings_payload[i .. i + 6];
                 const id = std.mem.readInt(u16, setting[0..2], .big);
                 const value = std.mem.readInt(u32, setting[2..6], .big);
                 switch (id) {
@@ -99,10 +131,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     6 => self.settings.max_header_list_size = value,
                     else => {},
                 }
+                i += 6;
             }
         }
 
-        fn close(self: @This()) !void {
+        pub fn close(self: @This()) !void {
             var goaway_frame: [17]u8 = undefined;
             std.mem.writeInt(u24, goaway_frame[0..3], 8, .big);
             goaway_frame[3] = 0x7; // type (GOAWAY)
@@ -112,7 +145,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try self.writer.writeAll(&goaway_frame);
         }
 
-        fn getStream(self: *@This(), stream_id: u31) !*Stream {
+        pub fn getStream(self: *@This(), stream_id: u31) !*Stream {
             if (self.streams.get(stream_id)) |stream| {
                 return stream;
             } else {

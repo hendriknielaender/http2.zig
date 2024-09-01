@@ -1,11 +1,11 @@
 const std = @import("std");
 const http2 = @import("http2");
 
-const Connection = http2.Connection(std.net.Stream, std.net.Stream);
-const Stream = @import("http2").Stream;
+const Connection = http2.Connection(std.io.AnyReader, std.io.AnyWriter);
+const Stream = http2.Stream;
 
 pub fn main() !void {
-    const allocator = std.heap.page_allocator;
+    var allocator = std.heap.page_allocator;
     const address = try std.net.Address.resolveIp("127.0.0.1", 9001);
     var listener = try address.listen(.{
         .reuse_address = true,
@@ -19,7 +19,10 @@ pub fn main() !void {
         defer con.stream.close();
         std.debug.print("Accepted Connection from: {any}\n", .{con.address});
 
-        var connection = try Connection.init(allocator, con.reader(), con.writer(), true);
+        const reader = con.stream.reader().any();
+        const writer = con.stream.writer().any();
+
+        var connection = try Connection.init(&allocator, reader, writer, true);
 
         try processConnection(&connection);
     }
@@ -36,9 +39,10 @@ fn processConnection(connection: *Connection) !void {
         switch (frame.header.frame_type) {
             .HEADERS => {
                 std.debug.print("Received HEADERS frame\n", .{});
-                const stream = try connection.getStream(frame.header.stream_id);
 
-                if (stream != null and frame.payload.len > 0) {
+                // Properly handle the optional result from getStream
+                const stream = try connection.getStream(frame.header.stream_id);
+                if (stream != undefined and frame.payload.len > 0) {
                     // Respond to GET request
                     std.debug.print(">>> Sending 200 OK response with Hello, World!\n", .{});
 
@@ -46,7 +50,7 @@ fn processConnection(connection: *Connection) !void {
                     try connection.sendData(stream, response_data);
 
                     // Send END_STREAM flag to close the stream
-                    try connection.sendHeaders(stream, true);
+                    try connection.close();
                 }
             },
             else => {},
