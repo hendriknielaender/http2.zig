@@ -1,9 +1,9 @@
 const std = @import("std");
-const Stream = @import("stream.zig").Stream;
-const Frame = @import("frame.zig").Frame;
-const FrameHeader = @import("frame.zig").FrameHeader;
-const FrameFlags = @import("frame.zig").FrameFlags;
-const FrameType = @import("frame.zig").FrameType;
+pub const Stream = @import("stream.zig").Stream;
+pub const Frame = @import("frame.zig").Frame;
+pub const FrameHeader = @import("frame.zig").FrameHeader;
+pub const FrameFlags = @import("frame.zig").FrameFlags;
+pub const FrameType = @import("frame.zig").FrameType;
 const assert = std.debug.assert;
 
 const http2_preface: []const u8 = "\x50\x52\x49\x20\x2A\x20\x48\x54\x54\x50\x2F\x32\x2E\x30\x0D\x0A\x0D\x0A\x53\x4D\x0D\x0A\x0D\x0A";
@@ -31,9 +31,18 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 .streams = std.AutoHashMap(u31, *Stream).init(allocator.*),
             };
 
-            if (!self.is_server) {
+            if (self.is_server) {
+                // Check for the correct HTTP/2 preface
+                var preface_buf: [24]u8 = undefined;
+                _ = try self.reader.readAll(&preface_buf);
+                if (!std.mem.eql(u8, &preface_buf, http2_preface)) {
+                    return error.InvalidPreface;
+                }
+                std.debug.print("Valid HTTP/2 preface received\n", .{});
+            } else {
                 try self.sendPreface();
             }
+
             try self.sendSettings();
             return self;
         }
@@ -42,7 +51,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try self.writer.writeAll(http2_preface);
         }
 
-        fn sendSettings(self: @This()) !void {
+        pub fn sendSettings(self: @This()) !void {
             const settings = [_][2]u32{
                 .{ 1, self.settings.header_table_size },
                 .{ 3, self.settings.max_concurrent_streams },
@@ -78,12 +87,31 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
         }
 
+        fn from_int(val: u8) FrameType {
+            return std.meta.intToEnum(FrameType, val) catch undefined;
+        }
+
         pub fn receiveFrame(self: *@This()) !Frame {
             var header_buf: [9]u8 = undefined; // Frame header size is 9 bytes
             _ = try self.reader.readAll(&header_buf);
 
+            std.debug.print("Raw header bytes: {x}\n", .{header_buf});
+
+            // Read frame type from the header buffer
             const frame_type_u8: u8 = @intCast(header_buf[3]);
-            const frame_type: FrameType = @enumFromInt(frame_type_u8);
+            std.debug.print("Read frame_type_u8: {any} (dec: {d})\n", .{ frame_type_u8, frame_type_u8 });
+
+            const frame_type = from_int(frame_type_u8);
+
+            if (frame_type == undefined) {
+                std.debug.print("Invalid frame type received: {d} (hex: {any})\n", .{ frame_type_u8, frame_type_u8 });
+                std.debug.print("Full header buffer for context: {any}\n", .{header_buf});
+                return error.InvalidFrameType;
+            }
+
+            if (frame_type == .SETTINGS) {
+                std.debug.print("Valid SETTINGS frame received.\n", .{});
+            }
 
             const stream_id_u32: u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
             const stream_id: u31 = @intCast(stream_id_u32);
@@ -96,15 +124,137 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 .stream_id = stream_id,
             };
 
+            std.debug.print("Received frame header: {any}\n", .{frame_header});
+
             const payload: []u8 = try self.allocator.alloc(u8, frame_header.length);
             defer self.allocator.free(payload);
 
             _ = try self.reader.readAll(payload);
 
+            std.debug.print("Frame payload length: {d}\n", .{frame_header.length});
+
+            // Return valid frame
             return Frame{
                 .header = frame_header,
                 .payload = payload,
             };
+        }
+
+        pub fn applySettings(self: *@This(), frame: Frame) !void {
+            std.debug.print("Applying client settings...\n", .{});
+
+            // Ensure the frame type is SETTINGS and the payload length is a multiple of 6
+            if (frame.header.frame_type != .SETTINGS or frame.payload.len % 6 != 0) {
+                return error.InvalidSettingsFrame;
+            }
+
+            var i: usize = 0;
+            const payload_len = frame.payload.len;
+
+            // Log the payload length
+            std.debug.print("Frame payload length: {d}\n", .{payload_len});
+
+            // Check if the frame payload length is valid
+            if (frame.payload.len == 0) {
+                std.debug.print("Invalid frame payload detected: length = {d}\n", .{frame.payload.len});
+                return error.InvalidFramePayload;
+            }
+
+            // Print the payload in chunks for debugging
+            var idx: usize = 0;
+            for (frame.payload) |*byte| { // Using *byte to ensure we are safely handling memory
+                if (idx % 16 == 0) {
+                    std.debug.print("\n", .{});
+                }
+                std.debug.print("{x} ", .{byte.*});
+                idx += 1;
+            }
+            std.debug.print("\n", .{});
+
+            // Iterate over the payload to apply settings
+            while (i + 6 <= payload_len) {
+                // Check if the index is within bounds before accessing
+                if (i + 6 > payload_len) {
+                    std.debug.print("Out of bounds access detected: i = {d}, payload_len = {d}\n", .{ i, payload_len });
+                    return error.InvalidSettingsFrameSize;
+                }
+
+                const setting = frame.payload[i .. i + 6];
+
+                // Validate setting slice length before accessing
+                if (setting.len != 6) {
+                    std.debug.print("Invalid setting length detected at index {d}, actual length: {d}\n", .{ i, setting.len });
+                    return error.InvalidSettingsFrameSize;
+                }
+
+                // Safely access setting elements within bounds
+                if (setting.len >= 6) {
+                    std.debug.print("Processing setting at index {d}: {x} {x} {x} {x} {x} {x}\n", .{ i, setting[0], setting[1], setting[2], setting[3], setting[4], setting[5] });
+                } else {
+                    std.debug.print("Invalid access detected. Skipping processing due to invalid setting length: {d}\n", .{setting.len});
+                    return error.InvalidSettingsFrameSize;
+                }
+
+                // Read the identifier and value for each setting
+                const id: u16 = @intCast(std.mem.readInt(u16, setting[0..2], .big));
+                const value: u32 = @intCast(std.mem.readInt(u32, setting[2..6], .big));
+
+                std.debug.print("Processing setting: ID = {d}, Value = {d}\n", .{ id, value });
+
+                // Apply settings based on the ID
+                switch (id) {
+                    1 => self.settings.header_table_size = value,
+                    2 => {
+                        if (value > 1) {
+                            return error.InvalidSettingsValue;
+                        }
+                        self.settings.enable_push = (value == 1);
+                    },
+                    3 => self.settings.max_concurrent_streams = value,
+                    4 => self.settings.initial_window_size = value,
+                    5 => self.settings.max_frame_size = value,
+                    6 => self.settings.max_header_list_size = value,
+                    else => {
+                        std.debug.print("Unknown setting ID: {}\n", .{id});
+                        // Unknown settings should be ignored as per the HTTP/2 specification
+                    },
+                }
+
+                i += 6; // Move to the next setting
+            }
+
+            std.debug.print("Client settings applied successfully.\n", .{});
+        }
+
+        pub fn sendSettingsAck(self: @This()) !void {
+            var frame_header = FrameHeader{
+                .length = 0,
+                .frame_type = .SETTINGS,
+                .flags = FrameFlags{ .value = 1 }, // Set ACK flag
+                .reserved = false,
+                .stream_id = 0,
+            };
+
+            try frame_header.write(self.writer);
+            std.debug.print("Sent SETTINGS ACK frame\n", .{});
+        }
+
+        pub fn sendPong(self: *@This(), payload: []const u8) !void {
+            // Ensure the payload length is exactly 8 bytes as per the HTTP/2 specification for PING frames.
+            if (payload.len != 8) {
+                return error.InvalidPingPayload;
+            }
+
+            var frame_header = FrameHeader{
+                .length = 8, // PING payload length is always 8
+                .frame_type = .PING,
+                .flags = FrameFlags.init(FrameFlags.ACK),
+                .reserved = false,
+                .stream_id = 0,
+            };
+
+            try frame_header.write(self.writer);
+            try self.writer.writeAll(payload);
         }
 
         pub fn receiveSettings(self: *@This()) !void {
@@ -203,14 +353,14 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
         }
 
-        pub fn sendData(self: *@This(), stream: *Stream, data: []const u8) !void {
+        pub fn sendData(self: *@This(), stream: *Stream, data: []const u8, end_stream: bool) !void {
             std.debug.print("sendData called with data length: {d}\n", .{data.len});
 
             if (data.len > self.send_window_size) {
                 return error.FlowControlError;
             }
 
-            try stream.sendData(data);
+            try stream.sendData(data, end_stream);
 
             self.send_window_size -= @intCast(data.len);
 
@@ -287,11 +437,11 @@ test "HTTP/2 connection initialization and flow control" {
     const written_data = buffer_stream.getWritten();
 
     // Debug each section length
-    std.debug.print("Written data preface length: {}\n", .{http2_preface.len});
-    std.debug.print("Written data settings frame length: {}\n", .{39});
-    std.debug.print("Written data headers frame length: {}\n", .{headers_written_data.len - preface_written_data.len});
-    std.debug.print("Written data payload length: {}\n", .{data.len});
-    std.debug.print("Total written data length: {}\n", .{written_data.len});
+    std.debug.print("Written data preface length: {any}\n", .{http2_preface.len});
+    std.debug.print("Written data settings frame length: {any}\n", .{39});
+    std.debug.print("Written data headers frame length: {any}\n", .{headers_written_data.len - preface_written_data.len});
+    std.debug.print("Written data payload length: {any}\n", .{data.len});
+    std.debug.print("Total written data length: {any}\n", .{written_data.len});
 
     // Inspect the buffer contents for unexpected data
     std.debug.print("Buffer content before handling headers: {x}\n", .{buffer_stream.getWritten()});

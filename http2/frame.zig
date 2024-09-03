@@ -23,9 +23,14 @@ pub const FrameFlags = struct {
     pub const END_HEADERS = 0x4;
     pub const PADDED = 0x8;
     pub const PRIORITY = 0x20;
+    pub const ACK = 0x1;
 
     pub fn init(value: u8) FrameFlags {
         return FrameFlags{ .value = value };
+    }
+
+    pub fn has(self: FrameFlags, flag: u8) bool {
+        return (self.value & flag) != 0;
     }
 
     pub fn setEndStream(self: *FrameFlags) void {
@@ -33,7 +38,7 @@ pub const FrameFlags = struct {
     }
 
     pub fn isEndStream(self: FrameFlags) bool {
-        return (self.value & FrameFlags.END_STREAM) != 0;
+        return self.has(FrameFlags.END_STREAM);
     }
 
     pub fn setEndHeaders(self: *FrameFlags) void {
@@ -41,7 +46,7 @@ pub const FrameFlags = struct {
     }
 
     pub fn isEndHeaders(self: FrameFlags) bool {
-        return (self.value & FrameFlags.END_HEADERS) != 0;
+        return self.has(FrameFlags.END_HEADERS);
     }
 
     pub fn setPadded(self: *FrameFlags) void {
@@ -49,7 +54,7 @@ pub const FrameFlags = struct {
     }
 
     pub fn isPadded(self: FrameFlags) bool {
-        return (self.value & FrameFlags.PADDED) != 0;
+        return self.has(FrameFlags.PADDED);
     }
 
     pub fn setPriority(self: *FrameFlags) void {
@@ -57,7 +62,7 @@ pub const FrameFlags = struct {
     }
 
     pub fn isPriority(self: FrameFlags) bool {
-        return (self.value & FrameFlags.PRIORITY) != 0;
+        return self.has(FrameFlags.PRIORITY);
     }
 };
 
