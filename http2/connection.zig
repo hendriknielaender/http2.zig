@@ -140,90 +140,47 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             };
         }
 
-        pub fn applySettings(self: *@This(), frame: Frame) !void {
-            std.debug.print("Applying client settings...\n", .{});
+        pub fn applyFrameSettings(self: *@This(), frame: Frame) !void {
+            std.debug.print("Applying settings from frame...\n", .{});
 
-            // Ensure the frame type is SETTINGS and the payload length is a multiple of 6
-            if (frame.header.frame_type != .SETTINGS or frame.payload.len % 6 != 0) {
-                return error.InvalidSettingsFrame;
+            // Ensure the frame type is SETTINGS
+            if (frame.header.frame_type != .SETTINGS) {
+                return error.InvalidFrameType;
+            }
+
+            // The payload of the SETTINGS frame is already read into `frame.payload`
+            if (frame.payload.len % 6 != 0) {
+                return error.InvalidSettingsFrameSize;
             }
 
             var i: usize = 0;
-            const payload_len = frame.payload.len;
-
-            // Log the payload length
-            std.debug.print("Frame payload length: {d}\n", .{payload_len});
-
-            // Check if the frame payload length is valid
-            if (frame.payload.len == 0) {
-                std.debug.print("Invalid frame payload detected: length = {d}\n", .{frame.payload.len});
-                return error.InvalidFramePayload;
-            }
-
-            // Print the payload in chunks for debugging
-            var idx: usize = 0;
-            for (frame.payload) |*byte| { // Using *byte to ensure we are safely handling memory
-                if (idx % 16 == 0) {
-                    std.debug.print("\n", .{});
-                }
-                std.debug.print("{x} ", .{byte.*});
-                idx += 1;
-            }
-            std.debug.print("\n", .{});
-
-            // Iterate over the payload to apply settings
-            while (i + 6 <= payload_len) {
-                // Check if the index is within bounds before accessing
-                if (i + 6 > payload_len) {
-                    std.debug.print("Out of bounds access detected: i = {d}, payload_len = {d}\n", .{ i, payload_len });
-                    return error.InvalidSettingsFrameSize;
-                }
-
+            while (i + 6 <= frame.payload.len) {
                 const setting = frame.payload[i .. i + 6];
 
-                // Validate setting slice length before accessing
-                if (setting.len != 6) {
-                    std.debug.print("Invalid setting length detected at index {d}, actual length: {d}\n", .{ i, setting.len });
-                    return error.InvalidSettingsFrameSize;
-                }
+                // Decode setting ID and value
+                const id = std.mem.readInt(u16, setting[0..2], .big);
+                const value = std.mem.readInt(u32, setting[2..6], .big);
 
-                // Safely access setting elements within bounds
-                if (setting.len >= 6) {
-                    std.debug.print("Processing setting at index {d}: {x} {x} {x} {x} {x} {x}\n", .{ i, setting[0], setting[1], setting[2], setting[3], setting[4], setting[5] });
-                } else {
-                    std.debug.print("Invalid access detected. Skipping processing due to invalid setting length: {d}\n", .{setting.len});
-                    return error.InvalidSettingsFrameSize;
-                }
+                std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
 
-                // Read the identifier and value for each setting
-                const id: u16 = @intCast(std.mem.readInt(u16, setting[0..2], .big));
-                const value: u32 = @intCast(std.mem.readInt(u32, setting[2..6], .big));
-
-                std.debug.print("Processing setting: ID = {d}, Value = {d}\n", .{ id, value });
-
-                // Apply settings based on the ID
+                // Apply the settings based on ID
                 switch (id) {
                     1 => self.settings.header_table_size = value,
                     2 => {
-                        if (value > 1) {
-                            return error.InvalidSettingsValue;
-                        }
+                        if (value > 1) return error.InvalidSettingsValue;
                         self.settings.enable_push = (value == 1);
                     },
                     3 => self.settings.max_concurrent_streams = value,
                     4 => self.settings.initial_window_size = value,
                     5 => self.settings.max_frame_size = value,
                     6 => self.settings.max_header_list_size = value,
-                    else => {
-                        std.debug.print("Unknown setting ID: {}\n", .{id});
-                        // Unknown settings should be ignored as per the HTTP/2 specification
-                    },
+                    else => std.debug.print("Unknown setting ID: {}\n", .{id}),
                 }
 
-                i += 6; // Move to the next setting
+                i += 6;
             }
 
-            std.debug.print("Client settings applied successfully.\n", .{});
+            std.debug.print("Settings applied successfully.\n", .{});
         }
 
         pub fn sendSettingsAck(self: @This()) !void {
