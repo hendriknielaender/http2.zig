@@ -7,6 +7,7 @@ const FrameFlags = http2.FrameFlags;
 const FrameHeader = http2.FrameHeader;
 const FrameType = http2.FrameType;
 const Frame = http2.Frame;
+const Hpack = http2.Hpack.Hpack;
 
 pub fn main() !void {
     var allocator = std.heap.page_allocator; // Changed 'const' to 'var' to make it mutable
@@ -34,47 +35,57 @@ pub fn main() !void {
 }
 
 fn processConnection(connection: *Connection) !void {
-    try connection.sendSettings();
-
     while (true) {
-        const frame = try Frame.read(connection.reader, connection.allocator);
+        const frame = try connection.receiveFrame();
 
         std.debug.print("Processing frame: {any}\n", .{frame.header.frame_type});
 
         switch (frame.header.frame_type) {
             .SETTINGS => {
-                std.debug.print("Processing SETTINGS frame.\n", .{});
                 try connection.applyFrameSettings(frame);
                 try connection.sendSettingsAck();
             },
             .HEADERS => {
-                std.debug.print("Processing HEADERS frame.\n", .{});
-                try sendHelloWorldResponse(connection, frame.header.stream_id);
-            },
-            .RST_STREAM => {
-                std.debug.print("Processing RST_STREAM frame.\n", .{});
-                return; // Stop processing this connection
+                // Process incoming headers frame
+                var dynamic_table = try Hpack.DynamicTable.init(connection.allocator, 4096);
+                defer dynamic_table.table.deinit();
+
+                const decoded_header = try Hpack.decodeHeaderField(frame.payload, &dynamic_table);
+                std.debug.print("Decoded header: {s} = {s}\n", .{ decoded_header.name, decoded_header.value });
+
+                // Send HTTP/2 response after headers are received
+                try connection.sendResponse(frame.header.stream_id);
             },
             else => {
-                std.debug.print("Ignoring frame of type: {any}\n", .{@tagName(frame.header.frame_type)});
+                std.debug.print("Ignoring frame of type: {any}\n", .{frame.header.frame_type});
             },
         }
     }
 }
 
 fn sendHelloWorldResponse(connection: *Connection, stream_id: u31) !void {
-    const headers_payload = &[_]u8{ ':', 's', 't', 'a', 't', 'u', 's', '2', '0', '0' }; // HTTP/2 pseudo-header
+    // Ensure the :status pseudo-header is present
+    const status_field = Hpack.HeaderField.init(":status", "200");
 
+    // Use HPACK to encode the headers
+    var dynamic_table = try Hpack.DynamicTable.init(connection.allocator, 4096);
+    defer dynamic_table.table.deinit();
+
+    const encoded_headers = try Hpack.encodeHeaderField(status_field, &dynamic_table);
+    defer connection.allocator.free(encoded_headers);
+
+    // Write the headers frame with END_HEADERS flag
     var response_headers = Frame.init(FrameHeader{
-        .length = @intCast(headers_payload.len),
+        .length = @intCast(encoded_headers.len),
         .frame_type = FrameType.HEADERS,
         .flags = FrameFlags.init(FrameFlags.END_HEADERS),
         .reserved = false,
         .stream_id = stream_id,
-    }, headers_payload);
+    }, encoded_headers);
 
     try response_headers.write(connection.writer);
 
+    // Write the "Hello, World!" message with the END_STREAM flag
     const hello_world_message = "Hello, World!";
     var data_frame = Frame.init(FrameHeader{
         .length = @intCast(hello_world_message.len),

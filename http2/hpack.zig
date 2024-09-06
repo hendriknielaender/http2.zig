@@ -146,6 +146,16 @@ pub const Hpack = struct {
     pub fn decodeHeaderField(encoded: []const u8, dynamic_table: *DynamicTable) !HeaderField {
         var allocator = std.heap.page_allocator;
 
+        // Check if the header is indexed (first byte has the top bit set to 1)
+        if (encoded[0] & 0x80 != 0) {
+            const index = encoded[0] & 0x7F; // Get the index value
+            if (index == 0 or index > StaticTable.entries.len) {
+                return error.InvalidEncoding;
+            }
+            return StaticTable.get(index - 1); // HPACK indexing starts at 1
+        }
+
+        // Otherwise, assume it's a literal header field (not indexed)
         const name_end_index = std.mem.indexOfScalar(u8, encoded, 0x3A) orelse return error.InvalidEncoding;
         if (name_end_index == 0 or name_end_index >= encoded.len - 1) {
             return error.InvalidEncoding;
@@ -160,12 +170,10 @@ pub const Hpack = struct {
         const decoded_value_with_null = try huffman.decode(encoded_value, &allocator);
         defer allocator.free(decoded_value_with_null);
 
-        // Ensure the decoded strings are properly handled
         if (decoded_name_with_null.len == 0 or decoded_value_with_null.len == 0) {
             return error.InvalidEncoding;
         }
 
-        // Properly handle the null-terminated strings
         const final_decoded_name = decoded_name_with_null[0 .. decoded_name_with_null.len - 1];
         const final_decoded_value = decoded_value_with_null[0 .. decoded_value_with_null.len - 1];
 

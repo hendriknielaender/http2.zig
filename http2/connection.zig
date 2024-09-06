@@ -4,6 +4,7 @@ pub const Frame = @import("frame.zig").Frame;
 pub const FrameHeader = @import("frame.zig").FrameHeader;
 pub const FrameFlags = @import("frame.zig").FrameFlags;
 pub const FrameType = @import("frame.zig").FrameType;
+pub const Hpack = @import("hpack.zig");
 const assert = std.debug.assert;
 
 const http2_preface: []const u8 = "\x50\x52\x49\x20\x2A\x20\x48\x54\x54\x50\x2F\x32\x2E\x30\x0D\x0A\x0D\x0A\x53\x4D\x0D\x0A\x0D\x0A";
@@ -49,6 +50,43 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
         fn sendPreface(self: @This()) !void {
             try self.writer.writeAll(http2_preface);
+        }
+
+        pub fn sendResponse(self: *@This(), stream_id: u31) !void {
+            const response_headers = &[_]u8{
+                0x82, // :status = 200 (indexed header field in HPACK static table)
+                0x86, // Content-Length = (dynamic header field)
+            };
+
+            const response_body = "Hello, World!";
+
+            // Send HEADERS frame
+            var headers_frame = Frame{
+                .header = FrameHeader{
+                    .length = @intCast(response_headers.len),
+                    .frame_type = .HEADERS,
+                    .flags = FrameFlags{ .value = FrameFlags.END_HEADERS },
+                    .reserved = false,
+                    .stream_id = stream_id,
+                },
+                .payload = response_headers,
+            };
+            try headers_frame.write(self.writer);
+
+            // Send DATA frame
+            var data_frame = Frame{
+                .header = FrameHeader{
+                    .length = @intCast(response_body.len),
+                    .frame_type = .DATA,
+                    .flags = FrameFlags{ .value = FrameFlags.END_STREAM },
+                    .reserved = false,
+                    .stream_id = stream_id,
+                },
+                .payload = response_body,
+            };
+            try data_frame.write(self.writer);
+
+            std.debug.print("Sent 'Hello, World!' response.\n", .{});
         }
 
         pub fn sendSettings(self: @This()) !void {
@@ -109,10 +147,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 return error.InvalidFrameType;
             }
 
-            if (frame_type == .SETTINGS) {
-                std.debug.print("Valid SETTINGS frame received.\n", .{});
-            }
-
             const stream_id_u32: u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
             const stream_id: u31 = @intCast(stream_id_u32);
 
@@ -133,7 +167,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             std.debug.print("Frame payload length: {d}\n", .{frame_header.length});
 
-            // Return valid frame
             return Frame{
                 .header = frame_header,
                 .payload = payload,
@@ -187,12 +220,13 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             var frame_header = FrameHeader{
                 .length = 0,
                 .frame_type = .SETTINGS,
-                .flags = FrameFlags{ .value = 1 }, // Set ACK flag
+                .flags = FrameFlags{ .value = FrameFlags.ACK }, // Set ACK flag
                 .reserved = false,
                 .stream_id = 0,
             };
 
-            try frame_header.write(self.writer);
+            try frame_header.write(self.writer); // No need for try or catch, as write returns void
+
             std.debug.print("Sent SETTINGS ACK frame\n", .{});
         }
 
@@ -313,8 +347,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         pub fn sendData(self: *@This(), stream: *Stream, data: []const u8, end_stream: bool) !void {
             std.debug.print("sendData called with data length: {d}\n", .{data.len});
 
-            if (data.len > self.send_window_size) {
-                return error.FlowControlError;
+            if (data.len > self.settings.max_frame_size) {
+                return error.FrameSizeError; // Ensure data doesn't exceed max frame size
             }
 
             try stream.sendData(data, end_stream);
@@ -323,7 +357,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             if (self.send_window_size < 0) {
                 // Send a WINDOW_UPDATE frame to increase the window size
-                try self.sendWindowUpdate(0, 65535); // Increase by a default value, adjust as necessary
+                try self.sendWindowUpdate(0, 65535); // Increase by a default value
             }
 
             std.debug.print("sendData completed with send_window_size: {d}\n", .{self.send_window_size});
@@ -389,7 +423,7 @@ test "HTTP/2 connection initialization and flow control" {
 
     // Send data
     const data = "Hello, world!";
-    try connection.sendData(&stream, data);
+    try connection.sendData(&stream, data, false);
 
     const written_data = buffer_stream.getWritten();
 
@@ -428,7 +462,7 @@ test "HTTP/2 connection initialization and flow control" {
 
     // Check that data was sent after reset
     const data_after_reset = "Hello again!";
-    try connection.sendData(&stream, data_after_reset);
+    try connection.sendData(&stream, data_after_reset, false);
 
     const sent_data = buffer_stream.getWritten();
     std.debug.print("Buffer after sending data: {x}\n", .{sent_data});
@@ -449,7 +483,7 @@ test "HTTP/2 connection initialization and flow control" {
     try connection.handleWindowUpdate(window_update_frame);
 
     // After handling WINDOW_UPDATE, we should be able to send more data
-    try connection.sendData(&stream, data_after_reset);
+    try connection.sendData(&stream, data_after_reset, false);
     const sent_data_after_window_update = buffer_stream.getWritten();
     assert(sent_data_after_window_update.len > sent_data.len);
 

@@ -202,7 +202,7 @@ test "create and handle stream" {
     try std.testing.expectEqual(@as(usize, 4), stream.recv_headers.items.len);
 
     const data = "Hello, world!";
-    try stream.sendData(data);
+    try stream.sendData(data, false);
 
     const writtenData = buffer_stream.getWritten();
     try std.testing.expect(writtenData.len > 0);
