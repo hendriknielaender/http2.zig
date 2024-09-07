@@ -34,33 +34,39 @@ pub fn main() !void {
     }
 }
 
-fn processConnection(connection: *Connection) !void {
-    while (true) {
-        const frame = try connection.receiveFrame();
+pub fn processConnection(connection: *Connection) !void {
+    var dynamic_table = try Hpack.DynamicTable.init(connection.allocator, 4096);
+    defer dynamic_table.table.deinit();
 
-        std.debug.print("Processing frame: {any}\n", .{frame.header.frame_type});
+    const frame = try Frame.read(connection.reader, connection.allocator);
 
-        switch (frame.header.frame_type) {
-            .SETTINGS => {
-                try connection.applyFrameSettings(frame);
-                try connection.sendSettingsAck();
-            },
-            .HEADERS => {
-                // Process incoming headers frame
-                var dynamic_table = try Hpack.DynamicTable.init(connection.allocator, 4096);
-                defer dynamic_table.table.deinit();
+    // Handle headers frame
+    if (frame.header.frame_type == FrameType.HEADERS) {
+        // Decode header fields
+        const decoded_header = try Hpack.decodeHeaderField(frame.payload, &dynamic_table);
+        std.debug.print("Decoded header: {s} = {s}\n", .{ decoded_header.name, decoded_header.value });
 
-                const decoded_header = try Hpack.decodeHeaderField(frame.payload, &dynamic_table);
-                std.debug.print("Decoded header: {s} = {s}\n", .{ decoded_header.name, decoded_header.value });
+        // After decoding request headers, respond with a simple message
+        const response_headers = [_]Hpack.HeaderField{
+            Hpack.HeaderField{ .name = ":status", .value = "200" },
+            Hpack.HeaderField{ .name = "content-type", .value = "text/plain" },
+        };
 
-                // Send HTTP/2 response after headers are received
-                try connection.sendResponse(frame.header.stream_id);
-            },
-            else => {
-                std.debug.print("Ignoring frame of type: {any}\n", .{frame.header.frame_type});
-            },
+        // Encode and send each header
+        for (response_headers) |header| {
+            const encoded_header = try Hpack.encodeHeaderField(header, &dynamic_table);
+            try connection.writer.writeAll(encoded_header);
         }
+
+        // Get the stream, handle errors
+        const stream = try connection.getStream(1); // Unwrap error union
+        // Send 'Hello, World!' response and set END_STREAM flag
+        const response_body = "Hello, World!";
+        try connection.sendData(stream, response_body, true); // Pass stream to sendData
     }
+
+    // Additional frame processing, if necessary
+    std.debug.print("Sent 'Hello, World!' response.\n", .{});
 }
 
 fn sendHelloWorldResponse(connection: *Connection, stream_id: u31) !void {
