@@ -190,7 +190,6 @@ pub const Hpack = struct {
 
         std.debug.print("Encoding field: {s}: {s}\n", .{ field.name, field.value });
 
-        // Check static table for the field
         const static_index = Hpack.StaticTable.getStaticIndex(field.name, field.value);
         if (static_index) |idx| {
             const encoded_idx: u8 = @intCast(0x80 | idx); // Encode static table index
@@ -211,11 +210,12 @@ pub const Hpack = struct {
 
             // Dynamic table index starts after the static table (index 62 and above)
             const dynamic_index = 62 + dynamic_table.table.items.len;
+            std.debug.print("Dynamic index for entry: {d}, Static table size: {d}, Dynamic table size: {d}\n", .{ dynamic_index, StaticTable.entries.len, dynamic_table.table.items.len });
 
-            // Ensure the dynamic index does not exceed the allowed limit
-            if (dynamic_index >= 62) {
-                std.debug.print("Dynamic index {d} exceeds the maximum allowed (62), returning InvalidEncoding\n", .{dynamic_index});
-                return error.InvalidEncoding; // Return an error to match the test expectation
+            // Ensure the dynamic index does not exceed the maximum allowed index
+            if (dynamic_index > 61) {
+                std.debug.print("Dynamic index {d} exceeds max, returning InvalidEncoding.\n", .{dynamic_index});
+                return error.InvalidEncoding; // Prevent invalid encoding by returning the error
             }
 
             try dynamic_table.addEntry(field);
@@ -227,7 +227,7 @@ pub const Hpack = struct {
 
     pub fn decodeHeaderField(payload: []const u8, dynamic_table: *DynamicTable) !HeaderField {
         const static_table_len = Hpack.StaticTable.entries.len;
-        const dynamic_table_len = dynamic_table.table.items.len;
+        const dynamic_table_len = dynamic_table.max_size;
 
         const index = try Hpack.decodeInt(7, payload, static_table_len, dynamic_table_len); // Decode the index from the payload
 
@@ -235,18 +235,19 @@ pub const Hpack = struct {
             return error.InvalidEncoding; // Index 0 is invalid, throw an error
         }
 
+        if (index > static_table_len + dynamic_table_len) {
+            std.debug.print("Invalid index {d}, returning InvalidEncoding.\n", .{index});
+            return error.InvalidEncoding; // Return an error for invalid indices
+        }
+
         if (index <= static_table_len) {
             // Use the static table if the index falls within its range
-            const header_field = Hpack.StaticTable.get(index - 1);
-            std.debug.print("Decoded from static table: {s}: {s}\n", .{ header_field.name, header_field.value });
-            return header_field;
+            return Hpack.StaticTable.get(index - 1);
         } else {
             // Otherwise, it falls into the dynamic table
             const dynamic_index = index - static_table_len;
-            if (dynamic_index < dynamic_table_len) {
-                const header_field = dynamic_table.getEntry(dynamic_index);
-                std.debug.print("Decoded from dynamic table: {s}: {s}\n", .{ header_field.name, header_field.value });
-                return header_field;
+            if (dynamic_index <= dynamic_table_len) {
+                return dynamic_table.getEntry(dynamic_index);
             } else {
                 return error.InvalidEncoding; // Invalid index, out of bounds
             }
