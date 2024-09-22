@@ -312,16 +312,22 @@ pub const Huffman = struct {
         for (input) |byte| {
             bit_buffer = (bit_buffer << 8) | @as(u64, byte);
             bit_count += 8;
+            std.debug.print("Processing byte: {x}, bit_buffer: {x}, bit_count: {}\n", .{ byte, bit_buffer, bit_count });
 
             while (bit_count >= 5) {
                 var matched = false;
 
                 if (bit_count >= 5) {
                     const short_code: u32 = @truncate(bit_buffer >> @intCast(bit_count - 5));
+                    std.debug.print("Short code: {x}\n", .{short_code});
                     if (short_code < 32) {
                         const entry = huffmanTable[short_code];
+                        std.debug.print("Attempting match with entry: code={x}, bits={}\n", .{ entry.code, entry.bits });
                         if (entry.bits <= bit_count) {
-                            if (entry.symbol == .eos) break;
+                            if (entry.symbol == .eos) {
+                                std.debug.print("EOS symbol encountered\n", .{});
+                                break;
+                            }
                             try decoded.append(entry.symbol.byte);
                             bit_count -= entry.bits;
                             bit_buffer &= (@as(u64, 1) << @intCast(bit_count)) - 1;
@@ -337,7 +343,10 @@ pub const Huffman = struct {
                             const shift_amount: u8 = bit_count - entry.bits;
                             const bits: u32 = @truncate(bit_buffer >> @intCast(shift_amount));
                             if (bits == entry.code) {
-                                if (entry.symbol == .eos) break;
+                                if (entry.symbol == .eos) {
+                                    std.debug.print("EOS symbol encountered in full table search\n", .{});
+                                    break;
+                                }
                                 try decoded.append(entry.symbol.byte);
                                 bit_count -= entry.bits;
                                 bit_buffer &= (@as(u64, 1) << @intCast(shift_amount)) - 1;
@@ -348,7 +357,10 @@ pub const Huffman = struct {
                     }
                 }
 
-                if (!matched) break;
+                if (!matched) {
+                    std.debug.print("No match found, breaking out of loop\n", .{});
+                    break;
+                }
             }
         }
 
