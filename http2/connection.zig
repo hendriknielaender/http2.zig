@@ -52,55 +52,18 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try self.writer.writeAll(http2_preface);
         }
 
-        pub fn sendResponse(self: *@This(), stream_id: u31) !void {
-            const response_headers = &[_]u8{
-                0x82, // :status = 200 (indexed header field in HPACK static table)
-                0x86, // Content-Length = (dynamic header field)
-            };
-
-            const response_body = "Hello, World!";
-
-            // Send HEADERS frame
-            var headers_frame = Frame{
-                .header = FrameHeader{
-                    .length = @intCast(response_headers.len),
-                    .frame_type = .HEADERS,
-                    .flags = FrameFlags{ .value = FrameFlags.END_HEADERS },
-                    .reserved = false,
-                    .stream_id = stream_id,
-                },
-                .payload = response_headers,
-            };
-            try headers_frame.write(self.writer);
-
-            // Send DATA frame
-            var data_frame = Frame{
-                .header = FrameHeader{
-                    .length = @intCast(response_body.len),
-                    .frame_type = .DATA,
-                    .flags = FrameFlags{ .value = FrameFlags.END_STREAM },
-                    .reserved = false,
-                    .stream_id = stream_id,
-                },
-                .payload = response_body,
-            };
-            try data_frame.write(self.writer);
-
-            std.debug.print("Sent 'Hello, World!' response.\n", .{});
-        }
-
         pub fn sendSettings(self: @This()) !void {
             const settings = [_][2]u32{
-                .{ 1, self.settings.header_table_size },
-                .{ 3, self.settings.max_concurrent_streams },
-                .{ 4, self.settings.initial_window_size },
-                .{ 5, self.settings.max_frame_size },
-                .{ 6, self.settings.max_header_list_size },
+                .{ 1, self.settings.header_table_size }, // HEADER_TABLE_SIZE
+                .{ 3, self.settings.max_concurrent_streams }, // MAX_CONCURRENT_STREAMS
+                .{ 4, self.settings.initial_window_size }, // INITIAL_WINDOW_SIZE
+                .{ 5, self.settings.max_frame_size }, // MAX_FRAME_SIZE
+                .{ 6, self.settings.max_header_list_size }, // MAX_HEADER_LIST_SIZE
             };
 
             // Define the settings frame header
             var frame_header = FrameHeader{
-                .length = @intCast(6 * settings.len),
+                .length = @intCast(6 * settings.len), // 6 bytes per setting
                 .frame_type = .SETTINGS,
                 .flags = FrameFlags.init(0),
                 .reserved = false,
@@ -112,7 +75,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             var buffer: [6]u8 = undefined;
             for (settings) |setting| {
+                // Serialize Setting ID as u16 (big-endian)
                 std.mem.writeInt(u16, buffer[0..2], @intCast(setting[0]), .big);
+                // Serialize Setting Value as u32 (big-endian)
                 std.mem.writeInt(u32, buffer[2..6], setting[1], .big);
 
                 std.debug.print("Writing setting: ", .{});
@@ -225,7 +190,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 .stream_id = 0,
             };
 
-            try frame_header.write(self.writer); // No need for try or catch, as write returns void
+            try frame_header.write(self.writer);
 
             std.debug.print("Sent SETTINGS ACK frame\n", .{});
         }
@@ -276,14 +241,55 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
         }
 
+        // ... [Existing Methods] ...
+
+        /// Sends a GOAWAY frame with the given parameters.
+        pub fn sendGoAway(self: @This(), last_stream_id: u31, error_code: u32, debug_data: []const u8) !void {
+            var buffer = std.ArrayList(u8).init(self.allocator.*);
+            defer buffer.deinit();
+
+            // Serialize Last-Stream-ID (31 bits) as 4 bytes (big-endian)
+            try buffer.append(@intCast((last_stream_id >> 24) & 0x7F));
+            try buffer.append(@intCast((last_stream_id >> 16) & 0xFF));
+            try buffer.append(@intCast((last_stream_id >> 8) & 0xFF));
+            try buffer.append(@intCast(last_stream_id & 0xFF));
+
+            // Serialize Error Code (32 bits) as 4 bytes (big-endian)
+            try buffer.append(@intCast((error_code >> 24) & 0xFF));
+            try buffer.append(@intCast((error_code >> 16) & 0xFF));
+            try buffer.append(@intCast((error_code >> 8) & 0xFF));
+            try buffer.append(@intCast(error_code & 0xFF));
+
+            // Append Debug Data if any
+            if (debug_data.len > 0) {
+                try buffer.appendSlice(debug_data);
+            }
+
+            const goaway_payload = try buffer.toOwnedSlice();
+
+            var goaway_frame = Frame{
+                .header = FrameHeader{
+                    .length = @intCast(goaway_payload.len),
+                    .frame_type = .GOAWAY,
+                    .flags = FrameFlags.init(0),
+                    .reserved = false,
+                    .stream_id = 0, // GOAWAY is always on stream 0
+                },
+                .payload = goaway_payload,
+            };
+
+            std.debug.print("Sending GOAWAY frame: {x}\n", .{goaway_payload});
+            try goaway_frame.write(self.writer);
+        }
+
         pub fn close(self: @This()) !void {
-            var goaway_frame: [17]u8 = undefined;
-            std.mem.writeInt(u24, goaway_frame[0..3], 8, .big);
-            goaway_frame[3] = 0x7; // type (GOAWAY)
-            goaway_frame[4] = 0; // flags
-            std.mem.writeInt(u32, goaway_frame[5..9], 0, .big); // last stream ID
-            std.mem.writeInt(u32, goaway_frame[9..13], 0, .big); // error code
-            try self.writer.writeAll(&goaway_frame);
+            // Here, `last_stream_id` should be the highest stream ID the server has processed.
+            // For simplicity, we'll use 1, as per your current implementation.
+            try self.sendGoAway(1, 0, "Closing connection gracefully");
+
+            // Optionally, send a GOAWAY frame with additional debug data or different error codes as needed.
+
+            // Finally, close the writer to terminate the connection.
         }
 
         pub fn getStream(self: *@This(), stream_id: u31) !*Stream {

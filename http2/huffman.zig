@@ -329,7 +329,7 @@ pub const Huffman = struct {
                 for (huffmanTable) |entry| {
                     if (entry.bits == code_bits and entry.code == code) {
                         if (entry.symbol == .eos) {
-                            return error.InvalidHuffmanCode;
+                            return error.InvalidHuffmanCode; // EOS within string is an error
                         }
                         try decoded.append(entry.symbol.byte);
                         code = 0;
@@ -362,7 +362,7 @@ pub const Huffman = struct {
             const masked_eos_code = (eos_code >> shift) & ((@as(u32, 1) << code_bits_u5) - 1);
 
             if (code != masked_eos_code) {
-                return error.InvalidHuffmanCode;
+                return error.InvalidHuffmanCode; // The remaining bits don't match the EOS padding
             }
         }
 

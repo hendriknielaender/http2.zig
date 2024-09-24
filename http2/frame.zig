@@ -127,7 +127,6 @@ pub const Frame = struct {
 
     pub fn read(reader: anytype, allocator: *std.mem.Allocator) !Frame {
         const header = try FrameHeader.read(reader);
-
         std.debug.print("Read FrameHeader: {any}\n", .{header});
 
         var payload_length = header.length;
@@ -135,14 +134,17 @@ pub const Frame = struct {
 
         if (header.flags.isPadded()) {
             padding_length = try reader.readByte();
-            payload_length -= @as(u24, padding_length.? + 1); // Account for the padding length byte
+            if (padding_length.? >= payload_length) {
+                return error.InvalidPaddingLength;
+            }
+            payload_length -= @as(u24, padding_length.? + 1); // Subtract padding length
+            std.debug.print("Padding length: {}\n", .{padding_length.?});
         }
 
         const payload = try allocator.alloc(u8, payload_length);
         _ = try reader.readAll(payload);
 
         if (padding_length != null) {
-            // Skip padding bytes
             _ = try reader.skipBytes(@as(u64, padding_length.?), .{});
         }
 
@@ -163,9 +165,6 @@ pub const Frame = struct {
         if (self.payload.len > 0) {
             try writer.writeAll(self.payload[0..self.header.length]);
         }
-
-        // Clearing the payload might cause issues here; remove or delay this if it’s causing problems
-        // self.payload = &[]u8{};
 
         // Handle padding if necessary
         if (self.header.flags.isPadded()) {
