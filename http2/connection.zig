@@ -368,83 +368,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             std.debug.print("sendData completed with send_window_size: {d}\n", .{self.send_window_size});
         }
-
-        fn getStream(self: *@This(), stream_id: u31) !*Stream {
-            if (self.streams.get(stream_id)) |stream| {
-                return stream;
-            } else {
-                var stream = try Stream.init(self.allocator, self, stream_id);
-                try self.streams.put(stream_id, &stream);
-                return &stream;
-            }
-        }
-
-        fn updateSendWindow(self: *@This(), increment: i32) !void {
-            self.send_window_size += increment;
-            if (self.send_window_size > 2147483647) { // Max value for a signed 31-bit integer
-                return error.FlowControlError;
-            }
-        }
-
-        fn updateRecvWindow(self: *@This(), delta: i32) void {
-            self.recv_window_size += delta;
-        }
-
-        fn sendWindowUpdate(self: *@This(), stream_id: u31, increment: i32) !void {
-            var frame_header = FrameHeader{
-                .length = 4,
-                .frame_type = .WINDOW_UPDATE,
-                .flags = FrameFlags.init(0),
-                .reserved = false,
-                .stream_id = stream_id,
-            };
-
-            var buffer: [4]u8 = undefined;
-            std.mem.writeInt(u32, &buffer, @intCast(increment), .big);
-
-            try frame_header.write(self.writer);
-            try self.writer.writeAll(&buffer);
-        }
-
-        pub fn handleWindowUpdate(self: *@This(), frame: Frame) !void {
-            if (frame.payload.len != 4) {
-                return error.InvalidFrameSize;
-            }
-
-            const pay: *const [4]u8 = @ptrCast(frame.payload[0..4]);
-            const increment = std.mem.readInt(u32, pay, .big);
-
-            if (increment > 0x7FFFFFFF) { // u31 max value
-                return error.FlowControlError;
-            }
-
-            if (frame.header.stream_id == 0) {
-                try self.updateSendWindow(@intCast(increment));
-            } else {
-                // Forward to the appropriate stream for handling
-                var stream = try self.getStream(frame.header.stream_id);
-                try stream.updateSendWindow(@intCast(increment));
-            }
-        }
-
-        pub fn sendData(self: *@This(), stream: *Stream, data: []const u8) !void {
-            std.debug.print("sendData called with data length: {d}\n", .{data.len});
-
-            if (data.len > self.send_window_size) {
-                return error.FlowControlError;
-            }
-
-            try stream.sendData(data);
-
-            self.send_window_size -= @intCast(data.len);
-
-            if (self.send_window_size < 0) {
-                // Send a WINDOW_UPDATE frame to increase the window size
-                try self.sendWindowUpdate(0, 65535); // Increase by a default value, adjust as necessary
-            }
-
-            std.debug.print("sendData completed with send_window_size: {d}\n", .{self.send_window_size});
-        }
     };
 }
 
@@ -567,7 +490,6 @@ test "HTTP/2 connection initialization and flow control" {
 
     // After handling WINDOW_UPDATE, we should be able to send more data
     try connection.sendData(&stream, data_after_reset, false);
-
     const sent_data_after_window_update = buffer_stream.getWritten();
     assert(sent_data_after_window_update.len > sent_data.len);
 

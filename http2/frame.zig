@@ -129,8 +129,6 @@ pub const Frame = struct {
         const header = try FrameHeader.read(reader);
         std.debug.print("Read FrameHeader: {any}\n", .{header});
 
-        std.debug.print("Read FrameHeader: {any}\n", .{header});
-
         var payload_length = header.length;
         var padding_length: ?u8 = null;
 
@@ -167,7 +165,6 @@ pub const Frame = struct {
         if (self.payload.len > 0) {
             try writer.writeAll(self.payload[0..self.header.length]);
         }
-
 
         // Handle padding if necessary
         if (self.header.flags.isPadded()) {
