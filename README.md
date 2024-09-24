@@ -23,7 +23,81 @@
 
 ## Installation
 
-Add `http2.zig` to your Zig project by including it in your build script.
+You can use `zig fetch` to conveniently set the hash in the `build.zig.zon` file and update an existing dependency.
+
+Run the following command to fetch the http2.zig package:
+```shell
+zig fetch https://github.com/hendriknielaender/http2.zig/archive/<COMMIT>.tar.gz --save
+```
+Using `zig fetch` simplifies managing dependencies by automatically handling the package hash, ensuring your `build.zig.zon` file is up to date.
+
+### Option 1 (build.zig.zon)
+
+1. Declare http2.zig as a dependency in `build.zig.zon`:
+
+   ```diff
+   .{
+       .name = "my-project",
+       .version = "1.0.0",
+       .paths = .{""},
+       .dependencies = .{
+   +       .http2 = .{
+   +           .url = "https://github.com/hendriknielaender/http2.zig/archive/<COMMIT>.tar.gz",
+   +       },
+       },
+   }
+   ```
+
+2. Add the module in `build.zig`:
+
+   ```diff
+   const std = @import("std");
+
+   pub fn build(b: *std.Build) void {
+       const target = b.standardTargetOptions(.{});
+       const optimize = b.standardOptimizeOption(.{});
+
+   +   const opts = .{ .target = target, .optimize = optimize };
+   +   const http2_module = b.dependency("http2", opts).module("http2");
+
+       const exe = b.addExecutable(.{
+           .name = "test",
+           .root_source_file = b.path("src/main.zig"),
+           .target = target,
+           .optimize = optimize,
+       });
+   +   exe.root_module.addImport("http2", http2_module);
+       exe.install();
+
+       ...
+   }
+   ```
+
+3. Get the package hash:
+
+   ```shell
+   $ zig build
+   my-project/build.zig.zon:6:20: error: url field is missing corresponding hash field
+           .url = "https://github.com/hendriknielaender/http2.zig/archive/<COMMIT>.tar.gz",
+                  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   note: expected .hash = "<HASH>",
+   ```
+
+4. Update `build.zig.zon` package hash value:
+
+   ```diff
+   .{
+       .name = "my-project",
+       .version = "1.0.0",
+       .paths = .{""},
+       .dependencies = .{
+           .http2 = .{
+               .url = "https://github.com/hendriknielaender/http2.zig/archive/<COMMIT>.tar.gz",
+   +           .hash = "<HASH>",
+           },
+       },
+   }
+   ```
 
 ## Usage
 

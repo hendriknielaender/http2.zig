@@ -271,35 +271,36 @@ pub const Huffman = struct {
 
     pub fn encode(input: []const u8, allocator: *std.mem.Allocator) ![]u8 {
         var bit_buffer: u64 = 0;
-        var bit_count: u8 = 0;
+        var bit_count: u6 = 0;
         var encoded = std.ArrayList(u8).init(allocator.*);
         defer encoded.deinit();
 
         for (input) |byte| {
             const huff = try findHuffmanEntry(byte);
-            const cast_bits: u8 = @intCast(huff.bits);
-            const shift_amount: u6 = @intCast(64 - cast_bits - bit_count);
-            bit_buffer |= @as(u64, huff.code) << shift_amount;
-            bit_count += cast_bits;
+            const code = huff.code;
+            const code_bits: u6 = @intCast(huff.bits);
+
+            bit_buffer = (bit_buffer << code_bits) | @as(u64, code);
+            bit_count += code_bits;
 
             while (bit_count >= 8) {
-                const cast_buffer: u8 = @intCast(bit_buffer >> 56);
-                try encoded.append(cast_buffer);
-                bit_buffer <<= 8;
                 bit_count -= 8;
+                const byte_to_append: u8 = @intCast((bit_buffer >> bit_count) & 0xFF);
+                try encoded.append(byte_to_append);
+                bit_buffer &= (@as(u64, 1) << bit_count) - 1; // Keep remaining bits
             }
         }
 
         if (bit_count > 0) {
-            // Add the remaining bits to the output
-            const remaining_bits = bit_buffer >> @intCast(64 - bit_count);
-            const remaining_byte: u8 = @truncate(remaining_bits << @intCast(8 - bit_count % 8));
+            const bits_to_pad: u6 = 8 - bit_count;
+            const bits_to_pad_u3: u3 = @intCast(bits_to_pad);
+            const pad_bits = (@as(u8, 1) << bits_to_pad_u3) - 1; // bits_to_pad bits of '1's
+            const buff_u8: u8 = @intCast(bit_buffer);
+            const remaining_byte = ((buff_u8 << bits_to_pad_u3) | pad_bits) & 0xFF;
             try encoded.append(remaining_byte);
         }
 
-        const result = encoded.toOwnedSlice();
-        //std.debug.print("Encoded result: {any}\n", .{result});
-        return result;
+        return encoded.toOwnedSlice();
     }
 
     pub fn decode(input: []const u8, allocator: *std.mem.Allocator) ![]u8 {
@@ -309,51 +310,63 @@ pub const Huffman = struct {
         var bit_buffer: u64 = 0;
         var bit_count: u8 = 0;
 
+        var code: u32 = 0;
+        var code_bits: u8 = 0;
+
         for (input) |byte| {
             bit_buffer = (bit_buffer << 8) | @as(u64, byte);
             bit_count += 8;
 
-            while (bit_count >= 5) {
-                var matched = false;
+            while (bit_count > 0) {
+                const bit_count_u6: u6 = @intCast(bit_count - 1);
+                const bit_u32: u32 = @intCast((bit_buffer >> bit_count_u6) & 0x1);
+                code = (code << 1) | bit_u32;
+                code_bits += 1;
+                bit_count -= 1;
 
-                if (bit_count >= 5) {
-                    const short_code: u32 = @truncate(bit_buffer >> @intCast(bit_count - 5));
-                    if (short_code < 32) {
-                        const entry = huffmanTable[short_code];
-                        if (entry.bits <= bit_count) {
-                            if (entry.symbol == .eos) break;
-                            try decoded.append(entry.symbol.byte);
-                            bit_count -= entry.bits;
-                            bit_buffer &= (@as(u64, 1) << @intCast(bit_count)) - 1;
-                            matched = true;
-                            continue;
+                // Attempt to find a matching Huffman code
+                var found = false;
+                for (huffmanTable) |entry| {
+                    if (entry.bits == code_bits and entry.code == code) {
+                        if (entry.symbol == .eos) {
+                            return error.InvalidHuffmanCode; // EOS within string is an error
                         }
+                        try decoded.append(entry.symbol.byte);
+                        code = 0;
+                        code_bits = 0;
+                        found = true;
+                        break;
                     }
                 }
 
-                if (!matched) {
-                    for (huffmanTable) |entry| {
-                        if (entry.bits <= bit_count) {
-                            const shift_amount: u8 = bit_count - entry.bits;
-                            const bits: u32 = @truncate(bit_buffer >> @intCast(shift_amount));
-                            if (bits == entry.code) {
-                                if (entry.symbol == .eos) break;
-                                try decoded.append(entry.symbol.byte);
-                                bit_count -= entry.bits;
-                                bit_buffer &= (@as(u64, 1) << @intCast(shift_amount)) - 1;
-                                matched = true;
-                                break;
-                            }
-                        }
-                    }
+                if (found) {
+                    continue;
                 }
 
-                if (!matched) break;
+                // If code length exceeds maximum code length, it's invalid
+                if (code_bits > 30) {
+                    return error.InvalidHuffmanCode;
+                }
             }
         }
 
-        const result = decoded.toOwnedSlice();
-        return result;
+        // After processing all bits, check for remaining bits
+        if (code_bits > 0) {
+            // The remaining bits should be a prefix of the EOS code
+            const eos_code: u32 = 0x3fffffff; // 30 bits
+            const eos_bits: u5 = 30;
+
+            const code_bits_u5: u5 = @intCast(code_bits);
+            const shift: u5 = eos_bits - code_bits_u5;
+
+            const masked_eos_code = (eos_code >> shift) & ((@as(u32, 1) << code_bits_u5) - 1);
+
+            if (code != masked_eos_code) {
+                return error.InvalidHuffmanCode; // The remaining bits don't match the EOS padding
+            }
+        }
+
+        return decoded.toOwnedSlice();
     }
 
     fn findHuffmanEntry(byte: u8) !HuffmanEntry {
@@ -405,5 +418,31 @@ test "Huffman encode decode consistency" {
         defer allocator.free(decoded);
 
         try std.testing.expect(std.mem.eql(u8, decoded, input));
+    }
+}
+
+test "Huffman encoding and decoding compliance with RFC 7541" {
+    var allocator = std.testing.allocator;
+
+    const test_cases = [_][]const u8{
+        "", // Empty string
+        "a", // Single character
+        "Hello, World!", // Simple ASCII string
+        "The quick brown fox jumps over the lazy dog", // Pangram
+        "0123456789", // Digits
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz", // All letters
+        " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", // Special characters
+        "Привет мир", // Unicode characters (Cyrillic)
+    };
+
+    for (test_cases) |input| {
+        // Since Huffman coding in HPACK operates on bytes, ensure the input is valid UTF-8
+        const encoded = try Huffman.encode(input, &allocator);
+        defer allocator.free(encoded);
+
+        const decoded = try Huffman.decode(encoded, &allocator);
+        defer allocator.free(decoded);
+
+        try std.testing.expectEqualStrings(input, decoded);
     }
 }

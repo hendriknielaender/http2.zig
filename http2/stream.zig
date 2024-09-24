@@ -128,7 +128,7 @@ pub const Stream = struct {
     }
 
     /// Sends data over the stream
-    pub fn sendData(self: *Stream, data: []const u8) !void {
+    pub fn sendData(self: *Stream, data: []const u8, end_stream: bool) !void {
         if (self.state != .Open and self.state != .HalfClosedLocal) {
             return error.InvalidStreamState;
         }
@@ -138,18 +138,13 @@ pub const Stream = struct {
         try self.send_data.appendSlice(data);
         self.send_window_size -= @intCast(data.len);
 
-        var flags = FrameFlags.init(0); // Initialize with no flags
-
-        // Condition to set the END_STREAM flag
-        if (self.send_data.items.len == data.len) { // This is the last data chunk
-            flags.setEndStream();
-        }
+        const frame_flags = if (end_stream) FrameFlags.init(FrameFlags.END_STREAM) else FrameFlags.init(0);
 
         var frame = Frame{
             .header = FrameHeader{
                 .length = @intCast(data.len),
                 .frame_type = .DATA,
-                .flags = flags,
+                .flags = frame_flags,
                 .reserved = false,
                 .stream_id = self.id,
             },
@@ -207,7 +202,7 @@ test "create and handle stream" {
     try std.testing.expectEqual(@as(usize, 4), stream.recv_headers.items.len);
 
     const data = "Hello, world!";
-    try stream.sendData(data);
+    try stream.sendData(data, false);
 
     const writtenData = buffer_stream.getWritten();
     try std.testing.expect(writtenData.len > 0);

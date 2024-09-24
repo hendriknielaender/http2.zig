@@ -1,8 +1,10 @@
 const std = @import("std");
-const Stream = @import("stream.zig").Stream;
-const Frame = @import("frame.zig").Frame;
-const FrameHeader = @import("frame.zig").FrameHeader;
-const FrameFlags = @import("frame.zig").FrameFlags;
+pub const Stream = @import("stream.zig").Stream;
+pub const Frame = @import("frame.zig").Frame;
+pub const FrameHeader = @import("frame.zig").FrameHeader;
+pub const FrameFlags = @import("frame.zig").FrameFlags;
+pub const FrameType = @import("frame.zig").FrameType;
+pub const Hpack = @import("hpack.zig");
 const assert = std.debug.assert;
 
 const http2_preface: []const u8 = "\x50\x52\x49\x20\x2A\x20\x48\x54\x54\x50\x2F\x32\x2E\x30\x0D\x0A\x0D\x0A\x53\x4D\x0D\x0A\x0D\x0A";
@@ -30,9 +32,18 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 .streams = std.AutoHashMap(u31, *Stream).init(allocator.*),
             };
 
-            if (!self.is_server) {
+            if (self.is_server) {
+                // Check for the correct HTTP/2 preface
+                var preface_buf: [24]u8 = undefined;
+                _ = try self.reader.readAll(&preface_buf);
+                if (!std.mem.eql(u8, &preface_buf, http2_preface)) {
+                    return error.InvalidPreface;
+                }
+                std.debug.print("Valid HTTP/2 preface received\n", .{});
+            } else {
                 try self.sendPreface();
             }
+
             try self.sendSettings();
             return self;
         }
@@ -41,18 +52,18 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try self.writer.writeAll(http2_preface);
         }
 
-        fn sendSettings(self: @This()) !void {
+        pub fn sendSettings(self: @This()) !void {
             const settings = [_][2]u32{
-                .{ 1, self.settings.header_table_size },
-                .{ 3, self.settings.max_concurrent_streams },
-                .{ 4, self.settings.initial_window_size },
-                .{ 5, self.settings.max_frame_size },
-                .{ 6, self.settings.max_header_list_size },
+                .{ 1, self.settings.header_table_size }, // HEADER_TABLE_SIZE
+                .{ 3, self.settings.max_concurrent_streams }, // MAX_CONCURRENT_STREAMS
+                .{ 4, self.settings.initial_window_size }, // INITIAL_WINDOW_SIZE
+                .{ 5, self.settings.max_frame_size }, // MAX_FRAME_SIZE
+                .{ 6, self.settings.max_header_list_size }, // MAX_HEADER_LIST_SIZE
             };
 
             // Define the settings frame header
             var frame_header = FrameHeader{
-                .length = @intCast(6 * settings.len),
+                .length = @intCast(6 * settings.len), // 6 bytes per setting
                 .frame_type = .SETTINGS,
                 .flags = FrameFlags.init(0),
                 .reserved = false,
@@ -64,7 +75,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             var buffer: [6]u8 = undefined;
             for (settings) |setting| {
+                // Serialize Setting ID as u16 (big-endian)
                 std.mem.writeInt(u16, buffer[0..2], @intCast(setting[0]), .big);
+                // Serialize Setting Value as u32 (big-endian)
                 std.mem.writeInt(u32, buffer[2..6], setting[1], .big);
 
                 std.debug.print("Writing setting: ", .{});
@@ -77,18 +90,143 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
         }
 
-        pub fn receiveSettings(self: @This()) !void {
+        fn from_int(val: u8) FrameType {
+            return std.meta.intToEnum(FrameType, val) catch undefined;
+        }
+
+        pub fn receiveFrame(self: *@This()) !Frame {
+            var header_buf: [9]u8 = undefined; // Frame header size is 9 bytes
+            _ = try self.reader.readAll(&header_buf);
+
+            std.debug.print("Raw header bytes: {x}\n", .{header_buf});
+
+            // Read frame type from the header buffer
+            const frame_type_u8: u8 = @intCast(header_buf[3]);
+            std.debug.print("Read frame_type_u8: {any} (dec: {d})\n", .{ frame_type_u8, frame_type_u8 });
+
+            const frame_type = from_int(frame_type_u8);
+
+            if (frame_type == undefined) {
+                std.debug.print("Invalid frame type received: {d} (hex: {any})\n", .{ frame_type_u8, frame_type_u8 });
+                std.debug.print("Full header buffer for context: {any}\n", .{header_buf});
+                return error.InvalidFrameType;
+            }
+
+            const stream_id_u32: u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
+            const stream_id: u31 = @intCast(stream_id_u32);
+
+            const frame_header = FrameHeader{
+                .length = std.mem.readInt(u24, header_buf[0..3], .big),
+                .frame_type = frame_type,
+                .flags = FrameFlags.init(header_buf[4]),
+                .reserved = (header_buf[5] & 0x80) != 0,
+                .stream_id = stream_id,
+            };
+
+            std.debug.print("Received frame header: {any}\n", .{frame_header});
+
+            const payload: []u8 = try self.allocator.alloc(u8, frame_header.length);
+            defer self.allocator.free(payload);
+
+            _ = try self.reader.readAll(payload);
+
+            std.debug.print("Frame payload length: {d}\n", .{frame_header.length});
+
+            return Frame{
+                .header = frame_header,
+                .payload = payload,
+            };
+        }
+
+        pub fn applyFrameSettings(self: *@This(), frame: Frame) !void {
+            std.debug.print("Applying settings from frame...\n", .{});
+
+            // Ensure the frame type is SETTINGS
+            if (frame.header.frame_type != .SETTINGS) {
+                return error.InvalidFrameType;
+            }
+
+            // The payload of the SETTINGS frame is already read into `frame.payload`
+            if (frame.payload.len % 6 != 0) {
+                return error.InvalidSettingsFrameSize;
+            }
+
+            var i: usize = 0;
+            while (i + 6 <= frame.payload.len) {
+                const setting = frame.payload[i .. i + 6];
+
+                // Decode setting ID and value
+                const id = std.mem.readInt(u16, setting[0..2], .big);
+                const value = std.mem.readInt(u32, setting[2..6], .big);
+
+                std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
+
+                // Apply the settings based on ID
+                switch (id) {
+                    1 => self.settings.header_table_size = value,
+                    2 => {
+                        if (value > 1) return error.InvalidSettingsValue;
+                        self.settings.enable_push = (value == 1);
+                    },
+                    3 => self.settings.max_concurrent_streams = value,
+                    4 => self.settings.initial_window_size = value,
+                    5 => self.settings.max_frame_size = value,
+                    6 => self.settings.max_header_list_size = value,
+                    else => std.debug.print("Unknown setting ID: {}\n", .{id}),
+                }
+
+                i += 6;
+            }
+
+            std.debug.print("Settings applied successfully.\n", .{});
+        }
+
+        pub fn sendSettingsAck(self: @This()) !void {
+            var frame_header = FrameHeader{
+                .length = 0,
+                .frame_type = .SETTINGS,
+                .flags = FrameFlags{ .value = FrameFlags.ACK }, // Set ACK flag
+                .reserved = false,
+                .stream_id = 0,
+            };
+
+            try frame_header.write(self.writer);
+
+            std.debug.print("Sent SETTINGS ACK frame\n", .{});
+        }
+
+        pub fn sendPong(self: *@This(), payload: []const u8) !void {
+            // Ensure the payload length is exactly 8 bytes as per the HTTP/2 specification for PING frames.
+            if (payload.len != 8) {
+                return error.InvalidPingPayload;
+            }
+
+            var frame_header = FrameHeader{
+                .length = 8, // PING payload length is always 8
+                .frame_type = .PING,
+                .flags = FrameFlags.init(FrameFlags.ACK),
+                .reserved = false,
+                .stream_id = 0,
+            };
+
+            try frame_header.write(self.writer);
+            try self.writer.writeAll(payload);
+        }
+
+        pub fn receiveSettings(self: *@This()) !void {
             const settings_frame_header_size = 9;
             var frame_header: [settings_frame_header_size]u8 = undefined;
-            try self.reader.readAll(&frame_header);
+            _ = try self.reader.readAll(&frame_header);
             const length = std.mem.readInt(u24, frame_header[0..3], .big);
             if (length % 6 != 0) return error.InvalidSettingsFrameSize;
 
             var settings_payload: []u8 = try self.allocator.alloc(u8, length);
             defer self.allocator.free(settings_payload);
-            try self.reader.readAll(settings_payload);
+            _ = try self.reader.readAll(settings_payload);
 
-            for (settings_payload.chunks(6)) |setting| {
+            var i: usize = 0;
+            while (i < settings_payload.len) {
+                const setting = settings_payload[i .. i + 6];
                 const id = std.mem.readInt(u16, setting[0..2], .big);
                 const value = std.mem.readInt(u32, setting[2..6], .big);
                 switch (id) {
@@ -99,17 +237,136 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     6 => self.settings.max_header_list_size = value,
                     else => {},
                 }
+                i += 6;
             }
         }
 
-        fn close(self: @This()) !void {
-            var goaway_frame: [17]u8 = undefined;
-            std.mem.writeInt(u24, goaway_frame[0..3], 8, .big);
-            goaway_frame[3] = 0x7; // type (GOAWAY)
-            goaway_frame[4] = 0; // flags
-            std.mem.writeInt(u32, goaway_frame[5..9], 0, .big); // last stream ID
-            std.mem.writeInt(u32, goaway_frame[9..13], 0, .big); // error code
-            try self.writer.writeAll(&goaway_frame);
+        // ... [Existing Methods] ...
+
+        /// Sends a GOAWAY frame with the given parameters.
+        pub fn sendGoAway(self: @This(), last_stream_id: u31, error_code: u32, debug_data: []const u8) !void {
+            var buffer = std.ArrayList(u8).init(self.allocator.*);
+            defer buffer.deinit();
+
+            // Serialize Last-Stream-ID (31 bits) as 4 bytes (big-endian)
+            try buffer.append(@intCast((last_stream_id >> 24) & 0x7F));
+            try buffer.append(@intCast((last_stream_id >> 16) & 0xFF));
+            try buffer.append(@intCast((last_stream_id >> 8) & 0xFF));
+            try buffer.append(@intCast(last_stream_id & 0xFF));
+
+            // Serialize Error Code (32 bits) as 4 bytes (big-endian)
+            try buffer.append(@intCast((error_code >> 24) & 0xFF));
+            try buffer.append(@intCast((error_code >> 16) & 0xFF));
+            try buffer.append(@intCast((error_code >> 8) & 0xFF));
+            try buffer.append(@intCast(error_code & 0xFF));
+
+            // Append Debug Data if any
+            if (debug_data.len > 0) {
+                try buffer.appendSlice(debug_data);
+            }
+
+            const goaway_payload = try buffer.toOwnedSlice();
+
+            var goaway_frame = Frame{
+                .header = FrameHeader{
+                    .length = @intCast(goaway_payload.len),
+                    .frame_type = .GOAWAY,
+                    .flags = FrameFlags.init(0),
+                    .reserved = false,
+                    .stream_id = 0, // GOAWAY is always on stream 0
+                },
+                .payload = goaway_payload,
+            };
+
+            std.debug.print("Sending GOAWAY frame: {x}\n", .{goaway_payload});
+            try goaway_frame.write(self.writer);
+        }
+
+        pub fn close(self: @This()) !void {
+            // Here, `last_stream_id` should be the highest stream ID the server has processed.
+            // For simplicity, we'll use 1, as per your current implementation.
+            try self.sendGoAway(1, 0, "Closing connection gracefully");
+
+            // Optionally, send a GOAWAY frame with additional debug data or different error codes as needed.
+
+            // Finally, close the writer to terminate the connection.
+        }
+
+        pub fn getStream(self: *@This(), stream_id: u31) !*Stream {
+            if (self.streams.get(stream_id)) |stream| {
+                return stream;
+            } else {
+                var stream = try Stream.init(self.allocator, self, stream_id);
+                try self.streams.put(stream_id, &stream);
+                return &stream;
+            }
+        }
+
+        fn updateSendWindow(self: *@This(), increment: i32) !void {
+            self.send_window_size += increment;
+            if (self.send_window_size > 2147483647) { // Max value for a signed 31-bit integer
+                return error.FlowControlError;
+            }
+        }
+
+        fn updateRecvWindow(self: *@This(), delta: i32) void {
+            self.recv_window_size += delta;
+        }
+
+        fn sendWindowUpdate(self: *@This(), stream_id: u31, increment: i32) !void {
+            var frame_header = FrameHeader{
+                .length = 4,
+                .frame_type = .WINDOW_UPDATE,
+                .flags = FrameFlags.init(0),
+                .reserved = false,
+                .stream_id = stream_id,
+            };
+
+            var buffer: [4]u8 = undefined;
+            std.mem.writeInt(u32, &buffer, @intCast(increment), .big);
+
+            try frame_header.write(self.writer);
+            try self.writer.writeAll(&buffer);
+        }
+
+        pub fn handleWindowUpdate(self: *@This(), frame: Frame) !void {
+            if (frame.payload.len != 4) {
+                return error.InvalidFrameSize;
+            }
+
+            const pay: *const [4]u8 = @ptrCast(frame.payload[0..4]);
+            const increment = std.mem.readInt(u32, pay, .big);
+
+            if (increment > 0x7FFFFFFF) { // u31 max value
+                return error.FlowControlError;
+            }
+
+            if (frame.header.stream_id == 0) {
+                try self.updateSendWindow(@intCast(increment));
+            } else {
+                // Forward to the appropriate stream for handling
+                var stream = try self.getStream(frame.header.stream_id);
+                try stream.updateSendWindow(@intCast(increment));
+            }
+        }
+
+        pub fn sendData(self: *@This(), stream: *Stream, data: []const u8, end_stream: bool) !void {
+            std.debug.print("sendData called with data length: {d}\n", .{data.len});
+
+            if (data.len > self.settings.max_frame_size) {
+                return error.FrameSizeError; // Ensure data doesn't exceed max frame size
+            }
+
+            try stream.sendData(data, end_stream);
+
+            self.send_window_size -= @intCast(data.len);
+
+            if (self.send_window_size < 0) {
+                // Send a WINDOW_UPDATE frame to increase the window size
+                try self.sendWindowUpdate(0, 65535); // Increase by a default value
+            }
+
+            std.debug.print("sendData completed with send_window_size: {d}\n", .{self.send_window_size});
         }
 
         fn getStream(self: *@This(), stream_id: u31) !*Stream {
@@ -249,16 +506,16 @@ test "HTTP/2 connection initialization and flow control" {
 
     // Send data
     const data = "Hello, world!";
-    try connection.sendData(&stream, data);
+    try connection.sendData(&stream, data, false);
 
     const written_data = buffer_stream.getWritten();
 
     // Debug each section length
-    std.debug.print("Written data preface length: {}\n", .{http2_preface.len});
-    std.debug.print("Written data settings frame length: {}\n", .{39});
-    std.debug.print("Written data headers frame length: {}\n", .{headers_written_data.len - preface_written_data.len});
-    std.debug.print("Written data payload length: {}\n", .{data.len});
-    std.debug.print("Total written data length: {}\n", .{written_data.len});
+    std.debug.print("Written data preface length: {any}\n", .{http2_preface.len});
+    std.debug.print("Written data settings frame length: {any}\n", .{39});
+    std.debug.print("Written data headers frame length: {any}\n", .{headers_written_data.len - preface_written_data.len});
+    std.debug.print("Written data payload length: {any}\n", .{data.len});
+    std.debug.print("Total written data length: {any}\n", .{written_data.len});
 
     // Inspect the buffer contents for unexpected data
     std.debug.print("Buffer content before handling headers: {x}\n", .{buffer_stream.getWritten()});
@@ -288,7 +545,7 @@ test "HTTP/2 connection initialization and flow control" {
 
     // Check that data was sent after reset
     const data_after_reset = "Hello again!";
-    try connection.sendData(&stream, data_after_reset);
+    try connection.sendData(&stream, data_after_reset, false);
 
     const sent_data = buffer_stream.getWritten();
     std.debug.print("Buffer after sending data: {x}\n", .{sent_data});
@@ -309,7 +566,8 @@ test "HTTP/2 connection initialization and flow control" {
     try connection.handleWindowUpdate(window_update_frame);
 
     // After handling WINDOW_UPDATE, we should be able to send more data
-    try connection.sendData(&stream, data_after_reset);
+    try connection.sendData(&stream, data_after_reset, false);
+
     const sent_data_after_window_update = buffer_stream.getWritten();
     assert(sent_data_after_window_update.len > sent_data.len);
 

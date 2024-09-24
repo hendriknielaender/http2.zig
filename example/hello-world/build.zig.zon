@@ -1,0 +1,17 @@
+.{
+    .name = "hello-world-example",
+    .version = "0.0.1",
+    .minimum_zig_version = "0.13.0",
+
+    .dependencies = .{
+        .http2 = .{
+            .path = "../../http2", // Path to the HTTP/2 library project
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}
