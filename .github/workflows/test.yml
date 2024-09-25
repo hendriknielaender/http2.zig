@@ -26,7 +26,7 @@ jobs:
       - name: Run h2spec tests
         run: |
           docker pull summerwind/h2spec
-          docker run --network bridge -p 8082:8080 summerwind/h2spec -h host.docker.internal -p 8081
+          docker run --network bridge -p 8082:8080 summerwind/h2spec -h 127.0.0.1 -p 8081
 
 
       - name: Stop HTTP/2 server
