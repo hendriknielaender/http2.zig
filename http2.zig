@@ -6,7 +6,8 @@ const Connection = http2.Connection(std.io.AnyReader, std.io.AnyWriter);
 const Hpack = hpack.Hpack;
 
 pub fn main() !void {
-    const address = try std.net.Address.resolveIp("127.0.0.1", 8080);
+    const address = try std.net.Address.resolveIp("0.0.0.0", 8080);
+
     var listener = try address.listen(.{ .reuse_address = true });
     defer listener.deinit();
 
