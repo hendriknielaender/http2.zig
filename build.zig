@@ -2,21 +2,23 @@ const std = @import("std");
 
 const Build = std.Build;
 
-// Although this function looks imperative, note that its job is to
-// declaratively construct a build graph that will be executed by an external
-// runner.
-pub fn build(b: *std.Build) void {
-    // Standard target options allows the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
+const version = std.SemanticVersion{ .major = 0, .minor = 0, .patch = 1 };
 
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Setup library
+    _ = setupLibrary(b, target, optimize);
+
+    // Setup exe
+    setupExe(b, target, optimize);
+
+    // Setup testing
+    setupTesting(b, target, optimize);
+}
+
+fn setupLibrary(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
     const boringssl_include_path = b.path("boringssl/include/openssl");
     const boringssl_lib_path = b.path("boringssl/build");
 
@@ -25,6 +27,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("http2/connection.zig"),
         .target = target,
         .optimize = optimize,
+        .version = version,
     });
 
     lib.linkLibC();
@@ -40,28 +43,55 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(lib);
 
-    // Creates a step for unit testing. This only builds the test executable
-    // but does not run it.
-    const lib_unit_tests = b.addTest(.{
-        .root_source_file = b.path("http2/connection.zig"),
+    return lib;
+}
+
+fn setupExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const exe_step = b.step("http2", "Build exe for http2 lib");
+
+    const exe = b.addExecutable(.{
+        .name = "http2",
+        .root_source_file = b.path("http2.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
-
-    lib_unit_tests.linkLibC();
+    exe.linkLibC();
 
     // Link OpenSSL libraries
-    lib_unit_tests.linkSystemLibrary("ssl");
-    lib_unit_tests.linkSystemLibrary("crypto");
+    exe.linkSystemLibrary("ssl");
+    exe.linkSystemLibrary("crypto");
 
-    lib_unit_tests.addIncludePath(boringssl_include_path);
-    lib_unit_tests.addLibraryPath(boringssl_lib_path);
+    const boringssl_include_path = b.path("boringssl/include/openssl");
+    const boringssl_lib_path = b.path("boringssl/build");
 
-    // Similar to creating the run step earlier, this exposes a `test` step to
-    // the `zig build --help` menu, providing a way for the user to request
-    // running the unit tests.
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_lib_unit_tests.step);
+    exe.addIncludePath(boringssl_include_path);
+    exe.addLibraryPath(boringssl_lib_path);
+
+    exe.addIncludePath(b.path("boringssl/include/openssl"));
+
+    b.installArtifact(exe);
+    exe_step.dependOn(&exe.step);
+}
+
+fn setupTesting(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const test_files = [_]struct { name: []const u8, path: []const u8 }{
+        .{ .name = "hpack", .path = "http2/hpack.zig" },
+        .{ .name = "huffman", .path = "http2/huffman.zig" },
+        .{ .name = "frame", .path = "http2/frame.zig" },
+        .{ .name = "stream", .path = "http2/stream.zig" },
+        .{ .name = "connection", .path = "http2/connection.zig" },
+    };
+
+    const test_step = b.step("test", "Run library tests");
+    for (test_files) |test_file| {
+        const _test = b.addTest(.{
+            .name = test_file.name,
+            .root_source_file = .{ .src_path = .{ .owner = b, .sub_path = test_file.path } },
+            .target = target,
+            .optimize = optimize,
+        });
+        const run_test = b.addRunArtifact(_test);
+        test_step.dependOn(&run_test.step);
+    }
 }

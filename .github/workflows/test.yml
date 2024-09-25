@@ -1,0 +1,37 @@
+name: HTTP/2 Conformance Test
+
+on: [pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Build http2.zig
+        run: zig build
+
+      - name: Start HTTP/2 server
+        run: ./zig-out/bin/http2 &
+        env:
+          PORT: 8081
+
+      - name: Get Host IP Address
+        id: host_ip
+        run: echo "::set-output name=ip::$(hostname -I | awk '{print $1}')"
+
+      - name: Run h2spec tests
+        run: |
+          docker pull summerwind/h2spec
+          docker run --network bridge -p 8082:8080 summerwind/h2spec -h ${{ steps.host_ip.outputs.ip }} -p 8081
+
+
+      - name: Stop HTTP/2 server
+        run: kill $(lsof -t -i:8080) || true
