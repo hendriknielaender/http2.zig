@@ -1,6 +1,6 @@
 name: HTTP/2 Conformance Test
 
-on: [push, pull_request]
+on: [pull_request]
 
 jobs:
   test:
