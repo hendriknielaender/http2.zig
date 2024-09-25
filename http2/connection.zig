@@ -37,6 +37,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 var preface_buf: [24]u8 = undefined;
                 _ = try self.reader.readAll(&preface_buf);
                 if (!std.mem.eql(u8, &preface_buf, http2_preface)) {
+                    try self.sendGoAway(0, 1, "Invalid preface: PROTOCOL_ERROR");
                     return error.InvalidPreface;
                 }
                 std.debug.print("Valid HTTP/2 preface received\n", .{});
@@ -46,6 +47,20 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             try self.sendSettings();
             return self;
+        }
+
+        pub fn deinit(self: @This()) void {
+            // Deinitialize all streams.
+            var it = self.streams.iterator();
+            while (it.next()) |_| {
+                //const stream = entry.value_ptr;
+                //stream.deinit();
+            }
+
+            // Deinitialize the stream hash map.
+            // self.streams.deinit();
+
+            std.debug.print("Resources deinitialized for connection\n", .{});
         }
 
         fn sendPreface(self: @This()) !void {
@@ -96,7 +111,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
         pub fn receiveFrame(self: *@This()) !Frame {
             var header_buf: [9]u8 = undefined; // Frame header size is 9 bytes
-            _ = try self.reader.readAll(&header_buf);
+
+            // Catching potential BrokenPipe or ConnectionResetByPeer
+            _ = self.reader.readAll(&header_buf) catch |err| {
+                if (err == error.BrokenPipe or err == error.ConnectionResetByPeer) {
+                    std.debug.print("Client disconnected (BrokenPipe or ConnectionResetByPeer)\n", .{});
+                    return err;
+                }
+                return err;
+            };
 
             std.debug.print("Raw header bytes: {x}\n", .{header_buf});
 
@@ -146,8 +169,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 return error.InvalidFrameType;
             }
 
-            // The payload of the SETTINGS frame is already read into `frame.payload`
+            // The payload of the SETTINGS frame must be a multiple of 6 bytes
             if (frame.payload.len % 6 != 0) {
+                std.debug.print("Invalid SETTINGS frame size: {d}\n", .{frame.payload.len});
                 return error.InvalidSettingsFrameSize;
             }
 
@@ -155,11 +179,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             while (i + 6 <= frame.payload.len) {
                 const setting = frame.payload[i .. i + 6];
 
-                // Decode setting ID and value
-                const id = std.mem.readInt(u16, setting[0..2], .big);
-                const value = std.mem.readInt(u32, setting[2..6], .big);
+                const id: u16 = std.mem.readInt(u16, setting[0..2], .big);
+                const value: u32 = std.mem.readInt(u32, setting[2..6], .big);
 
-                std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
+                std.debug.print("Applying Setting ID: {d}, Value: {d}\n", .{ id, value });
 
                 // Apply the settings based on ID
                 switch (id) {
@@ -190,7 +213,13 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 .stream_id = 0,
             };
 
-            try frame_header.write(self.writer);
+            frame_header.write(self.writer) catch |err| {
+                if (err == error.BrokenPipe) {
+                    std.debug.print("Client disconnected (BrokenPipe)\n", .{});
+                    return err;
+                }
+                return err;
+            };
 
             std.debug.print("Sent SETTINGS ACK frame\n", .{});
         }
@@ -241,8 +270,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
         }
 
-        // ... [Existing Methods] ...
-
         /// Sends a GOAWAY frame with the given parameters.
         pub fn sendGoAway(self: @This(), last_stream_id: u31, error_code: u32, debug_data: []const u8) !void {
             var buffer = std.ArrayList(u8).init(self.allocator.*);
@@ -283,13 +310,35 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         pub fn close(self: @This()) !void {
-            // Here, `last_stream_id` should be the highest stream ID the server has processed.
-            // For simplicity, we'll use 1, as per your current implementation.
-            try self.sendGoAway(1, 0, "Closing connection gracefully");
+            // Determine the highest stream ID that was processed
+            var highest_stream_id: u31 = 0;
 
-            // Optionally, send a GOAWAY frame with additional debug data or different error codes as needed.
+            var it = self.streams.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.* > highest_stream_id) {
+                    highest_stream_id = entry.key_ptr.*;
+                }
+            }
 
-            // Finally, close the writer to terminate the connection.
+            // Error code 0 indicates graceful shutdown; adjust this if specific errors need to be reported.
+            const error_code: u32 = 0; // 0: NO_ERROR, indicating graceful shutdown
+
+            // Optional debug data for GOAWAY frame, informing the client about the reason
+            const debug_data = "Connection closing: graceful shutdown";
+
+            // Send the GOAWAY frame with the highest stream ID and debug information
+            try self.sendGoAway(highest_stream_id, error_code, debug_data);
+
+            // Ensure the GOAWAY frame is fully sent before closing the connection.
+            // try self.writer.flush();
+
+            // Close the underlying writer and terminate the connection gracefully
+            // try self.writer.close();
+
+            // Optionally, free up resources associated with streams
+            @constCast(&self.streams).deinit();
+
+            std.debug.print("Connection closed gracefully with GOAWAY frame\n", .{});
         }
 
         pub fn getStream(self: *@This(), stream_id: u31) !*Stream {
