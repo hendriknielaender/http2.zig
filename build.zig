@@ -50,7 +50,7 @@ fn setupExe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
     const exe_step = b.step("http2", "Build exe for http2 lib");
 
     const exe = b.addExecutable(.{
-        .name = "http2_server",
+        .name = "http2",
         .root_source_file = b.path("http2.zig"),
         .target = target,
         .optimize = optimize,
