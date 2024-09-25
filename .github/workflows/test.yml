@@ -27,3 +27,6 @@ jobs:
         run: |
           docker pull summerwind/h2spec
           docker run --network host summerwind/h2spec -h 127.0.0.1 -p 8080 --tls
+
+      - name: Stop HTTP/2 server
+        run: kill $(lsof -t -i:8080) || true
