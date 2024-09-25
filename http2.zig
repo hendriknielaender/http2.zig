@@ -6,12 +6,12 @@ const Connection = http2.Connection(std.io.AnyReader, std.io.AnyWriter);
 const Hpack = hpack.Hpack;
 
 pub fn main() !void {
-    const address = try std.net.Address.resolveIp("0.0.0.0", 8080);
+    const address = try std.net.Address.resolveIp("0.0.0.0", 8081);
 
     var listener = try address.listen(.{ .reuse_address = true });
     defer listener.deinit();
 
-    std.debug.print("Listening on 127.0.0.1:8080...\n", .{});
+    std.debug.print("Listening on 127.0.0.1:8081...\n", .{});
 
     while (true) {
         var conn = try listener.accept();

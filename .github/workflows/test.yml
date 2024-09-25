@@ -21,12 +21,13 @@ jobs:
       - name: Start HTTP/2 server
         run: ./zig-out/bin/http2 &
         env:
-          PORT: 8080
+          PORT: 8081
 
       - name: Run h2spec tests
         run: |
           docker pull summerwind/h2spec
-          docker run -p 8080:8080 summerwind/h2spec -h host.docker.internal -p 8080
+          docker run --network bridge -p 8081:8080 summerwind/h2spec -h 127.0.0.1 -p 8081
+
 
       - name: Stop HTTP/2 server
         run: kill $(lsof -t -i:8080) || true
