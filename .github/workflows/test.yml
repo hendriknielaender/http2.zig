@@ -19,7 +19,7 @@ jobs:
         run: zig build
 
       - name: Start HTTP/2 server
-        run: ./zig-out/bin/http2
+        run: ./zig-out/bin/http2_server &
         env:
           PORT: 8080
 
