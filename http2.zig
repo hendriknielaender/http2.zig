@@ -14,16 +14,13 @@ pub fn main() !void {
 
     while (true) {
         var conn = try listener.accept();
-        defer conn.stream.close(); // Ensure stream is closed
+        //defer conn.stream.close(); // Ensure stream is closed
 
         std.debug.print("Accepted connection from: {any}\n", .{conn.address});
 
         var server_conn = Connection.init(@constCast(&std.heap.page_allocator), conn.stream.reader().any(), conn.stream.writer().any(), true) catch |err| {
             if (err == error.InvalidPreface) {
                 std.debug.print("Invalid HTTP/2 preface, closing connection\n", .{});
-                // Send a GOAWAY frame with PROTOCOL_ERROR and close the connection
-                conn.stream.close();
-                break;
             } else if (err == error.BrokenPipe) {
                 std.debug.print("Client disconnected (BrokenPipe)\n", .{});
             } else {
@@ -73,7 +70,7 @@ fn handleHttp2Connection(server_conn: *Connection) !void {
             },
             .GOAWAY => {
                 std.debug.print("Received GOAWAY frame, closing connection\n", .{});
-                return server_conn.close();
+                //return server_conn.close();
             },
             else => {
                 std.debug.print("Unknown frame type: {s}\n", .{@tagName(frame.header.frame_type)});
