@@ -7,7 +7,6 @@ const Hpack = hpack.Hpack;
 
 pub fn main() !void {
     const address = try std.net.Address.resolveIp("0.0.0.0", 8081);
-
     var listener = try address.listen(.{ .reuse_address = true });
     defer listener.deinit();
 
@@ -22,7 +21,9 @@ pub fn main() !void {
         var server_conn = Connection.init(@constCast(&std.heap.page_allocator), conn.stream.reader().any(), conn.stream.writer().any(), true) catch |err| {
             if (err == error.InvalidPreface) {
                 std.debug.print("Invalid HTTP/2 preface, closing connection\n", .{});
-                // Connection will close after GOAWAY is sent
+                // Send a GOAWAY frame with PROTOCOL_ERROR and close the connection
+                conn.stream.close();
+                break;
             } else if (err == error.BrokenPipe) {
                 std.debug.print("Client disconnected (BrokenPipe)\n", .{});
             } else {
@@ -38,26 +39,13 @@ pub fn main() !void {
                 std.debug.print("Error handling connection: {s}\n", .{@errorName(err)});
             }
         };
-
         std.debug.print("Closing connection from: {any}\n", .{conn.address});
     }
 }
 
 fn handleHttp2Connection(server_conn: *Connection) !void {
-    // Send the SETTINGS frame to the client
-    try server_conn.sendSettings();
-    std.debug.print("Sent HTTP/2 SETTINGS frame\n", .{});
-
-    // Loop to process incoming frames
     while (true) {
-        const frame = server_conn.receiveFrame() catch |err| {
-            if (err == error.BrokenPipe or err == error.ConnectionResetByPeer) {
-                std.debug.print("Client disconnected: {any}\n", .{err});
-                return server_conn.close();
-            }
-            return err;
-        };
-
+        const frame = try server_conn.receiveFrame();
         std.debug.print("Received frame of type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
 
         switch (frame.header.frame_type) {
@@ -81,7 +69,7 @@ fn handleHttp2Connection(server_conn: *Connection) !void {
             },
             .DATA => {
                 std.debug.print("Received DATA frame\n", .{});
-                // Handle data frame
+                // Handle incoming data frames, potentially implementing flow control
             },
             .GOAWAY => {
                 std.debug.print("Received GOAWAY frame, closing connection\n", .{});
@@ -89,6 +77,7 @@ fn handleHttp2Connection(server_conn: *Connection) !void {
             },
             else => {
                 std.debug.print("Unknown frame type: {s}\n", .{@tagName(frame.header.frame_type)});
+                return server_conn.close();
             },
         }
     }

@@ -40,6 +40,13 @@ pub const Stream = struct {
         };
     }
 
+    pub fn deinit(self: *Stream, allocator: *std.mem.Allocator) void {
+        self.recv_headers.deinit(allocator);
+        self.send_headers.deinit(allocator);
+        self.recv_data.deinit(allocator);
+        self.send_data.deinit(allocator);
+    }
+
     /// Handles incoming frames for the stream
     pub fn handleFrame(self: *Stream, frame: Frame) !void {
         std.debug.print("Handling frame type: {d}, stream ID: {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });

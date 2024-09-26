@@ -33,32 +33,35 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             };
 
             if (self.is_server) {
-                // Check for the correct HTTP/2 preface
+                // Check for the correct HTTP/2 preface (RFC 9113, section 3.4)
                 var preface_buf: [24]u8 = undefined;
                 _ = try self.reader.readAll(&preface_buf);
+
                 if (!std.mem.eql(u8, &preface_buf, http2_preface)) {
-                    try self.sendGoAway(0, 1, "Invalid preface: PROTOCOL_ERROR");
+                    const PROTOCOL_ERROR: u32 = 0x1; // PROTOCOL_ERROR is 0x1 as per RFC 9113
+                    std.debug.print("Invalid HTTP/2 preface, sending GOAWAY frame...\n", .{});
+
+                    // Send GOAWAY frame and ensure it is flushed
+                    try self.sendGoAway(0, PROTOCOL_ERROR, "Invalid preface: PROTOCOL_ERROR");
+
+                    // Ensure the connection is closed after sending the GOAWAY frame
                     return error.InvalidPreface;
                 }
                 std.debug.print("Valid HTTP/2 preface received\n", .{});
             } else {
+                // Client-side, send preface and settings
                 try self.sendPreface();
             }
 
+            // Both client and server send their settings frames
             try self.sendSettings();
+
             return self;
         }
 
         pub fn deinit(self: @This()) void {
-            // Deinitialize all streams.
-            var it = self.streams.iterator();
-            while (it.next()) |_| {
-                //const stream = entry.value_ptr;
-                //stream.deinit();
-            }
-
             // Deinitialize the stream hash map.
-            // self.streams.deinit();
+            self.streams.deinit();
 
             std.debug.print("Resources deinitialized for connection\n", .{});
         }
@@ -132,6 +135,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             if (frame_type == undefined) {
                 std.debug.print("Invalid frame type received: {d} (hex: {any})\n", .{ frame_type_u8, frame_type_u8 });
                 std.debug.print("Full header buffer for context: {any}\n", .{header_buf});
+                try self.sendGoAway(0, 1, "Invalid frame type: PROTOCOL_ERROR");
                 return error.InvalidFrameType;
             }
 
@@ -164,41 +168,59 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         pub fn applyFrameSettings(self: *@This(), frame: Frame) !void {
             std.debug.print("Applying settings from frame...\n", .{});
 
-            // Ensure the frame type is SETTINGS
+            // Ensure the frame is of type SETTINGS
             if (frame.header.frame_type != .SETTINGS) {
+                std.debug.print("Received frame with invalid frame type: {any}\n", .{frame.header.frame_type});
                 return error.InvalidFrameType;
+            }
+
+            // SETTINGS frame must be on stream 0
+            if (frame.header.stream_id != 0) {
+                std.debug.print("SETTINGS frame received on a non-zero stream ID: {any}\n", .{frame.header.stream_id});
+                return error.InvalidStreamId;
             }
 
             // The payload of the SETTINGS frame must be a multiple of 6 bytes
             if (frame.payload.len % 6 != 0) {
-                std.debug.print("Invalid SETTINGS frame size: {d}\n", .{frame.payload.len});
+                std.debug.print("Invalid SETTINGS frame size: {any}\n", .{frame.payload.len});
                 return error.InvalidSettingsFrameSize;
             }
 
+            const buffer = frame.payload;
+            const buffer_size: usize = buffer.len;
+
+            std.debug.print("Processing SETTINGS frame with payload length: {d} bytes\n", .{buffer_size});
+
+            // Ensure the buffer is large enough before reading
             var i: usize = 0;
-            while (i + 6 <= frame.payload.len) {
-                const setting = frame.payload[i .. i + 6];
+            while (i + 6 <= buffer_size) {
+                std.debug.print("Processing setting starting at index {d}. Remaining buffer size: {d}\n", .{ i, buffer_size - i });
 
-                const id: u16 = std.mem.readInt(u16, setting[0..2], .big);
-                const value: u32 = std.mem.readInt(u32, setting[2..6], .big);
+                // Safely read the ID and Value using std.mem.readInt with endian handling
+                const id_slice: *const [2]u8 = @ptrCast(&buffer[i .. i + 2]);
 
-                std.debug.print("Applying Setting ID: {d}, Value: {d}\n", .{ id, value });
+                const id: u16 = std.mem.readInt(u16, id_slice, .big);
 
-                // Apply the settings based on ID
+                const value_slice: *const [4]u8 = @ptrCast(&buffer[i + 2 .. i + 6]);
+
+                const value: u32 = std.mem.readInt(u32, value_slice, .big);
+
+                std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
+
                 switch (id) {
                     1 => self.settings.header_table_size = value,
-                    2 => {
-                        if (value > 1) return error.InvalidSettingsValue;
-                        self.settings.enable_push = (value == 1);
-                    },
+                    2 => self.settings.enable_push = (value == 1),
                     3 => self.settings.max_concurrent_streams = value,
                     4 => self.settings.initial_window_size = value,
-                    5 => self.settings.max_frame_size = value,
+                    5 => {
+                        if (value < 16384 or value > 16777215) return error.InvalidFrameSize;
+                        self.settings.max_frame_size = value;
+                    },
                     6 => self.settings.max_header_list_size = value,
-                    else => std.debug.print("Unknown setting ID: {}\n", .{id}),
+                    else => std.debug.print("Unknown setting ID: {d}\n", .{id}),
                 }
 
-                i += 6;
+                i += 6; // Move to the next setting (6 bytes per setting)
             }
 
             std.debug.print("Settings applied successfully.\n", .{});
@@ -330,7 +352,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try self.sendGoAway(highest_stream_id, error_code, debug_data);
 
             // Ensure the GOAWAY frame is fully sent before closing the connection.
-            // try self.writer.flush();
 
             // Close the underlying writer and terminate the connection gracefully
             // try self.writer.close();
@@ -544,4 +565,46 @@ test "HTTP/2 connection initialization and flow control" {
 
     // Clean up
     try connection.close();
+}
+
+test "applyFrameSettings test" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buffer);
+
+    const reader = stream.reader().any();
+    const writer = stream.writer().any();
+
+    var alloc = arena.allocator();
+
+    const ConnectionType = Connection(@TypeOf(reader), @TypeOf(writer));
+    var connection = try ConnectionType.init(&alloc, reader, writer, false);
+
+    // Frame with the SETTINGS type and 18 bytes of payload
+    const frame = Frame{
+        .header = FrameHeader{
+            .length = 18, // 3 settings of 6 bytes each
+            .frame_type = FrameType.SETTINGS,
+            .flags = FrameFlags.init(0),
+            .reserved = false,
+            .stream_id = 0,
+        },
+        .payload = &[_]u8{
+            // Example settings: ID 1, value 4096; ID 3, value 100; ID 4, value 65535
+            0x00, 0x01, 0x00, 0x00, 0x10, 0x00, // header_table_size: 4096
+            0x00, 0x03, 0x00, 0x00, 0x00, 0x64, // max_concurrent_streams: 100
+            0x00, 0x04, 0x00, 0x00, 0xFF, 0xFF, // initial_window_size: 65535
+        },
+    };
+
+    // Call the function to apply the frame settings via connection
+    try connection.applyFrameSettings(frame);
+
+    // Assert that the settings were applied correctly in the connection
+    try std.testing.expect(connection.settings.header_table_size == 4096);
+    try std.testing.expect(connection.settings.max_concurrent_streams == 100);
+    try std.testing.expect(connection.settings.initial_window_size == 65535);
+    std.debug.print("Settings applied successfully in test\n", .{});
 }
