@@ -261,7 +261,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             };
 
             try frame_header.write(self.writer);
-            try self.writer.writeAll(payload);
+
+            std.debug.print("Sent PONG frame with payload\n", .{});
         }
 
         pub fn receiveSettings(self: *@This()) !void {

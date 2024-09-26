@@ -45,6 +45,18 @@ fn handleHttp2Connection(server_conn: *Connection) !void {
         const frame = try server_conn.receiveFrame();
         std.debug.print("Received frame of type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
 
+        // Check if the frame type is valid; if not, discard it.
+        if (!isValidFrameType(frame.header.frame_type)) {
+            std.debug.print("Ignoring unknown frame type: {any}\n", .{frame.header.frame_type});
+            continue; // Ignore unknown frame types
+        }
+
+        // Validate flags (e.g., undefined flags should be ignored)
+        if (!isValidFlags(frame.header)) {
+            std.debug.print("Ignoring frame with undefined flags\n", .{});
+            continue; // Ignore frames with invalid or undefined flags
+        }
+
         switch (frame.header.frame_type) {
             .SETTINGS => {
                 std.debug.print("Received SETTINGS frame\n", .{});
@@ -74,9 +86,28 @@ fn handleHttp2Connection(server_conn: *Connection) !void {
             },
             else => {
                 std.debug.print("Unknown frame type: {s}\n", .{@tagName(frame.header.frame_type)});
-                return server_conn.close();
+                continue;
             },
         }
+    }
+}
+
+// Helper function to validate frame types
+fn isValidFrameType(frame_type: http2.FrameType) bool {
+    switch (frame_type) {
+        // List valid frame types
+        .SETTINGS, .PING, .WINDOW_UPDATE, .HEADERS, .DATA, .GOAWAY => return true,
+        else => return false,
+    }
+}
+
+// Helper function to validate flags for different frame types
+fn isValidFlags(header: http2.FrameHeader) bool {
+    // Add logic to validate flags based on frame type
+    switch (header.frame_type) {
+        .PING => return header.flags.value & http2.FrameFlags.ACK == 0, // PING only allows the ACK flag
+        // Add other frame type flag checks here if needed
+        else => return true, // Default to true if no specific flag validation is required
     }
 }
 
