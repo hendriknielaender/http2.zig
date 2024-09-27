@@ -70,6 +70,156 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try self.writer.writeAll(http2_preface);
         }
 
+        pub fn handleConnection(self: *@This()) !void {
+            while (true) {
+                const frame = self.receiveFrame() catch |err| {
+                    if (err == error.InvalidFrameType) {
+                        std.debug.print("Invalid frame type received, discarding.\n", .{});
+                        try self.sendPing();
+                        try self.sendGoAway(0, 0x01, "Invalid Frame Type: PROTOCOL_ERROR");
+
+                        break;
+                    } else {
+                        std.debug.print("Error receiving frame: {s}\n", .{@errorName(err)});
+                        return err; // Handle non-frame-related errors
+                    }
+                };
+
+                // Process valid frames
+                std.debug.print("Received frame of type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
+
+                if (!isValidFrameType(frame.header.frame_type)) {
+                    std.debug.print("Ignoring unknown frame type: {any}\n", .{frame.header.frame_type});
+                    try self.sendPing();
+                    try self.sendGoAway(0, 0x01, "Invalid Frame Type: PROTOCOL_ERROR");
+
+                    continue; // Ignore unknown frame types
+                }
+
+                if (!isValidFlags(frame.header)) {
+                    std.debug.print("Ignoring frame with undefined flags\n", .{});
+                    try self.sendPing();
+                    try self.sendGoAway(0, 0x01, "Invalid Frame flags: PROTOCOL_ERROR");
+
+                    continue; // Ignore frames with invalid or undefined flags
+                }
+
+                switch (frame.header.frame_type) {
+                    .SETTINGS => {
+                        std.debug.print("Received SETTINGS frame\n", .{});
+                        try self.applyFrameSettings(frame);
+                        try self.sendSettingsAck();
+                        std.debug.print("Sent SETTINGS ACK\n", .{});
+                    },
+                    .PING => {
+                        std.debug.print("Received PING frame, responding with PING (ACK)\n", .{});
+                        try self.sendPing();
+                    },
+                    .WINDOW_UPDATE => {
+                        std.debug.print("Received WINDOW_UPDATE frame\n", .{});
+                        try self.handleWindowUpdate(frame);
+                    },
+                    .HEADERS => {
+                        std.debug.print("Received HEADERS frame\n", .{});
+                        try processRequest(self, frame.header.stream_id);
+                    },
+                    .DATA => {
+                        std.debug.print("Received DATA frame\n", .{});
+                        // Handle incoming data frames
+                    },
+                    .GOAWAY => {
+                        std.debug.print("Received GOAWAY frame, closing connection\n", .{});
+                        return self.close(); // Gracefully close connection
+                    },
+                    else => {
+                        std.debug.print("Unknown frame type: {s}\n", .{@tagName(frame.header.frame_type)});
+                        continue; // Ensure unknown frame types are ignored
+                    },
+                }
+            }
+        }
+
+        fn processRequest(server_conn: *@This(), stream_id: u31) !void {
+            std.debug.print("Processing request for stream ID: {d}\n", .{stream_id});
+            var dynamic_table = try Hpack.Hpack.DynamicTable.init(@constCast(&std.heap.page_allocator), 4096); // Initialize dynamic table with 4KB size
+
+            // Prepare a basic response: "Hello, World!"
+            const response_body = "Hello, World!";
+            const response_headers = [_]Hpack.Hpack.HeaderField{
+                .{ .name = ":status", .value = "200" },
+            };
+
+            var buffer = std.ArrayList(u8).init(std.heap.page_allocator);
+            defer buffer.deinit();
+
+            // Encode headers and write them to the buffer
+            for (response_headers) |header| {
+                try Hpack.Hpack.encodeHeaderField(header, &dynamic_table, &buffer);
+            }
+
+            const encoded_headers = buffer.items;
+
+            // Send HEADERS frame
+            var headers_frame = Frame{
+                .header = FrameHeader{
+                    .length = @intCast(encoded_headers.len),
+                    .frame_type = .HEADERS,
+                    .flags = FrameFlags{
+                        .value = FrameFlags.END_HEADERS, // Mark end of headers
+                    },
+                    .reserved = false,
+                    .stream_id = stream_id,
+                },
+                .payload = encoded_headers,
+            };
+            try headers_frame.write(server_conn.writer);
+
+            // Send DATA frame with "Hello, World!" response
+            var data_frame = Frame{
+                .header = FrameHeader{
+                    .length = @intCast(response_body.len),
+                    .frame_type = .DATA,
+                    .flags = FrameFlags{
+                        .value = FrameFlags.END_STREAM, // Mark end of stream
+                    },
+                    .reserved = false,
+                    .stream_id = stream_id,
+                },
+                .payload = response_body,
+            };
+            try data_frame.write(server_conn.writer);
+
+            std.debug.print("Sent 200 OK response with body: \"Hello, World!\"\n", .{});
+        }
+
+        // Helper function to validate frame types
+        fn isValidFrameType(frame_type: FrameType) bool {
+            switch (frame_type) {
+                // List valid frame types
+                .SETTINGS, .PING, .WINDOW_UPDATE, .HEADERS, .DATA, .GOAWAY => return true,
+                else => return false,
+            }
+        }
+
+        // Helper function to validate flags for different frame types
+        fn isValidFlags(header: FrameHeader) bool {
+            switch (header.frame_type) {
+                .PING => {
+                    // PING frame allows only the ACK flag (0x1)
+                    return header.flags.value & FrameFlags.ACK == 0;
+                },
+                .SETTINGS => {
+                    // SETTINGS frame only allows the ACK flag
+                    return header.flags.value & FrameFlags.ACK == 0;
+                },
+                .WINDOW_UPDATE, .HEADERS, .DATA => {
+                    // Add validation for other frame types if necessary
+                    return true; // Accept any flags for now, ignoring undefined flags
+                },
+                else => return true, // By default, ignore any undefined flags
+            }
+        }
+
         pub fn sendSettings(self: @This()) !void {
             const settings = [_][2]u32{
                 .{ 1, self.settings.header_table_size }, // HEADER_TABLE_SIZE
@@ -135,7 +285,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             if (frame_type == undefined) {
                 std.debug.print("Invalid frame type received: {d} (hex: {any})\n", .{ frame_type_u8, frame_type_u8 });
                 std.debug.print("Full header buffer for context: {any}\n", .{header_buf});
-                try self.sendGoAway(0, 1, "Invalid frame type: PROTOCOL_ERROR");
                 return error.InvalidFrameType;
             }
 
@@ -246,23 +395,19 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             std.debug.print("Sent SETTINGS ACK frame\n", .{});
         }
 
-        pub fn sendPong(self: *@This(), payload: []const u8) !void {
-            // Ensure the payload length is exactly 8 bytes as per the HTTP/2 specification for PING frames.
-            if (payload.len != 8) {
-                return error.InvalidPingPayload;
-            }
-
+        pub fn sendPing(self: *@This()) !void {
             var frame_header = FrameHeader{
                 .length = 8, // PING payload length is always 8
                 .frame_type = .PING,
-                .flags = FrameFlags.init(FrameFlags.ACK),
+                .flags = FrameFlags{ .value = FrameFlags.ACK }, // Set ACK flag
+
                 .reserved = false,
                 .stream_id = 0,
             };
 
             try frame_header.write(self.writer);
 
-            std.debug.print("Sent PONG frame with payload\n", .{});
+            std.debug.print("Sent PING frame\n", .{});
         }
 
         pub fn receiveSettings(self: *@This()) !void {
