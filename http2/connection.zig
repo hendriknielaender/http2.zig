@@ -124,8 +124,14 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         try processRequest(self, frame.header.stream_id);
                     },
                     .DATA => {
-                        std.debug.print("Received DATA frame\n", .{});
-                        // Handle incoming data frames
+                        std.debug.print("Processing DATA frame, length: {d}\n", .{frame.header.length});
+                        if (frame.header.length == 0) {
+                            // Invalid DATA frame, ignore
+                            std.debug.print("Ignoring DATA frame with zero length\n", .{});
+                            continue;
+                        }
+
+                        try processRequest(self, frame.header.stream_id);
                     },
                     .GOAWAY => {
                         std.debug.print("Received GOAWAY frame, closing connection\n", .{});
@@ -194,10 +200,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
         // Helper function to validate frame types
         fn isValidFrameType(frame_type: FrameType) bool {
+            // List of valid frame types as per RFC 9113, Section 6
             switch (frame_type) {
-                // List valid frame types
-                .SETTINGS, .PING, .WINDOW_UPDATE, .HEADERS, .DATA, .GOAWAY => return true,
-                else => return false,
+                .DATA, .HEADERS, .PRIORITY, .RST_STREAM, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .WINDOW_UPDATE, .CONTINUATION => {
+                    return true;
+                },
             }
         }
 
@@ -258,60 +265,46 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
         }
 
-        fn from_int(val: u8) FrameType {
-            return std.meta.intToEnum(FrameType, val) catch undefined;
-        }
-
         pub fn receiveFrame(self: *@This()) !Frame {
-            var header_buf: [9]u8 = undefined; // Frame header size is 9 bytes
+            var header_buf: [9]u8 = undefined;
 
-            // Catching potential BrokenPipe or ConnectionResetByPeer
-            _ = self.reader.readAll(&header_buf) catch |err| {
-                if (err == error.BrokenPipe or err == error.ConnectionResetByPeer) {
-                    std.debug.print("Client disconnected (BrokenPipe or ConnectionResetByPeer)\n", .{});
-                    return err;
-                }
-                return err;
-            };
+            // Read the frame header (9 bytes)
+            _ = try self.reader.readAll(&header_buf);
 
-            std.debug.print("Raw header bytes: {x}\n", .{header_buf});
+            // Parse frame length (first 3 bytes)
+            const length: u24 = std.mem.readInt(u24, header_buf[0..3], .big);
 
-            // Read frame type from the header buffer
-            const frame_type_u8: u8 = @intCast(header_buf[3]);
-            std.debug.print("Read frame_type_u8: {any} (dec: {d})\n", .{ frame_type_u8, frame_type_u8 });
-
-            const frame_type = from_int(frame_type_u8);
-
-            if (frame_type == undefined) {
-                std.debug.print("Invalid frame type received: {d} (hex: {any})\n", .{ frame_type_u8, frame_type_u8 });
-                std.debug.print("Full header buffer for context: {any}\n", .{header_buf});
-                return error.InvalidFrameType;
+            // Validate the length against the max_frame_size
+            if (length > self.settings.max_frame_size) {
+                return error.FrameSizeError; // FRAME_SIZE_ERROR: Length exceeds max frame size
             }
 
+            // Continue parsing the frame header as before
+            const header: u8 = @intCast(header_buf[3]);
+            const frame_type = try std.meta.intToEnum(FrameType, header);
+            const flags = FrameFlags{ .value = header_buf[4] };
             const stream_id_u32: u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
             const stream_id: u31 = @intCast(stream_id_u32);
 
-            const frame_header = FrameHeader{
-                .length = std.mem.readInt(u24, header_buf[0..3], .big),
-                .frame_type = frame_type,
-                .flags = FrameFlags.init(header_buf[4]),
-                .reserved = (header_buf[5] & 0x80) != 0,
-                .stream_id = stream_id,
-            };
-
-            std.debug.print("Received frame header: {any}\n", .{frame_header});
-
-            const payload: []u8 = try self.allocator.alloc(u8, frame_header.length);
+            // Read the frame payload
+            const payload = try self.allocator.alloc(u8, length);
             defer self.allocator.free(payload);
-
             _ = try self.reader.readAll(payload);
 
-            std.debug.print("Frame payload length: {d}\n", .{frame_header.length});
-
             return Frame{
-                .header = frame_header,
+                .header = FrameHeader{
+                    .length = length,
+                    .frame_type = frame_type,
+                    .flags = flags,
+                    .stream_id = stream_id,
+                    .reserved = false,
+                },
                 .payload = payload,
             };
+        }
+
+        fn from_int(val: u8) FrameType {
+            return std.meta.intToEnum(FrameType, val) catch undefined;
         }
 
         pub fn applyFrameSettings(self: *@This(), frame: Frame) !void {
@@ -361,10 +354,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     2 => self.settings.enable_push = (value == 1),
                     3 => self.settings.max_concurrent_streams = value,
                     4 => self.settings.initial_window_size = value,
-                    5 => {
-                        if (value < 16384 or value > 16777215) return error.InvalidFrameSize;
-                        self.settings.max_frame_size = value;
-                    },
+                    5 => self.settings.max_frame_size = value,
                     6 => self.settings.max_header_list_size = value,
                     else => std.debug.print("Unknown setting ID: {d}\n", .{id}),
                 }
@@ -567,22 +557,30 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         pub fn sendData(self: *@This(), stream: *Stream, data: []const u8, end_stream: bool) !void {
-            std.debug.print("sendData called with data length: {d}\n", .{data.len});
+            const max_frame_size = self.settings.max_frame_size;
 
-            if (data.len > self.settings.max_frame_size) {
-                return error.FrameSizeError; // Ensure data doesn't exceed max frame size
+            var remaining_data = data;
+            while (remaining_data.len > 0) {
+                const chunk_size = if (remaining_data.len > max_frame_size) max_frame_size else remaining_data.len;
+
+                const data_chunk = remaining_data[0..chunk_size];
+                remaining_data = remaining_data[chunk_size..];
+
+                var data_frame = Frame{
+                    .header = FrameHeader{
+                        .length = @intCast(chunk_size),
+                        .frame_type = .DATA,
+                        .flags = FrameFlags{
+                            .value = if (remaining_data.len == 0 and end_stream) FrameFlags.END_STREAM else 0,
+                        },
+                        .stream_id = stream.id,
+                        .reserved = false,
+                    },
+                    .payload = data_chunk,
+                };
+
+                try data_frame.write(self.writer);
             }
-
-            try stream.sendData(data, end_stream);
-
-            self.send_window_size -= @intCast(data.len);
-
-            if (self.send_window_size < 0) {
-                // Send a WINDOW_UPDATE frame to increase the window size
-                try self.sendWindowUpdate(0, 65535); // Increase by a default value
-            }
-
-            std.debug.print("sendData completed with send_window_size: {d}\n", .{self.send_window_size});
         }
     };
 }
@@ -753,4 +751,113 @@ test "applyFrameSettings test" {
     try std.testing.expect(connection.settings.max_concurrent_streams == 100);
     try std.testing.expect(connection.settings.initial_window_size == 65535);
     std.debug.print("Settings applied successfully in test\n", .{});
+}
+
+test "send HEADERS and DATA frames with proper flow" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [8192]u8 = undefined;
+    var buffer_stream = std.io.fixedBufferStream(&buffer);
+
+    const reader = buffer_stream.reader().any();
+    const writer = buffer_stream.writer().any();
+
+    const ConnectionType = Connection(@TypeOf(reader), @TypeOf(writer));
+    var allocator = arena.allocator();
+    var connection = try ConnectionType.init(&allocator, reader, writer, false);
+
+    var stream = try Stream.init(&allocator, &connection, 1);
+
+    // Send a HEADERS frame
+    const headers_payload: [16]u8 = undefined;
+    const headers_frame = Frame{
+        .header = FrameHeader{
+            .length = @intCast(headers_payload.len),
+            .frame_type = .HEADERS,
+            .flags = FrameFlags{
+                .value = FrameFlags.END_HEADERS, // Mark end of headers
+            },
+            .reserved = false,
+            .stream_id = stream.id,
+        },
+        .payload = &headers_payload,
+    };
+
+    // Handle HEADERS frame
+    try stream.handleFrame(headers_frame);
+
+    // Check that the HEADERS frame was processed before continuing
+    const headers_written_data = buffer_stream.getWritten();
+    assert(headers_written_data.len > 0);
+    std.debug.print("HEADERS frame written data length: {d}\n", .{headers_written_data.len});
+
+    // Now send the DATA frame only after ensuring the HEADERS frame was handled
+    const data = "Hello, world!";
+    try connection.sendData(&stream, data, false);
+
+    const written_data = buffer_stream.getWritten();
+    std.debug.print("Total written data length after DATA frame: {d}\n", .{written_data.len});
+}
+
+test "Endpoint can process DATA frames of 2^14 octets in length" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [8192 * 4]u8 = undefined; // Create a larger buffer to handle large DATA frames
+    var buffer_stream = std.io.fixedBufferStream(&buffer);
+
+    const reader = buffer_stream.reader().any();
+    const writer = buffer_stream.writer().any();
+
+    const ConnectionType = Connection(@TypeOf(reader), @TypeOf(writer));
+    var allocator = arena.allocator();
+    var connection = try ConnectionType.init(&allocator, reader, writer, false);
+
+    var stream = try Stream.init(&allocator, &connection, 1);
+
+    // Set max_frame_size to 16384 (2^14)
+    connection.settings.max_frame_size = 16384;
+
+    // Reset the buffer before writing
+    buffer_stream.reset();
+
+    // Send a HEADERS frame to initialize the stream
+    const headers_payload: [16]u8 = undefined; // Example headers payload
+    const headers_frame = Frame{
+        .header = FrameHeader{
+            .length = @intCast(headers_payload.len),
+            .frame_type = .HEADERS,
+            .flags = FrameFlags{
+                .value = FrameFlags.END_HEADERS, // Mark end of headers
+            },
+            .reserved = false,
+            .stream_id = stream.id,
+        },
+        .payload = &headers_payload,
+    };
+
+    // Handle the HEADERS frame
+    try stream.handleFrame(headers_frame);
+
+    // Prepare a DATA frame with 2^14 (16,384) octets, ensuring that it respects the frame size limit
+    var data_payload: [16384]u8 = undefined; // Fill the data payload with zeroes
+    try connection.sendData(&stream, &data_payload, false);
+
+    // Verify the DATA frame was sent and processed
+    const written_data = buffer_stream.getWritten();
+    std.debug.print("Total written data length after sending DATA frame: {d}\n", .{written_data.len});
+
+    // Ensure that the buffer contains the expected DATA frame of 16384 + 9 (frame header size) octets
+    const expected_data_frame_length = 16384 + 9; // DATA frame payload + frame header
+    try std.testing.expect(written_data.len == expected_data_frame_length);
+
+    // Simulate receiving and processing the DATA frame
+    const received_frame = try connection.receiveFrame();
+
+    // Ensure the received frame type is DATA and the length is 16,384
+    try std.testing.expect(received_frame.header.frame_type == .DATA);
+    try std.testing.expect(received_frame.header.length == 16384);
+
+    std.debug.print("Successfully processed DATA frame of 2^14 octets in length.\n", .{});
 }
