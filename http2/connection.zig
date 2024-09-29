@@ -38,15 +38,16 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 _ = try self.reader.readAll(&preface_buf);
 
                 if (!std.mem.eql(u8, &preface_buf, http2_preface)) {
-                    const PROTOCOL_ERROR: u32 = 0x1; // PROTOCOL_ERROR is 0x1 as per RFC 9113
+                    const PROTOCOL_ERROR: u32 = 0x1;
                     std.debug.print("Invalid HTTP/2 preface, sending GOAWAY frame...\n", .{});
 
                     // Send GOAWAY frame and ensure it is flushed
                     try self.sendGoAway(0, PROTOCOL_ERROR, "Invalid preface: PROTOCOL_ERROR");
 
-                    // Ensure the connection is closed after sending the GOAWAY frame
+                    // Gracefully close the connection by returning an appropriate error
                     return error.InvalidPreface;
                 }
+
                 std.debug.print("Valid HTTP/2 preface received\n", .{});
             } else {
                 // Client-side, send preface and settings
@@ -61,7 +62,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
         pub fn deinit(self: @This()) void {
             // Deinitialize the stream hash map.
-            self.streams.deinit();
+            @constCast(&self.streams).deinit();
 
             std.debug.print("Resources deinitialized for connection\n", .{});
         }
@@ -70,15 +71,39 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try self.writer.writeAll(http2_preface);
         }
 
+        pub fn highestStreamId(self: @This()) u31 {
+            var highest_stream_id: u31 = 0;
+
+            var it = self.streams.iterator();
+            while (it.next()) |entry| {
+                if (entry.key_ptr.* > highest_stream_id) {
+                    highest_stream_id = entry.key_ptr.*;
+                }
+            }
+
+            return highest_stream_id;
+        }
+
+        // Adjust frame handling and validation per RFC 9113.
         pub fn handleConnection(self: *@This()) !void {
             while (true) {
                 const frame = self.receiveFrame() catch |err| {
                     if (err == error.InvalidFrameType) {
-                        std.debug.print("Invalid frame type received, discarding.\n", .{});
-                        try self.sendPing();
-                        try self.sendGoAway(0, 0x01, "Invalid Frame Type: PROTOCOL_ERROR");
+                        std.debug.print("Invalid frame type received, discarding and sending PING + GOAWAY.\n", .{});
 
+                        // Send a PING frame with default opaque data and no ACK
+                        const opaque_data: [8]u8 = undefined; // Default opaque data for PING
+                        try self.sendPing(&opaque_data, true);
+
+                        // Send GOAWAY indicating protocol error
+                        try self.sendGoAway(0, 0x01, "Invalid Frame Type: PROTOCOL_ERROR");
                         break;
+                    } else if (err == error.FrameSizeError) {
+                        std.debug.print("Frame Size exceeded, discarding.\n", .{});
+                        break;
+                    } else if (err == error.BrokenPipe or err == error.ConnectionResetByPeer) {
+                        std.debug.print("Client disconnected unexpectedly (BrokenPipe/ConnectionResetByPeer)\n", .{});
+                        return; // Gracefully exit the connection handler
                     } else {
                         std.debug.print("Error receiving frame: {s}\n", .{@errorName(err)});
                         return err; // Handle non-frame-related errors
@@ -89,21 +114,26 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 std.debug.print("Received frame of type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
 
                 if (!isValidFrameType(frame.header.frame_type)) {
-                    std.debug.print("Ignoring unknown frame type: {any}\n", .{frame.header.frame_type});
-                    try self.sendPing();
+                    std.debug.print("Ignoring unknown frame type: {any}, sending PING and GOAWAY.\n", .{frame.header.frame_type});
+
+                    const opaque_data: [8]u8 = undefined; // Default opaque data for PING
+                    try self.sendPing(&opaque_data, true);
                     try self.sendGoAway(0, 0x01, "Invalid Frame Type: PROTOCOL_ERROR");
 
                     continue; // Ignore unknown frame types
                 }
 
                 if (!isValidFlags(frame.header)) {
-                    std.debug.print("Ignoring frame with undefined flags\n", .{});
-                    try self.sendPing();
+                    std.debug.print("Ignoring frame with undefined flags, sending PING and GOAWAY.\n", .{});
+
+                    const opaque_data: [8]u8 = undefined; // Default opaque data for PING
+                    try self.sendPing(&opaque_data, false);
                     try self.sendGoAway(0, 0x01, "Invalid Frame flags: PROTOCOL_ERROR");
 
                     continue; // Ignore frames with invalid or undefined flags
                 }
 
+                // Process frame based on type
                 switch (frame.header.frame_type) {
                     .SETTINGS => {
                         std.debug.print("Received SETTINGS frame\n", .{});
@@ -113,7 +143,14 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     },
                     .PING => {
                         std.debug.print("Received PING frame, responding with PING (ACK)\n", .{});
-                        try self.sendPing();
+
+                        // Respond with the same opaque data and ACK flag set
+                        if (frame.payload.len != 8) {
+                            std.debug.print("Invalid PING frame size, expected 8 bytes.\n", .{});
+                            return error.InvalidPingPayloadSize;
+                        }
+
+                        try self.sendPing(frame.payload, true); // Send PING response with ACK
                     },
                     .WINDOW_UPDATE => {
                         std.debug.print("Received WINDOW_UPDATE frame\n", .{});
@@ -143,6 +180,32 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     },
                 }
             }
+        }
+
+        /// Sends a PING frame over the connection. The opaque data must always be exactly 8 bytes.
+        /// If `ack` is true, the ACK flag will be set in the PING frame.
+        /// The opaque data should be echoed exactly in case of a PING response.
+        pub fn sendPing(self: *@This(), opaque_data: []const u8, ack: bool) !void {
+            // Make sure the opaque data is 8 bytes long
+            if (opaque_data.len != 8) {
+                return error.InvalidPingPayloadSize;
+            }
+
+            var frame_header = FrameHeader{
+                .length = 8, // PING payload length is always 8
+                .frame_type = .PING,
+                .flags = if (ack) FrameFlags{ .value = FrameFlags.ACK } else FrameFlags{ .value = 0 }, // Set ACK flag if true
+                .reserved = false,
+                .stream_id = 0, // PING frames must always be on stream 0
+            };
+
+            // Write the frame header
+            try frame_header.write(self.writer);
+
+            // Write the opaque data
+            try self.writer.writeAll(opaque_data);
+
+            std.debug.print("Sent PING frame (flags: {any}, opaque_data: {any})\n", .{ frame_header.flags.value, opaque_data });
         }
 
         fn processRequest(server_conn: *@This(), stream_id: u31) !void {
@@ -198,35 +261,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             std.debug.print("Sent 200 OK response with body: \"Hello, World!\"\n", .{});
         }
 
-        // Helper function to validate frame types
-        fn isValidFrameType(frame_type: FrameType) bool {
-            // List of valid frame types as per RFC 9113, Section 6
-            switch (frame_type) {
-                .DATA, .HEADERS, .PRIORITY, .RST_STREAM, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .WINDOW_UPDATE, .CONTINUATION => {
-                    return true;
-                },
-            }
-        }
-
-        // Helper function to validate flags for different frame types
-        fn isValidFlags(header: FrameHeader) bool {
-            switch (header.frame_type) {
-                .PING => {
-                    // PING frame allows only the ACK flag (0x1)
-                    return header.flags.value & FrameFlags.ACK == 0;
-                },
-                .SETTINGS => {
-                    // SETTINGS frame only allows the ACK flag
-                    return header.flags.value & FrameFlags.ACK == 0;
-                },
-                .WINDOW_UPDATE, .HEADERS, .DATA => {
-                    // Add validation for other frame types if necessary
-                    return true; // Accept any flags for now, ignoring undefined flags
-                },
-                else => return true, // By default, ignore any undefined flags
-            }
-        }
-
         pub fn sendSettings(self: @This()) !void {
             const settings = [_][2]u32{
                 .{ 1, self.settings.header_table_size }, // HEADER_TABLE_SIZE
@@ -280,8 +314,14 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
 
             // Continue parsing the frame header as before
-            const header: u8 = @intCast(header_buf[3]);
-            const frame_type = try std.meta.intToEnum(FrameType, header);
+            const frame_type_val: u8 = header_buf[3];
+
+            // Attempt to convert the integer to a valid FrameType
+            const frame_type = std.meta.intToEnum(FrameType, frame_type_val) catch {
+                // If the conversion fails, return an explicit error for invalid frame type
+                return error.InvalidFrameType;
+            };
+
             const flags = FrameFlags{ .value = header_buf[4] };
             const stream_id_u32: u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
             const stream_id: u31 = @intCast(stream_id_u32);
@@ -310,19 +350,16 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         pub fn applyFrameSettings(self: *@This(), frame: Frame) !void {
             std.debug.print("Applying settings from frame...\n", .{});
 
-            // Ensure the frame is of type SETTINGS
             if (frame.header.frame_type != .SETTINGS) {
                 std.debug.print("Received frame with invalid frame type: {any}\n", .{frame.header.frame_type});
                 return error.InvalidFrameType;
             }
 
-            // SETTINGS frame must be on stream 0
             if (frame.header.stream_id != 0) {
                 std.debug.print("SETTINGS frame received on a non-zero stream ID: {any}\n", .{frame.header.stream_id});
                 return error.InvalidStreamId;
             }
 
-            // The payload of the SETTINGS frame must be a multiple of 6 bytes
             if (frame.payload.len % 6 != 0) {
                 std.debug.print("Invalid SETTINGS frame size: {any}\n", .{frame.payload.len});
                 return error.InvalidSettingsFrameSize;
@@ -331,12 +368,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             const buffer = frame.payload;
             const buffer_size: usize = buffer.len;
 
-            std.debug.print("Processing SETTINGS frame with payload length: {d} bytes\n", .{buffer_size});
-
-            // Ensure the buffer is large enough before reading
             var i: usize = 0;
             while (i + 6 <= buffer_size) {
-                std.debug.print("Processing setting starting at index {d}. Remaining buffer size: {d}\n", .{ i, buffer_size - i });
 
                 // Safely read the ID and Value using std.mem.readInt with endian handling
                 const id_slice: *const [2]u8 = @ptrCast(&buffer[i .. i + 2]);
@@ -348,7 +381,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 const value: u32 = std.mem.readInt(u32, value_slice, .big);
 
                 std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
+                std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
 
+                // Apply known settings
                 switch (id) {
                     1 => self.settings.header_table_size = value,
                     2 => self.settings.enable_push = (value == 1),
@@ -356,7 +391,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     4 => self.settings.initial_window_size = value,
                     5 => self.settings.max_frame_size = value,
                     6 => self.settings.max_header_list_size = value,
-                    else => std.debug.print("Unknown setting ID: {d}\n", .{id}),
+                    else => {
+                        // Unknown settings should be ignored
+                        std.debug.print("Ignoring unknown setting ID: {d}\n", .{id});
+                    },
                 }
 
                 i += 6; // Move to the next setting (6 bytes per setting)
@@ -383,21 +421,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             };
 
             std.debug.print("Sent SETTINGS ACK frame\n", .{});
-        }
-
-        pub fn sendPing(self: *@This()) !void {
-            var frame_header = FrameHeader{
-                .length = 8, // PING payload length is always 8
-                .frame_type = .PING,
-                .flags = FrameFlags{ .value = FrameFlags.ACK }, // Set ACK flag
-
-                .reserved = false,
-                .stream_id = 0,
-            };
-
-            try frame_header.write(self.writer);
-
-            std.debug.print("Sent PING frame\n", .{});
         }
 
         pub fn receiveSettings(self: *@This()) !void {
@@ -597,6 +620,32 @@ const Settings = struct {
         return Settings{};
     }
 };
+
+// Ensure valid frame types are checked correctly.
+fn isValidFrameType(frame_type: FrameType) bool {
+    // Return true only for recognized HTTP/2 frame types as per RFC 7540, Section 6.
+    return switch (frame_type) {
+        .DATA, .HEADERS, .PRIORITY, .RST_STREAM, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .WINDOW_UPDATE, .CONTINUATION => true,
+    };
+}
+
+// Ensure valid flags for frame types.
+fn isValidFlags(header: FrameHeader) bool {
+    const flags = header.flags.value;
+
+    return switch (header.frame_type) {
+        .DATA => (flags & (FrameFlags.END_STREAM | FrameFlags.PADDED)) == 0,
+        .HEADERS => (flags & (FrameFlags.END_STREAM | FrameFlags.END_HEADERS | FrameFlags.PADDED | FrameFlags.PRIORITY)) == 0,
+        .PRIORITY => flags == 0, // No flags allowed for PRIORITY frames
+        .RST_STREAM => flags == 0, // No flags allowed for RST_STREAM frames
+        .SETTINGS => (flags & FrameFlags.ACK) == flags, // Only ACK flag allowed
+        .PUSH_PROMISE => (flags & (FrameFlags.END_HEADERS | FrameFlags.PADDED)) == 0,
+        .PING => flags == FrameFlags.ACK or flags == 0, // ACK or no flags allowed
+        .GOAWAY => flags == 0, // No flags allowed for GOAWAY frames
+        .WINDOW_UPDATE => flags == 0, // No flags allowed for WINDOW_UPDATE frames
+        .CONTINUATION => (flags & FrameFlags.END_HEADERS) == flags, // Only END_HEADERS allowed
+    };
+}
 
 test "HTTP/2 connection initialization and flow control" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -860,4 +909,17 @@ test "Endpoint can process DATA frames of 2^14 octets in length" {
     try std.testing.expect(received_frame.header.length == 16384);
 
     std.debug.print("Successfully processed DATA frame of 2^14 octets in length.\n", .{});
+}
+
+test "isValidFrameType returns true for valid frame types" {
+    try std.testing.expect(isValidFrameType(FrameType.DATA));
+    try std.testing.expect(isValidFrameType(FrameType.HEADERS));
+    try std.testing.expect(isValidFrameType(FrameType.PRIORITY));
+    try std.testing.expect(isValidFrameType(FrameType.RST_STREAM));
+    try std.testing.expect(isValidFrameType(FrameType.SETTINGS));
+    try std.testing.expect(isValidFrameType(FrameType.PUSH_PROMISE));
+    try std.testing.expect(isValidFrameType(FrameType.PING));
+    try std.testing.expect(isValidFrameType(FrameType.GOAWAY));
+    try std.testing.expect(isValidFrameType(FrameType.WINDOW_UPDATE));
+    try std.testing.expect(isValidFrameType(FrameType.CONTINUATION));
 }

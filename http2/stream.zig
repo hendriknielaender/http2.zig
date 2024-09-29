@@ -40,7 +40,7 @@ pub const Stream = struct {
         };
     }
 
-    pub fn deinit(self: *Stream, allocator: *std.mem.Allocator) void {
+    pub fn deinit(self: @This(), allocator: *std.mem.Allocator) void {
         self.recv_headers.deinit(allocator);
         self.send_headers.deinit(allocator);
         self.recv_data.deinit(allocator);
