@@ -87,7 +87,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         // Adjust frame handling and validation per RFC 9113.
         pub fn handleConnection(self: *@This()) !void {
             while (true) {
-                const frame = self.receiveFrame() catch |err| {
+                var frame = self.receiveFrame() catch |err| {
                     if (err == error.InvalidFrameType) {
                         std.debug.print("Invalid frame type received, discarding and sending PING + GOAWAY.\n", .{});
 
@@ -109,6 +109,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         return err; // Handle non-frame-related errors
                     }
                 };
+
+                defer frame.deinit(self.allocator);
 
                 // Process valid frames
                 std.debug.print("Received frame of type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
@@ -342,7 +344,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             // Read the frame payload
             const payload = try self.allocator.alloc(u8, length);
-            defer self.allocator.free(payload);
             _ = try self.reader.readAll(payload);
 
             return Frame{

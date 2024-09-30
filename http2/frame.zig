@@ -125,6 +125,11 @@ pub const Frame = struct {
         return Frame{ .header = header, .payload = payload };
     }
 
+    pub fn deinit(self: *Frame, allocator: *std.mem.Allocator) void {
+        allocator.free(self.payload);
+        self.payload = &[_]u8{};
+    }
+
     pub fn read(reader: anytype, allocator: *std.mem.Allocator) !Frame {
         const header = try FrameHeader.read(reader);
         std.debug.print("Read FrameHeader: {any}\n", .{header});
