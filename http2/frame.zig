@@ -19,11 +19,11 @@ pub const FrameType = enum(u8) {
 pub const FrameFlags = struct {
     value: u8,
 
-    pub const END_STREAM = 0x1;
-    pub const END_HEADERS = 0x4;
-    pub const PADDED = 0x8;
-    pub const PRIORITY = 0x20;
-    pub const ACK = 0x1;
+    pub const END_STREAM: u8 = 0x1;
+    pub const END_HEADERS: u8 = 0x4;
+    pub const PADDED: u8 = 0x8;
+    pub const PRIORITY: u8 = 0x20;
+    pub const ACK: u8 = 0x1;
 
     pub fn init(value: u8) FrameFlags {
         return FrameFlags{ .value = value };

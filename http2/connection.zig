@@ -670,18 +670,22 @@ fn isValidFrameType(frame_type: FrameType) bool {
 fn isValidFlags(header: FrameHeader) bool {
     const flags = header.flags.value;
 
-    return switch (header.frame_type) {
-        .DATA => (flags & (FrameFlags.END_STREAM | FrameFlags.PADDED)) == 0,
-        .HEADERS => (flags & (FrameFlags.END_STREAM | FrameFlags.END_HEADERS | FrameFlags.PADDED | FrameFlags.PRIORITY)) == 0,
-        .PRIORITY => flags == 0, // No flags allowed for PRIORITY frames
-        .RST_STREAM => flags == 0, // No flags allowed for RST_STREAM frames
-        .SETTINGS => (flags & FrameFlags.ACK) == flags, // Only ACK flag allowed
-        .PUSH_PROMISE => (flags & (FrameFlags.END_HEADERS | FrameFlags.PADDED)) == 0,
-        .PING => flags == FrameFlags.ACK or flags == 0, // ACK or no flags allowed
-        .GOAWAY => flags == 0, // No flags allowed for GOAWAY frames
-        .WINDOW_UPDATE => flags == 0, // No flags allowed for WINDOW_UPDATE frames
-        .CONTINUATION => (flags & FrameFlags.END_HEADERS) == flags, // Only END_HEADERS allowed
+    // Get the allowed flags for the frame type
+    const allowed_flags = switch (header.frame_type) {
+        .DATA => FrameFlags.END_STREAM | FrameFlags.PADDED,
+        .HEADERS => FrameFlags.END_STREAM | FrameFlags.END_HEADERS | FrameFlags.PADDED | FrameFlags.PRIORITY,
+        .PRIORITY => 0,
+        .RST_STREAM => 0,
+        .SETTINGS => FrameFlags.ACK,
+        .PUSH_PROMISE => FrameFlags.END_HEADERS | FrameFlags.PADDED,
+        .PING => FrameFlags.ACK,
+        .GOAWAY => 0,
+        .WINDOW_UPDATE => 0,
+        .CONTINUATION => FrameFlags.END_HEADERS,
     };
+
+    // Return true if no invalid flags are set
+    return (flags & ~allowed_flags) == 0;
 }
 
 test "HTTP/2 connection initialization and flow control" {
