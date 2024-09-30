@@ -8,6 +8,8 @@ const Connection = @import("connection.zig").Connection;
 
 pub const StreamState = enum {
     Idle,
+    ReservedLocal,
+    ReservedRemote,
     Open,
     HalfClosedLocal,
     HalfClosedRemote,
@@ -55,9 +57,6 @@ pub const Stream = struct {
             FrameType.HEADERS => {
                 std.debug.print("Handling HEADERS frame\n", .{});
                 try self.handleHeaders(frame);
-
-                // Ensure only actual data is written, not zeros
-                try self.conn.writer.writeAll(frame.payload);
             },
             FrameType.DATA => {
                 std.debug.print("Handling DATA frame\n", .{});
@@ -82,6 +81,7 @@ pub const Stream = struct {
 
         std.debug.print("Total received headers data length: {d}\n", .{self.recv_headers.items.len});
 
+        // If the END_STREAM flag is set, transition to HalfClosedRemote
         if (frame.header.flags.isEndStream()) {
             self.state = .HalfClosedRemote;
         }
@@ -123,6 +123,14 @@ pub const Stream = struct {
     }
 
     fn handleRstStream(self: *Stream) !void {
+        std.debug.print("Received RST_STREAM frame\n", .{});
+
+        if (self.state == .Idle) {
+            std.debug.print("RST_STREAM received on idle stream {d}\n", .{self.id});
+            return error.IdleStreamError;
+        }
+
+        // Handle RST_STREAM frame
         self.state = .Closed;
     }
 
@@ -197,7 +205,7 @@ test "create and handle stream" {
     const end_headers_flag: u8 = 0x4; // Assuming 0x4 represents END_HEADERS
     const headers_frame = Frame{
         .header = FrameHeader{
-            .length = 16,
+            .length = @intCast(4),
             .frame_type = .HEADERS,
             .flags = FrameFlags.init(end_headers_flag),
             .reserved = false,

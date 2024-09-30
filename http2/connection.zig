@@ -156,9 +156,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         std.debug.print("Received WINDOW_UPDATE frame\n", .{});
                         try self.handleWindowUpdate(frame);
                     },
-                    .HEADERS => {
-                        std.debug.print("Received HEADERS frame\n", .{});
-                        try processRequest(self, frame.header.stream_id);
+                    .HEADERS, .CONTINUATION => {
+                        std.debug.print("Received HEADERS/CONTINUATION frame\n", .{});
+                        const stream = try self.getStream(frame.header.stream_id);
+
+                        // Check for END_STREAM flag and transition state accordingly
+                        if (frame.header.flags.isEndStream()) {
+                            std.debug.print("End of stream detected, transitioning stream to half-closed state.\n", .{});
+                            stream.state = .HalfClosedRemote;
+                        }
                     },
                     .DATA => {
                         std.debug.print("Processing DATA frame, length: {d}\n", .{frame.header.length});
@@ -169,6 +175,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         }
 
                         try processRequest(self, frame.header.stream_id);
+                    },
+                    .PRIORITY => {
+                        std.debug.print("Received PRIORITY frame\n", .{});
+                        // Handle PRIORITY frame appropriately here
                     },
                     .GOAWAY => {
                         std.debug.print("Received GOAWAY frame, closing connection\n", .{});
@@ -313,6 +323,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 return error.FrameSizeError; // FRAME_SIZE_ERROR: Length exceeds max frame size
             }
 
+            if (length > 16384) {
+                return error.FrameSizeError;
+            }
+
             // Continue parsing the frame header as before
             const frame_type_val: u8 = header_buf[3];
 
@@ -383,14 +397,37 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
                 std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
 
-                // Apply known settings
+                // In applyFrameSettings, when applying settings
+
                 switch (id) {
-                    1 => self.settings.header_table_size = value,
-                    2 => self.settings.enable_push = (value == 1),
-                    3 => self.settings.max_concurrent_streams = value,
-                    4 => self.settings.initial_window_size = value,
-                    5 => self.settings.max_frame_size = value,
-                    6 => self.settings.max_header_list_size = value,
+                    1 => { // SETTINGS_HEADER_TABLE_SIZE
+                        self.settings.header_table_size = value;
+                    },
+                    2 => { // SETTINGS_ENABLE_PUSH
+                        if (value != 0 and value != 1) {
+                            return error.ProtocolError; // Invalid value for ENABLE_PUSH
+                        }
+                        self.settings.enable_push = (value == 1);
+                    },
+                    3 => { // SETTINGS_MAX_CONCURRENT_STREAMS
+                        self.settings.max_concurrent_streams = value;
+                    },
+                    4 => { // SETTINGS_INITIAL_WINDOW_SIZE
+                        if (value > 2147483647) {
+                            return error.FlowControlError; // Initial window size too large
+                        }
+                        self.settings.initial_window_size = value;
+                        // TODO: Update window size for all open streams
+                    },
+                    5 => { // SETTINGS_MAX_FRAME_SIZE
+                        if (value < 16384 or value > 16777215) {
+                            return error.ProtocolError; // Invalid MAX_FRAME_SIZE
+                        }
+                        self.settings.max_frame_size = value;
+                    },
+                    6 => { // SETTINGS_MAX_HEADER_LIST_SIZE
+                        self.settings.max_header_list_size = value;
+                    },
                     else => {
                         // Unknown settings should be ignored
                         std.debug.print("Ignoring unknown setting ID: {d}\n", .{id});
