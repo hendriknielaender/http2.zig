@@ -99,8 +99,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         try self.sendGoAway(0, 0x01, "Invalid Frame Type: PROTOCOL_ERROR");
                         break;
                     } else if (err == error.FrameSizeError) {
-                        std.debug.print("Frame Size exceeded, discarding.\n", .{});
-                        break;
+                        std.debug.print("Frame Size exceeded, sending GOAWAY.\n", .{});
+                        try self.sendGoAway(self.highestStreamId(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
+                        return;
                     } else if (err == error.BrokenPipe or err == error.ConnectionResetByPeer) {
                         std.debug.print("Client disconnected unexpectedly (BrokenPipe/ConnectionResetByPeer)\n", .{});
                         return; // Gracefully exit the connection handler
