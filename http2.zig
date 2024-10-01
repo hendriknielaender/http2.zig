@@ -23,7 +23,10 @@ pub fn main() !void {
         defer server_conn.deinit();
 
         // Handle connection and errors during the process
-        try server_conn.handleConnection();
+        server_conn.handleConnection() catch |err| {
+            std.debug.print("Error handling connection: {}\n", .{err});
+            // Optionally, send a GOAWAY frame or perform other cleanup
+        };
 
         std.debug.print("Connection from {any} closed\n", .{conn.address});
     }

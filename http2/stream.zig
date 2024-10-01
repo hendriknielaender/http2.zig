@@ -5,6 +5,7 @@ const FrameHeader = @import("frame.zig").FrameHeader;
 const FrameType = @import("frame.zig").FrameType;
 const FrameFlags = @import("frame.zig").FrameFlags;
 const Connection = @import("connection.zig").Connection;
+const Hpack = @import("hpack.zig").Hpack;
 
 pub const StreamState = enum {
     Idle,
@@ -27,6 +28,8 @@ pub const Stream = struct {
     send_headers: std.ArrayList(u8),
     recv_data: std.ArrayList(u8),
     send_data: std.ArrayList(u8),
+    header_block_fragments: std.ArrayList(u8),
+    expecting_continuation: bool,
 
     pub fn init(allocator: *std.mem.Allocator, conn: *Connection(std.io.AnyReader, std.io.AnyWriter), id: u31) !Stream {
         return Stream{
@@ -39,6 +42,8 @@ pub const Stream = struct {
             .send_headers = std.ArrayList(u8).init(allocator.*),
             .recv_data = std.ArrayList(u8).init(allocator.*),
             .send_data = std.ArrayList(u8).init(allocator.*),
+            .header_block_fragments = std.ArrayList(u8).init(allocator.*),
+            .expecting_continuation = false,
         };
     }
 
@@ -47,6 +52,7 @@ pub const Stream = struct {
         self.send_headers.deinit(allocator);
         self.recv_data.deinit(allocator);
         self.send_data.deinit(allocator);
+        self.header_block_fragments.deinit(allocator.*);
     }
 
     /// Handles incoming frames for the stream
@@ -56,7 +62,11 @@ pub const Stream = struct {
         switch (frame.header.frame_type) {
             FrameType.HEADERS => {
                 std.debug.print("Handling HEADERS frame\n", .{});
-                try self.handleHeaders(frame);
+                try self.handleHeadersFrame(frame);
+            },
+            FrameType.CONTINUATION => {
+                std.debug.print("Handling CONTINUATION frame\n", .{});
+                try self.handleContinuationFrame(frame);
             },
             FrameType.DATA => {
                 std.debug.print("Handling DATA frame\n", .{});
@@ -70,21 +80,77 @@ pub const Stream = struct {
         std.debug.print("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
     }
 
-    fn handleHeaders(self: *Stream, frame: Frame) !void {
-        std.debug.print("Appending headers data of length: {d}\n", .{frame.payload.len});
-
-        if (self.state == .Idle or self.state == .HalfClosedRemote) {
-            self.state = .Open;
+    fn handleHeadersFrame(self: *Stream, frame: Frame) !void {
+        if (self.expecting_continuation) {
+            // Protocol error: already expecting continuation on this stream
+            try self.conn.sendGoAway(0, 0x01, "Unexpected HEADERS frame: PROTOCOL_ERROR");
+            return;
         }
 
-        try self.recv_headers.appendSlice(frame.payload);
+        try self.header_block_fragments.appendSlice(frame.payload);
 
-        std.debug.print("Total received headers data length: {d}\n", .{self.recv_headers.items.len});
+        if (frame.header.flags.isEndHeaders()) {
+            // Attempt to decode the header block
+            try self.decodeHeaderBlock();
+            self.header_block_fragments.clearAndFree();
+        } else {
+            self.expecting_continuation = true;
+        }
 
-        // If the END_STREAM flag is set, transition to HalfClosedRemote
         if (frame.header.flags.isEndStream()) {
             self.state = .HalfClosedRemote;
         }
+    }
+
+    fn handleContinuationFrame(self: *Stream, frame: Frame) !void {
+        if (!self.expecting_continuation) {
+            // Protocol error: not expecting continuation on this stream
+            try self.conn.sendGoAway(0, 0x01, "Unexpected CONTINUATION frame: PROTOCOL_ERROR");
+            return;
+        }
+
+        try self.header_block_fragments.appendSlice(frame.payload);
+
+        if (frame.header.flags.isEndHeaders()) {
+            // Attempt to decode the header block
+            try self.decodeHeaderBlock();
+            self.header_block_fragments.clearAndFree();
+            self.expecting_continuation = false;
+        }
+    }
+
+    fn decodeHeaderBlock(self: *Stream) !void {
+        const header_block = self.header_block_fragments.items;
+
+        var headers = std.ArrayList(Hpack.HeaderField).init(self.conn.allocator.*);
+
+        defer headers.deinit();
+
+        var cursor: usize = 0;
+        while (cursor < header_block.len) {
+            const remaining_data = header_block[cursor..];
+
+            var decoded_header = Hpack.decodeHeaderField(remaining_data, &self.conn.hpack_dynamic_table, self.conn.allocator) catch |err| {
+                // Decompression failed
+                std.debug.print("Header decompression failed: {}\n", .{err});
+                try self.conn.sendGoAway(0, 0x09, "Compression Error: COMPRESSION_ERROR");
+                return error.CompressionError;
+            };
+
+            defer decoded_header.deinit();
+
+            try headers.append(decoded_header.header);
+
+            cursor += decoded_header.bytes_consumed;
+        }
+
+        // Successfully decoded headers
+        std.debug.print("Successfully decoded headers:\n", .{});
+        for (headers.items) |header| {
+            std.debug.print("{s}: {s}\n", .{ header.name, header.value });
+        }
+
+        // You can now process the headers as needed...
     }
 
     fn handleData(self: *Stream, frame: Frame) !void {
