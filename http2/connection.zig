@@ -162,6 +162,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                             std.debug.print("Compression error occurred, sending GOAWAY with COMPRESSION_ERROR\n", .{});
                             try self.sendGoAway(0, 0x9, "Compression error: COMPRESSION_ERROR");
                             return; // Exit the loop to close the connection
+                        } else if (err == error.InvalidStreamState) {
+                            std.debug.print("Invalid stream state, sending GOAWAY with PROTOCOL_ERROR\n", .{});
+                            try self.sendGoAway(0, 0x1, "Invalid stream state: PROTOCOL_ERROR");
+                            break;
                         } else {
                             // Handle other errors if necessary
                         }
