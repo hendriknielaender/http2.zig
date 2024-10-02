@@ -107,18 +107,35 @@ To create an HTTP/2 connection, use the `Connection` struct. This struct handles
 
 ```zig
 const std = @import("std");
-const Connection = @import("http2.zig").Connection;
+const http2 = @import("http2");
 
-pub fn main() void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+const Connection = http2.Connection(std.io.AnyReader, std.io.AnyWriter);
 
-    var buffer: [4096]u8 = undefined;
-    var buffer_stream = std.io.fixedBufferStream(&buffer);
-    const reader = buffer_stream.reader();
-    const writer = buffer_stream.writer();
+pub fn main() !void {
+    const address = try std.net.Address.resolveIp("0.0.0.0", 8081);
+    var listener = try address.listen(.{ .reuse_address = true });
+    defer listener.deinit();
 
-    const ConnectionType = Connection(@TypeOf(reader), @TypeOf(writer));
-    var allocator = arena.allocator();
-    const conn = try ConnectionType.init(&allocator, reader, writer, false);
+    std.debug.print("Listening on 127.0.0.1:8081...\n", .{});
+
+    while (true) {
+        var conn = try listener.accept();
+        defer conn.stream.close(); 
+
+        std.debug.print("Accepted connection from: {any}\n", .{conn.address});
+
+        var server_conn = Connection.init(@constCast(&std.heap.page_allocator), conn.stream.reader().any(), conn.stream.writer().any(), true) catch |err| {
+            std.debug.print("Failed to initialize connection: {}\n", .{err});
+            continue;
+        };
+        defer server_conn.deinit();
+
+        // Handle connection and errors during the process
+        server_conn.handleConnection() catch |err| {
+            std.debug.print("Error handling connection: {}\n", .{err});
+        };
+
+        std.debug.print("Connection from {any} closed\n", .{conn.address});
+    }
 }
+```
