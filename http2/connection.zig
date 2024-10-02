@@ -117,6 +117,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
                 defer frame.deinit(self.allocator);
 
+                // If GOAWAY has been sent, we should stop processing new frames
+                if (self.goaway_sent) {
+                    std.debug.print("GOAWAY has been sent, stopping frame processing.\n", .{});
+                    break;
+                }
+
                 // Process valid frames
                 std.debug.print("Received frame of type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
 
@@ -339,10 +345,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             // Validate the length against the max_frame_size
             if (length > self.settings.max_frame_size) {
                 return error.FrameSizeError; // FRAME_SIZE_ERROR: Length exceeds max frame size
-            }
-
-            if (length > 16384) {
-                return error.FrameSizeError;
             }
 
             // Continue parsing the frame header as before
