@@ -11,6 +11,7 @@
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
 ![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/hendriknielaender/http2.zig)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/CONTRIBUTING.md)
+![h2spec Conformance](https://img.shields.io/badge/h2spec-5%2F143%20tests%20passing-red)
 
 </div>
 
