@@ -47,12 +47,12 @@ pub const Stream = struct {
         };
     }
 
-    pub fn deinit(self: @This(), allocator: *std.mem.Allocator) void {
-        self.recv_headers.deinit(allocator);
-        self.send_headers.deinit(allocator);
-        self.recv_data.deinit(allocator);
-        self.send_data.deinit(allocator);
-        self.header_block_fragments.deinit(allocator.*);
+    pub fn deinit(self: @This()) void {
+        self.recv_headers.deinit();
+        self.send_headers.deinit();
+        self.recv_data.deinit();
+        self.send_data.deinit();
+        self.header_block_fragments.deinit();
     }
 
     /// Handles incoming frames for the stream

@@ -14,57 +14,53 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         allocator: *std.mem.Allocator,
         reader: ReaderType,
         writer: WriterType,
-        is_server: bool,
         settings: Settings,
-        recv_window_size: i32 = 65535, // Default initial window size
-        send_window_size: i32 = 65535, // Default initial window size
+        recv_window_size: i32 = 65535,
+        send_window_size: i32 = 65535,
         streams: std.AutoHashMap(u31, *Stream),
         hpack_dynamic_table: Hpack.DynamicTable,
         goaway_sent: bool = false,
 
-        pub fn init(allocator: *std.mem.Allocator, reader: ReaderType, writer: WriterType, is_server: bool) !@This() {
+        pub fn init(allocator: *std.mem.Allocator, reader: ReaderType, writer: WriterType, comptime is_server: bool) !@This() {
             var self = @This(){
                 .allocator = allocator,
                 .reader = reader,
                 .writer = writer,
-                .is_server = is_server,
                 .settings = Settings.default(),
                 .recv_window_size = 65535,
                 .send_window_size = 65535,
                 .streams = std.AutoHashMap(u31, *Stream).init(allocator.*),
-                .hpack_dynamic_table = try Hpack.DynamicTable.init(allocator, 4096), // Initialize with default size
+                .hpack_dynamic_table = try Hpack.DynamicTable.init(allocator, 4096),
             };
 
-            if (self.is_server) {
-                // Check for the correct HTTP/2 preface (RFC 9113, section 3.4)
-                var preface_buf: [24]u8 = undefined;
-                _ = try self.reader.readAll(&preface_buf);
-
-                if (!std.mem.eql(u8, &preface_buf, http2_preface)) {
-                    const PROTOCOL_ERROR: u32 = 0x1;
-                    std.debug.print("Invalid HTTP/2 preface, sending GOAWAY frame...\n", .{});
-
-                    // Send GOAWAY frame and ensure it is flushed
-                    try self.sendGoAway(0, PROTOCOL_ERROR, "Invalid preface: PROTOCOL_ERROR");
-
-                    // Gracefully close the connection by returning an appropriate error
-                    return error.InvalidPreface;
-                }
-
-                std.debug.print("Valid HTTP/2 preface received\n", .{});
+            if (is_server) {
+                try self.checkServerPreface();
             } else {
-                // Client-side, send preface and settings
                 try self.sendPreface();
             }
 
-            // Both client and server send their settings frames
             try self.sendSettings();
-
             return self;
         }
 
+        fn checkServerPreface(self: *@This()) !void {
+            const preface_len = 24;
+            var preface_buf: [preface_len]u8 = undefined;
+            _ = try self.reader.readAll(&preface_buf);
+
+            if (!std.mem.eql(u8, &preface_buf, http2_preface)) {
+                try self.sendGoAway(0, 0x1, "Invalid preface: PROTOCOL_ERROR");
+                return error.InvalidPreface;
+            }
+            std.debug.print("Valid HTTP/2 preface received\n", .{});
+        }
+
         pub fn deinit(self: @This()) void {
-            // Deinitialize the stream hash map.
+            // Deinitialize streams
+            // var it = self.streams.iterator();
+            // while (it.next()) |entry| {
+            //     entry.value_ptr.*.deinit();
+            // }
             @constCast(&self.streams).deinit();
 
             self.hpack_dynamic_table.table.deinit();
@@ -344,7 +340,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             // Validate the length against the max_frame_size
             if (length > self.settings.max_frame_size) {
-                return error.FrameSizeError; // FRAME_SIZE_ERROR: Length exceeds max frame size
+                std.debug.print("Received frame size exceeds SETTINGS_MAX_FRAME_SIZE, sending GOAWAY\n", .{});
+                return error.FrameSizeError; // Send FRAME_SIZE_ERROR and close the connection
             }
 
             // Continue parsing the frame header as before
@@ -589,6 +586,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 return stream;
             } else {
                 var stream = try Stream.init(self.allocator, self, stream_id);
+                defer stream.deinit();
+
                 try self.streams.put(stream_id, &stream);
                 return &stream;
             }
