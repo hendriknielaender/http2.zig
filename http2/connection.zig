@@ -5,6 +5,8 @@ pub const FrameHeader = @import("frame.zig").FrameHeader;
 pub const FrameFlags = @import("frame.zig").FrameFlags;
 pub const FrameType = @import("frame.zig").FrameType;
 pub const Hpack = @import("hpack.zig").Hpack;
+
+const log = std.log.scoped(.connection);
 const assert = std.debug.assert;
 
 const http2_preface: []const u8 = "\x50\x52\x49\x20\x2A\x20\x48\x54\x54\x50\x2F\x32\x2E\x30\x0D\x0A\x0D\x0A\x53\x4D\x0D\x0A\x0D\x0A";
@@ -52,7 +54,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 try self.sendGoAway(0, 0x1, "Invalid preface: PROTOCOL_ERROR");
                 return error.InvalidPreface;
             }
-            std.debug.print("Valid HTTP/2 preface received\n", .{});
+            log.debug("Valid HTTP/2 preface received\n", .{});
         }
 
         pub fn deinit(self: @This()) void {
@@ -64,7 +66,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             @constCast(&self.streams).deinit();
 
             self.hpack_dynamic_table.table.deinit();
-            std.debug.print("Resources deinitialized for connection\n", .{});
+            log.debug("Resources deinitialized for connection\n", .{});
         }
 
         fn sendPreface(self: @This()) !void {
@@ -89,7 +91,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             while (true) {
                 var frame = self.receiveFrame() catch |err| {
                     if (err == error.InvalidFrameType) {
-                        std.debug.print("Invalid frame type received, discarding and sending PING + GOAWAY.\n", .{});
+                        log.err("Invalid frame type received, discarding and sending PING + GOAWAY.\n", .{});
 
                         // Send a PING frame with default opaque data and no ACK
                         const opaque_data: [8]u8 = undefined; // Default opaque data for PING
@@ -99,14 +101,14 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         try self.sendGoAway(0, 0x01, "Invalid Frame Type: PROTOCOL_ERROR");
                         break;
                     } else if (err == error.FrameSizeError) {
-                        std.debug.print("Frame Size exceeded, sending GOAWAY.\n", .{});
+                        log.err("Frame Size exceeded, sending GOAWAY.\n", .{});
                         try self.sendGoAway(self.highestStreamId(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
                         return;
                     } else if (err == error.BrokenPipe or err == error.ConnectionResetByPeer) {
-                        std.debug.print("Client disconnected unexpectedly (BrokenPipe/ConnectionResetByPeer)\n", .{});
+                        log.err("Client disconnected unexpectedly (BrokenPipe/ConnectionResetByPeer)\n", .{});
                         return; // Gracefully exit the connection handler
                     } else {
-                        std.debug.print("Error receiving frame: {s}\n", .{@errorName(err)});
+                        log.err("Error receiving frame: {s}\n", .{@errorName(err)});
                         return err; // Handle non-frame-related errors
                     }
                 };
@@ -115,15 +117,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
                 // If GOAWAY has been sent, we should stop processing new frames
                 if (self.goaway_sent) {
-                    std.debug.print("GOAWAY has been sent, stopping frame processing.\n", .{});
+                    log.debug("GOAWAY has been sent, stopping frame processing.\n", .{});
                     break;
                 }
 
                 // Process valid frames
-                std.debug.print("Received frame of type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
+                log.debug("Received frame of type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
 
                 if (!isValidFrameType(frame.header.frame_type)) {
-                    std.debug.print("Ignoring unknown frame type: {any}, sending PING and GOAWAY.\n", .{frame.header.frame_type});
+                    log.debug("Ignoring unknown frame type: {any}, sending PING and GOAWAY.\n", .{frame.header.frame_type});
 
                     const opaque_data: [8]u8 = undefined; // Default opaque data for PING
                     try self.sendPing(&opaque_data, true);
@@ -133,7 +135,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 }
 
                 if (!isValidFlags(frame.header)) {
-                    std.debug.print("Ignoring frame with undefined flags, sending PING and GOAWAY.\n", .{});
+                    log.debug("Ignoring frame with undefined flags, sending PING and GOAWAY.\n", .{});
 
                     const opaque_data: [8]u8 = undefined; // Default opaque data for PING
                     try self.sendPing(&opaque_data, false);
@@ -158,14 +160,14 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 if (frame.header.stream_id != 0) {
                     var stream = try self.getStream(frame.header.stream_id);
                     stream.handleFrame(frame) catch |err| {
-                        std.debug.print("Error handling frame in stream {d}: {any}\n", .{ frame.header.stream_id, err });
+                        log.err("Error handling frame in stream {d}: {any}\n", .{ frame.header.stream_id, err });
 
                         if (err == error.CompressionError) {
-                            std.debug.print("Compression error occurred, sending GOAWAY with COMPRESSION_ERROR\n", .{});
+                            log.err("Compression error occurred, sending GOAWAY with COMPRESSION_ERROR\n", .{});
                             try self.sendGoAway(0, 0x9, "Compression error: COMPRESSION_ERROR");
                             return; // Exit the loop to close the connection
                         } else if (err == error.InvalidStreamState) {
-                            std.debug.print("Invalid stream state, sending GOAWAY with PROTOCOL_ERROR\n", .{});
+                            log.err("Invalid stream state, sending GOAWAY with PROTOCOL_ERROR\n", .{});
                             try self.sendGoAway(0, 0x1, "Invalid stream state: PROTOCOL_ERROR");
                             break;
                         } else {
@@ -176,38 +178,38 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     // Handle connection-level frames
                     switch (frame.header.frame_type) {
                         .SETTINGS => {
-                            std.debug.print("Received SETTINGS frame\n", .{});
+                            log.debug("Received SETTINGS frame\n", .{});
                             try self.applyFrameSettings(frame);
                             try self.sendSettingsAck();
-                            std.debug.print("Sent SETTINGS ACK\n", .{});
+                            log.debug("Sent SETTINGS ACK\n", .{});
                         },
                         .PING => {
-                            std.debug.print("Received PING frame, responding with PING (ACK)\n", .{});
+                            log.debug("Received PING frame, responding with PING (ACK)\n", .{});
 
                             // Respond with the same opaque data and ACK flag set
                             if (frame.payload.len != 8) {
-                                std.debug.print("Invalid PING frame size, expected 8 bytes.\n", .{});
+                                log.debug("Invalid PING frame size, expected 8 bytes.\n", .{});
                                 return error.InvalidPingPayloadSize;
                             }
 
                             try self.sendPing(frame.payload, true); // Send PING response with ACK
                         },
                         .WINDOW_UPDATE => {
-                            std.debug.print("Received WINDOW_UPDATE frame\n", .{});
+                            log.debug("Received WINDOW_UPDATE frame\n", .{});
                             try self.handleWindowUpdate(frame);
                         },
                         .GOAWAY => {
-                            std.debug.print("Received GOAWAY frame, closing connection\n", .{});
+                            log.debug("Received GOAWAY frame, closing connection\n", .{});
                             return self.close(); // Gracefully close connection
                         },
                         else => {
-                            std.debug.print("Unknown frame type at connection level: {s}\n", .{@tagName(frame.header.frame_type)});
+                            log.debug("Unknown frame type at connection level: {s}\n", .{@tagName(frame.header.frame_type)});
                             continue; // Ensure unknown frame types are ignored
                         },
                     }
                 }
                 if (self.goaway_sent) {
-                    std.debug.print("GOAWAY has been sent, stopping frame processing.\n", .{});
+                    log.debug("GOAWAY has been sent, stopping frame processing.\n", .{});
                     break;
                 }
             }
@@ -236,11 +238,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             // Write the opaque data
             try self.writer.writeAll(opaque_data);
 
-            std.debug.print("Sent PING frame (flags: {any}, opaque_data: {any})\n", .{ frame_header.flags.value, opaque_data });
+            log.debug("Sent PING frame (flags: {any}, opaque_data: {any})\n", .{ frame_header.flags.value, opaque_data });
         }
 
         fn processRequest(self: *@This(), stream_id: u31) !void {
-            std.debug.print("Processing request for stream ID: {d}\n", .{stream_id});
+            log.debug("Processing request for stream ID: {d}\n", .{stream_id});
 
             // Prepare a basic response: "Hello, World!"
             const response_body = "Hello, World!";
@@ -288,7 +290,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             };
             try data_frame.write(self.writer);
 
-            std.debug.print("Sent 200 OK response with body: \"Hello, World!\"\n", .{});
+            log.debug("Sent 200 OK response with body: \"Hello, World!\"\n", .{});
         }
 
         pub fn sendSettings(self: @This()) !void {
@@ -319,11 +321,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 // Serialize Setting Value as u32 (big-endian)
                 std.mem.writeInt(u32, buffer[2..6], setting[1], .big);
 
-                std.debug.print("Writing setting: ", .{});
+                log.debug("Writing setting: ", .{});
                 for (buffer) |byte| {
-                    std.debug.print("{x} ", .{byte});
+                    log.debug("{x} ", .{byte});
                 }
-                std.debug.print("\n", .{});
+                log.debug("\n", .{});
 
                 try self.writer.writeAll(buffer[0..6]);
             }
@@ -340,7 +342,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             // Validate the length against the max_frame_size
             if (length > self.settings.max_frame_size) {
-                std.debug.print("Received frame size exceeds SETTINGS_MAX_FRAME_SIZE, sending GOAWAY\n", .{});
+                log.err("Received frame size exceeds SETTINGS_MAX_FRAME_SIZE, sending GOAWAY\n", .{});
                 return error.FrameSizeError; // Send FRAME_SIZE_ERROR and close the connection
             }
 
@@ -378,20 +380,20 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         pub fn applyFrameSettings(self: *@This(), frame: Frame) !void {
-            std.debug.print("Applying settings from frame...\n", .{});
+            log.debug("Applying settings from frame...\n", .{});
 
             if (frame.header.frame_type != .SETTINGS) {
-                std.debug.print("Received frame with invalid frame type: {any}\n", .{frame.header.frame_type});
+                log.err("Received frame with invalid frame type: {any}\n", .{frame.header.frame_type});
                 return error.InvalidFrameType;
             }
 
             if (frame.header.stream_id != 0) {
-                std.debug.print("SETTINGS frame received on a non-zero stream ID: {any}\n", .{frame.header.stream_id});
+                log.err("SETTINGS frame received on a non-zero stream ID: {any}\n", .{frame.header.stream_id});
                 return error.InvalidStreamId;
             }
 
             if (frame.payload.len % 6 != 0) {
-                std.debug.print("Invalid SETTINGS frame size: {any}\n", .{frame.payload.len});
+                log.err("Invalid SETTINGS frame size: {any}\n", .{frame.payload.len});
                 return error.InvalidSettingsFrameSize;
             }
 
@@ -410,8 +412,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
                 const value: u32 = std.mem.readInt(u32, value_slice, .big);
 
-                std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
-                std.debug.print("Setting ID: {d}, Value: {d}\n", .{ id, value });
+                log.debug("Setting ID: {d}, Value: {d}\n", .{ id, value });
+                log.debug("Setting ID: {d}, Value: {d}\n", .{ id, value });
 
                 // In applyFrameSettings, when applying settings
 
@@ -446,14 +448,14 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     },
                     else => {
                         // Unknown settings should be ignored
-                        std.debug.print("Ignoring unknown setting ID: {d}\n", .{id});
+                        log.debug("Ignoring unknown setting ID: {d}\n", .{id});
                     },
                 }
 
                 i += 6; // Move to the next setting (6 bytes per setting)
             }
 
-            std.debug.print("Settings applied successfully.\n", .{});
+            log.debug("Settings applied successfully.\n", .{});
         }
 
         pub fn sendSettingsAck(self: @This()) !void {
@@ -469,13 +471,13 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             frame_header.write(self.writer) catch |err| {
                 if (err == error.BrokenPipe) {
-                    std.debug.print("Client disconnected (BrokenPipe)\n", .{});
+                    log.err("Client disconnected (BrokenPipe)\n", .{});
                     return err;
                 }
                 return err;
             };
 
-            std.debug.print("Sent SETTINGS ACK frame\n", .{});
+            log.debug("Sent SETTINGS ACK frame\n", .{});
         }
 
         pub fn receiveSettings(self: *@This()) !void {
@@ -508,11 +510,22 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
         /// Sends a GOAWAY frame with the given parameters.
         pub fn sendGoAway(self: *@This(), last_stream_id: u31, error_code: u32, debug_data: []const u8) !void {
-            // Calculate the total payload size
             const payload_size = 8 + debug_data.len;
 
-            // Allocate the payload buffer
-            var payload = try self.allocator.alloc(u8, payload_size);
+            // Log the goaway details before allocation attempt
+            log.debug("Preparing to send GOAWAY frame with last_stream_id = {d}, error_code = {d}, payload_size = {d}\n", .{ last_stream_id, error_code, payload_size });
+
+            // Log the allocator state (if applicable)
+            log.debug("Allocator state before allocation: {any}", .{self.allocator});
+
+            // Add an assert to ensure that the payload size is reasonable
+            assert(payload_size > 0);
+
+            // Attempt to allocate memory for the payload
+            var payload = self.allocator.alloc(u8, payload_size) catch |err| {
+                log.err("Failed to allocate memory for GOAWAY frame payload: {any}", .{err});
+                return err;
+            };
             defer self.allocator.free(payload);
 
             // Write Last-Stream-ID (31 bits) in big-endian, ensuring the reserved bit is zero
@@ -526,6 +539,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 std.mem.copyForwards(u8, payload[8..], debug_data);
             }
 
+            // Log the payload details
+            log.debug("GOAWAY payload prepared, length = {d}, debug_data = {s}\n", .{ payload.len, debug_data });
+
             // Create the GOAWAY frame
             var goaway_frame = Frame{
                 .header = FrameHeader{
@@ -538,16 +554,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 .payload = payload,
             };
 
-            std.debug.print("Sending GOAWAY frame with error code {d}\n", .{error_code});
+            log.debug("Sending GOAWAY frame with error code {d} and stream_id {d}\n", .{ error_code, last_stream_id });
+
             try goaway_frame.write(self.writer);
 
-            // Ensure the GOAWAY frame is flushed to the client
-
-            // try self.writer.flush();
+            // Ensure the GOAWAY frame is sent successfully
+            log.debug("GOAWAY frame sent successfully\n", .{});
 
             // Set the goaway_sent flag
             self.goaway_sent = true;
-            std.debug.print("GOAWAY sent, connection will close.\n", .{});
         }
 
         pub fn close(self: *@This()) !void {
@@ -578,7 +593,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             // Optionally, free up resources associated with streams
             @constCast(&self.streams).deinit();
 
-            std.debug.print("Connection closed gracefully with GOAWAY frame\n", .{});
+            log.debug("Connection closed gracefully with GOAWAY frame\n", .{});
         }
 
         pub fn getStream(self: *@This(), stream_id: u31) !*Stream {

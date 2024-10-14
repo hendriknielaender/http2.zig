@@ -1,6 +1,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const log = std.log.scoped(.frame);
+
 /// Represents the type of an HTTP/2 frame
 pub const FrameType = enum(u8) {
     DATA = 0,
@@ -78,12 +80,12 @@ pub const FrameHeader = struct {
         var buffer: [9]u8 = undefined;
         _ = try reader.readAll(&buffer);
 
-        std.debug.print("Buffer content: {x}\n", .{buffer});
+        log.debug("Buffer content: {x}\n", .{buffer});
 
         const length: u24 = std.mem.readInt(u24, buffer[0..3], .big);
         const frame_type_value: u8 = buffer[3];
         if (frame_type_value > @intFromEnum(FrameType.CONTINUATION)) {
-            std.debug.print("Invalid frame_type_value: {}\n", .{frame_type_value});
+            log.err("Invalid frame_type_value: {}\n", .{frame_type_value});
             return error.InvalidEnumValue;
         }
 
@@ -132,7 +134,7 @@ pub const Frame = struct {
 
     pub fn read(reader: anytype, allocator: *std.mem.Allocator) !Frame {
         const header = try FrameHeader.read(reader);
-        std.debug.print("Read FrameHeader: {any}\n", .{header});
+        log.debug("Read FrameHeader: {any}\n", .{header});
 
         var payload_length = header.length;
         var padding_length: ?u8 = null;
@@ -143,7 +145,7 @@ pub const Frame = struct {
                 return error.InvalidPaddingLength;
             }
             payload_length -= @as(u24, padding_length.? + 1); // Subtract padding length
-            std.debug.print("Padding length: {}\n", .{padding_length.?});
+            log.debug("Padding length: {}\n", .{padding_length.?});
         }
 
         const payload = try allocator.alloc(u8, payload_length);
@@ -164,7 +166,7 @@ pub const Frame = struct {
         // Write the frame header first
         try self.header.write(writer);
 
-        std.debug.print("Frame.write called with payload length: {d}\n", .{self.payload.len});
+        log.debug("Frame.write called with payload length: {d}\n", .{self.payload.len});
 
         // Write the payload only if it's not empty
         if (self.payload.len > 0) {

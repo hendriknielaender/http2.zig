@@ -1,6 +1,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
+const log = std.log.scoped(.hpack);
+
 const huffman = @import("huffman.zig").Huffman;
 
 /// HPACK: Header Compression for HTTP/2
@@ -247,19 +249,19 @@ pub const Hpack = struct {
     }
 
     pub fn encodeString(str: []const u8, buffer: *std.ArrayList(u8)) !void {
-        std.debug.print("Encoding string: {s}, length: {d}\n", .{ str, str.len });
+        log.debug("Encoding string: {s}, length: {d}\n", .{ str, str.len });
 
         // For simplicity, we're not using Huffman encoding here.
         // Set the Huffman bit to 0.
         const huffman_bit: u8 = 0;
 
         // Ensure the length is encoded correctly
-        std.debug.print("Encoding string length: {d}\n", .{str.len});
+        log.debug("Encoding string length: {d}\n", .{str.len});
         try Hpack.encodeInt(str.len, 7, buffer, huffman_bit);
 
         try buffer.appendSlice(str);
 
-        std.debug.print("Encoded string: {any}\n", .{buffer.items});
+        log.debug("Encoded string: {any}\n", .{buffer.items});
     }
 
     pub fn encodeHeaderField(
@@ -330,14 +332,14 @@ pub const Hpack = struct {
         var owns_value: bool = false;
 
         // Debugging output to show the buffer state before decoding
-        std.debug.print("Decoding header at cursor position {any}, payload length: {any}\n", .{ cursor, payload.len });
+        log.debug("Decoding header at cursor position {any}, payload length: {any}\n", .{ cursor, payload.len });
 
         if ((first_byte & 0x80) != 0) {
             // Indexed Header Field Representation (Section 6.1)
             const int_result = try Hpack.decodeIntWithCursor(7, payload);
             cursor += int_result.bytes_consumed;
 
-            std.debug.print("Indexed header field: decoded index={any}, cursor={any}\n", .{ int_result.value, cursor });
+            log.debug("Indexed header field: decoded index={any}, cursor={any}\n", .{ int_result.value, cursor });
 
             if (int_result.value == 0) return error.InvalidEncoding;
 
@@ -361,7 +363,7 @@ pub const Hpack = struct {
             const int_result = try Hpack.decodeIntWithCursor(6, payload);
             cursor += int_result.bytes_consumed;
 
-            std.debug.print("Literal header field: decoded name index={any}, cursor={any}\n", .{ int_result.value, cursor });
+            log.debug("Literal header field: decoded name index={any}, cursor={any}\n", .{ int_result.value, cursor });
 
             var header_name: []const u8 = undefined;
 
@@ -387,7 +389,7 @@ pub const Hpack = struct {
             cursor += value_result.bytes_consumed;
             owns_value = value_result.owns_value;
 
-            std.debug.print("Decoded header field name: {s}, value: {s}\n", .{ header_name, value_result.value });
+            log.debug("Decoded header field name: {s}, value: {s}\n", .{ header_name, value_result.value });
 
             const field = HeaderField{
                 .name = header_name,
@@ -489,11 +491,11 @@ pub const Hpack = struct {
         var cursor: usize = int_result.bytes_consumed;
 
         // Debugging output to check the state
-        std.debug.print("Decoding string: huffman_bit={any}, decoded length={any}, cursor={any}\n", .{ huffman_bit, int_result.value, cursor });
+        log.debug("Decoding string: huffman_bit={any}, decoded length={any}, cursor={any}\n", .{ huffman_bit, int_result.value, cursor });
 
         // Ensure the decoded length fits within the remaining data
         if (int_result.value > data.len - cursor) {
-            std.debug.print("Invalid encoding: length {any} exceeds available buffer size {any}\n", .{ int_result.value, data.len - cursor });
+            log.err("Invalid encoding: length {any} exceeds available buffer size {any}\n", .{ int_result.value, data.len - cursor });
             return error.InvalidEncoding; // Invalid data length, buffer too small
         }
 
@@ -505,7 +507,7 @@ pub const Hpack = struct {
 
         if (huffman_bit) {
             // Debugging Huffman decoding step
-            std.debug.print("Decoding Huffman-encoded string of length {any}...\n", .{int_result.value});
+            log.debug("Decoding Huffman-encoded string of length {any}...\n", .{int_result.value});
 
             // Decode Huffman-encoded string
             const decoded_result = huffman.decode(encoded_value, allocator) catch |err| {
@@ -515,14 +517,14 @@ pub const Hpack = struct {
             owns_value = true;
 
             // Debugging output for Huffman decoding result
-            std.debug.print("Decoded Huffman string: {s}\n", .{decoded_value});
+            log.debug("Decoded Huffman string: {s}\n", .{decoded_value});
         } else {
             // Literal string, no Huffman encoding
             decoded_value = encoded_value;
             owns_value = false;
 
             // Debugging output for literal string decoding
-            std.debug.print("Decoded literal string: {s}\n", .{decoded_value});
+            log.debug("Decoded literal string: {s}\n", .{decoded_value});
         }
 
         return DecodedString{
@@ -547,10 +549,10 @@ pub const Hpack = struct {
         var value: usize = encoded[0] & max_prefix_value_u8;
         var cursor: usize = 1;
 
-        std.debug.print("Initial byte value: {any}, max_prefix_value: {any}, initial value: {any}, cursor: {any}\n", .{ encoded[0], max_prefix_value_u8, value, cursor });
+        log.debug("Initial byte value: {any}, max_prefix_value: {any}, initial value: {any}, cursor: {any}\n", .{ encoded[0], max_prefix_value_u8, value, cursor });
 
         if (value < max_prefix_value) {
-            std.debug.print("Decoded integer with value={any}, bytes_consumed={any}\n", .{ value, cursor });
+            log.err("Decoded integer with value={any}, bytes_consumed={any}\n", .{ value, cursor });
             return DecodedInt{ .value = value, .bytes_consumed = cursor };
         }
 
@@ -559,14 +561,14 @@ pub const Hpack = struct {
             const byte = encoded[cursor];
             cursor += 1;
 
-            std.debug.print("Decoding byte: {any}, current value: {any}, shift: {any}\n", .{ byte, value, shift });
+            log.debug("Decoding byte: {any}, current value: {any}, shift: {any}\n", .{ byte, value, shift });
 
             value += (@as(usize, byte & 0x7F) << shift);
             shift += 7;
             if ((byte & 0x80) == 0) break;
         }
 
-        std.debug.print("Final decoded value={any}, bytes_consumed={any}\n", .{ value, cursor });
+        log.debug("Final decoded value={any}, bytes_consumed={any}\n", .{ value, cursor });
 
         return DecodedInt{ .value = value, .bytes_consumed = cursor };
     }
