@@ -160,6 +160,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 // Process valid frames
                 log.debug("Received frame of type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
 
+                // Check for invalid SETTINGS frames
+                if (frame.header.frame_type == .SETTINGS and frame.header.stream_id != 0) {
+                    log.err("Received SETTINGS frame with non-zero stream ID {d}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
+                    // Send GOAWAY frame with error code PROTOCOL_ERROR
+                    try self.sendGoAway(self.last_stream_id, 0x1, "SETTINGS frame with non-zero stream ID: PROTOCOL_ERROR");
+                    // Close the connection
+                    return error.ProtocolError;
+                }
+
                 if (!isValidFrameType(frame.header.frame_type)) {
                     log.debug("Ignoring unknown frame type: {any}, sending PING and GOAWAY.\n", .{frame.header.frame_type});
 
@@ -204,6 +213,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                             try self.sendGoAway(self.last_stream_id, 0x5, "Frame received on closed stream: STREAM_CLOSED");
                             // Close the connection
                             return error.StreamClosed;
+                        } else if (err == error.ProtocolError) {
+                            log.err("Protocol error occurred, sending GOAWAY with PROTOCOL_ERROR\n", .{});
+                            try self.sendGoAway(self.last_stream_id, 0x1, "Protocol error: PROTOCOL_ERROR");
+                            return err; // Exit the loop to close the connection
                         } else if (err == error.InvalidStreamState or err == error.IdleStreamError) {
                             log.err("Invalid stream state, sending GOAWAY with PROTOCOL_ERROR\n", .{});
                             try self.sendGoAway(0, 0x1, "Invalid stream state: PROTOCOL_ERROR");
@@ -244,8 +257,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                             return self.close(); // Gracefully close connection
                         },
                         else => {
-                            log.debug("Unknown frame type at connection level: {s}\n", .{@tagName(frame.header.frame_type)});
-                            continue; // Ensure unknown frame types are ignored
+                            // log.debug("Unknown frame type at connection level: {s}\n", .{@tagName(frame.header.frame_type)});
+                            // continue; // Ensure unknown frame types are ignored
+                            // Invalid frame type received on stream 0
+                            log.err("Invalid frame type {s} received on stream 0: PROTOCOL_ERROR\n", .{@tagName(frame.header.frame_type)});
+                            try self.sendGoAway(self.last_stream_id, 0x1, "Invalid frame type on stream 0: PROTOCOL_ERROR");
+                            return error.ProtocolError;
                         },
                     }
                 }

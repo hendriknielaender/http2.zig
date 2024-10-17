@@ -306,11 +306,34 @@ pub const Stream = struct {
         if (self.state != .Open and self.state != .HalfClosedLocal) {
             return error.InvalidStreamState;
         }
-        try self.recv_data.appendSlice(frame.payload);
+
+        // Handle the PADDED flag
+        var payload = frame.payload;
+        var pad_length: u8 = 0;
+        if ((frame.header.flags.value & FrameFlags.PADDED) != 0) {
+            if (payload.len < 1) {
+                // Payload is too short to contain Pad Length field
+                return error.ProtocolError;
+            }
+            pad_length = payload[0];
+            payload = payload[1..];
+
+            if (@as(u32, pad_length) > payload.len) {
+                // Pad length exceeds remaining payload length
+                return error.ProtocolError;
+            }
+
+            // Remove padding from payload
+            payload = payload[0 .. payload.len - @as(u32, pad_length)];
+        }
+
+        // Now 'payload' contains the actual data without padding
+        try self.recv_data.appendSlice(payload);
         self.recv_window_size -= @intCast(frame.header.length);
         if (self.recv_window_size < 0) {
             return error.FlowControlError;
         }
+
         if (frame.header.flags.isEndStream()) {
             if (self.state == .Open) {
                 self.state = .HalfClosedRemote;
