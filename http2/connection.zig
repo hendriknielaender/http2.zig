@@ -23,6 +23,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         hpack_dynamic_table: Hpack.DynamicTable,
         goaway_sent: bool = false,
         expecting_continuation_stream_id: ?u32 = null,
+        last_stream_id: u32 = 0,
 
         pub fn init(allocator: *std.mem.Allocator, reader: ReaderType, writer: WriterType, comptime is_server: bool) !@This() {
             var self = @This(){
@@ -128,6 +129,13 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     }
                 }
 
+                // Check for invalid PING frames
+                if (frame.header.frame_type == .PING and frame.header.stream_id != 0) {
+                    log.err("Received PING frame with non-zero stream ID {d}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
+                    // Close the connection immediately
+                    return error.ProtocolError;
+                }
+
                 // Check for incomplete header blocks
                 if (self.expecting_continuation_stream_id) |expected_stream_id| {
                     if (frame.header.frame_type != .CONTINUATION or frame.header.stream_id != expected_stream_id) {
@@ -174,7 +182,14 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
                 // Dispatch frames with stream IDs to the appropriate stream
                 if (frame.header.stream_id != 0) {
-                    var stream = try self.getStream(frame.header.stream_id);
+                    var stream = self.getStream(frame.header.stream_id) catch |err| {
+                        if (err == error.ProtocolError) {
+                            // Protocol error has been handled in getStream
+                            return;
+                        } else {
+                            return err;
+                        }
+                    };
                     stream.handleFrame(frame) catch |err| {
                         log.err("Error handling frame in stream {d}: {any}\n", .{ frame.header.stream_id, err });
 
@@ -182,6 +197,13 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                             log.err("Compression error occurred, sending GOAWAY with COMPRESSION_ERROR\n", .{});
                             try self.sendGoAway(0, 0x9, "Compression error: COMPRESSION_ERROR");
                             return; // Exit the loop to close the connection
+                        } else if (err == error.StreamClosed) {
+                            log.err("Connection error due to frame on closed stream {d}: STREAM_CLOSED\n", .{frame.header.stream_id});
+
+                            // Send GOAWAY frame with error code STREAM_CLOSED
+                            try self.sendGoAway(self.last_stream_id, 0x5, "Frame received on closed stream: STREAM_CLOSED");
+                            // Close the connection
+                            return error.StreamClosed;
                         } else if (err == error.InvalidStreamState or err == error.IdleStreamError) {
                             log.err("Invalid stream state, sending GOAWAY with PROTOCOL_ERROR\n", .{});
                             try self.sendGoAway(0, 0x1, "Invalid stream state: PROTOCOL_ERROR");
@@ -655,9 +677,32 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         pub fn getStream(self: *@This(), stream_id: u32) !*Stream {
+            // Check if the stream ID is valid
+            if (stream_id % 2 == 0) {
+                // Even-numbered stream IDs are reserved for server-initiated streams
+                log.err("Received invalid stream ID {d} from client: PROTOCOL_ERROR\n", .{stream_id});
+                try self.sendGoAway(0, 0x1, "Invalid stream ID: PROTOCOL_ERROR");
+                return error.ProtocolError;
+            }
+
+            // Check if the stream already exists
             if (self.streams.get(stream_id)) |stream| {
                 return stream;
             } else {
+                // New stream
+                // Check if the stream ID is greater than the last processed stream ID
+                if (stream_id <= self.last_stream_id) {
+                    log.err(
+                        "Received new stream ID {d} that is less than or equal to the previous stream ID {d}: PROTOCOL_ERROR\n",
+                        .{ stream_id, self.last_stream_id },
+                    );
+                    try self.sendGoAway(0, 0x1, "Stream ID decreased: PROTOCOL_ERROR");
+                    return error.ProtocolError;
+                }
+
+                // Update the last processed stream ID
+                self.last_stream_id = stream_id;
+
                 const stream = try Stream.init(self.allocator, self, stream_id);
                 try self.streams.put(stream_id, stream);
                 return stream;

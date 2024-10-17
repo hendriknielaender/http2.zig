@@ -68,6 +68,15 @@ pub const Stream = struct {
     pub fn handleFrame(self: *Stream, frame: Frame) !void {
         log.debug("Handling frame type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
 
+        // Check if the stream is closed
+        if (self.state == .Closed) {
+            // Only PRIORITY frames are allowed on closed streams
+            if (frame.header.frame_type != .PRIORITY) {
+                log.err("Received frame type {s} on closed stream {d}: STREAM_CLOSED\n", .{ @tagName(frame.header.frame_type), self.id });
+                try self.sendRstStream(0x5); // STREAM_CLOSED
+                return error.StreamClosed;
+            }
+        }
         // Check if we're expecting a CONTINUATION frame
         if (self.expecting_continuation and frame.header.frame_type != FrameType.CONTINUATION) {
             // Protocol error: received a frame other than CONTINUATION while expecting CONTINUATION
@@ -91,6 +100,10 @@ pub const Stream = struct {
             },
             FrameType.WINDOW_UPDATE => try self.handleWindowUpdate(frame),
             FrameType.RST_STREAM => try self.handleRstStream(),
+            FrameType.PRIORITY => {
+                log.debug("Handling PRIORITY frame\n", .{});
+                try self.handlePriorityFrame(frame);
+            },
             else => {
                 // Handle other frame types or ignore them as appropriate
                 log.debug("Received frame type {s} which is not handled in current state\n", .{@tagName(frame.header.frame_type)});
@@ -107,35 +120,64 @@ pub const Stream = struct {
         log.debug("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
     }
 
-    pub fn handleFrame2(self: *Stream, frame: Frame) !void {
-        log.debug("Handling frame type: {d}, stream ID: {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
-
-        switch (frame.header.frame_type) {
-            FrameType.HEADERS => {
-                log.debug("Handling HEADERS frame\n", .{});
-                try self.handleHeadersFrame(frame);
-            },
-            FrameType.CONTINUATION => {
-                log.debug("Handling CONTINUATION frame\n", .{});
-                try self.handleContinuationFrame(frame);
-            },
-            FrameType.DATA => {
-                log.debug("Handling DATA frame\n", .{});
-                try self.handleData(frame);
-            },
-            FrameType.WINDOW_UPDATE => try self.handleWindowUpdate(frame),
-            FrameType.RST_STREAM => try self.handleRstStream(),
-            else => {},
+    fn handlePriorityFrame(self: *Stream, frame: Frame) !void {
+        if (frame.payload.len != 5) {
+            return error.FrameSizeError;
         }
 
-        // After handling the frame, check if the request is complete
-        if (self.request_complete) {
-            // Process the request
-            try self.conn.processRequest(self);
-            self.state = .HalfClosedRemote; // Update the stream state
+        const payload = frame.payload;
+
+        // Read the 4-byte Stream Dependency field
+        const stream_dependency = (@as(u32, payload[0]) << 24) |
+            (@as(u32, payload[1]) << 16) |
+            (@as(u32, payload[2]) << 8) |
+            (@as(u32, payload[3]));
+
+        // The most significant bit is the 'E' bit (Exclusive flag)
+        const exclusive = (stream_dependency & 0x80000000) != 0;
+        const dependency_stream_id = stream_dependency & 0x7FFFFFFF; // Clear the 'E' bit
+
+        // Read the 1-byte Weight field
+        const weight = payload[4]; // Weight is between 1 and 256
+
+        // Check for self-dependency
+        if (dependency_stream_id == self.id) {
+            log.err("Stream {d} has a dependency on itself: PROTOCOL_ERROR\n", .{self.id});
+            try self.sendRstStream(0x1); // PROTOCOL_ERROR
+            self.state = .Closed;
+            return error.ProtocolError;
         }
 
-        log.debug("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
+        // For now, we just log the priority information
+        log.debug(
+            "Stream {d} depends on stream {d} (exclusive: {any}), weight: {d}\n",
+            .{ self.id, dependency_stream_id, exclusive, weight },
+        );
+    }
+
+    fn sendRstStream(self: *Stream, error_code: u32) !void {
+        var buffer: [4]u8 = undefined;
+
+        buffer[0] = @intCast((error_code >> 24) & 0xFF);
+        buffer[1] = @intCast((error_code >> 16) & 0xFF);
+        buffer[2] = @intCast((error_code >> 8) & 0xFF);
+        buffer[3] = @intCast(error_code & 0xFF);
+
+        var frame = Frame{
+            .header = FrameHeader{
+                .length = 4,
+                .frame_type = .RST_STREAM,
+                .flags = FrameFlags.init(0),
+                .reserved = false,
+                .stream_id = self.id,
+            },
+            .payload = &buffer,
+        };
+        try frame.write(self.conn.writer);
+        log.debug(
+            "Sent RST_STREAM frame for stream {d} with error code {d}\n",
+            .{ self.id, error_code },
+        );
     }
 
     fn handleHeadersFrame(self: *Stream, frame: Frame) !void {
