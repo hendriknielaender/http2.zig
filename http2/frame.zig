@@ -70,19 +70,64 @@ pub const FrameFlags = struct {
 
 /// Represents an HTTP/2 frame header
 pub const FrameHeader = struct {
-    length: u24,
+    length: u32,
     frame_type: FrameType,
     flags: FrameFlags,
     reserved: bool,
-    stream_id: u31,
+    stream_id: u32,
 
     pub fn read(reader: anytype) !FrameHeader {
         var buffer: [9]u8 = undefined;
         _ = try reader.readAll(&buffer);
 
+        // Parse the 24-bit length from the first three bytes
+        const length: u32 = (@as(u32, buffer[0]) << 16) | (@as(u32, buffer[1]) << 8) | @as(u32, buffer[2]);
+
+        // Ensure the length is within 24 bits
+        if (length > 0xFFFFFF) {
+            return error.InvalidFrameLength;
+        }
+
+        const frame_type_value: u8 = buffer[3];
+        var frame_type: FrameType = undefined;
+        const frame_type_result: FrameType = @enumFromInt(frame_type_value);
+        if (frame_type_result) |ft| {
+            frame_type = ft;
+        } else {
+            // Handle unknown frame types by assigning a special value
+            frame_type = FrameType(0xFF); // Assign an invalid value that's not used
+        }
+
+        const flags = FrameFlags.init(buffer[4]);
+
+        // Parse the 31-bit stream ID from the last four bytes
+        const stream_id_raw = std.mem.readInt(u32, buffer[5..9], .big);
+        const reserved: bool = (stream_id_raw & 0x80000000) != 0;
+        const stream_id: u32 = stream_id_raw & 0x7FFFFFFF;
+
+        return FrameHeader{
+            .length = length,
+            .frame_type = frame_type,
+            .flags = flags,
+            .reserved = reserved,
+            .stream_id = stream_id,
+        };
+    }
+
+    pub fn read2(reader: anytype) !FrameHeader {
+        var buffer: [9]u8 = undefined;
+        _ = try reader.readAll(&buffer);
+
         log.debug("Buffer content: {x}\n", .{buffer});
 
-        const length: u24 = std.mem.readInt(u24, buffer[0..3], .big);
+        // Parse the 24-bit length from the first three bytes
+        const length: u32 = (@as(u32, buffer[0]) << 16) | (@as(u32, buffer[1]) << 8) | @as(u32, buffer[2]);
+
+        // Ensure the length is within 24 bits
+        if (length > 0xFFFFFF) {
+            return error.InvalidFrameLength;
+        }
+
         const frame_type_value: u8 = buffer[3];
         if (frame_type_value > @intFromEnum(FrameType.CONTINUATION)) {
             log.err("Invalid frame_type_value: {}\n", .{frame_type_value});
@@ -91,8 +136,11 @@ pub const FrameHeader = struct {
 
         const frame_type: FrameType = @enumFromInt(frame_type_value);
         const flags = FrameFlags.init(buffer[4]);
-        const reserved: bool = (buffer[5] & 0x80) != 0;
-        const stream_id: u31 = @intCast(std.mem.readInt(u32, buffer[5..9], .big) & 0x7fffffff);
+
+        // Parse the 31-bit stream ID from the last four bytes
+        const stream_id_raw = std.mem.readInt(u32, buffer[5..9], .big);
+        const reserved: bool = (stream_id_raw & 0x80000000) != 0;
+        const stream_id: u32 = stream_id_raw & 0x7FFFFFFF;
 
         return FrameHeader{
             .length = length,
@@ -105,14 +153,27 @@ pub const FrameHeader = struct {
 
     pub fn write(self: *FrameHeader, writer: anytype) !void {
         var buffer: [9]u8 = undefined;
-        std.mem.writeInt(u24, buffer[0..3], self.length, .big);
+
+        // Ensure the length fits into 24 bits
+        if (self.length > 0xFFFFFF) {
+            return error.InvalidFrameLength;
+        }
+
+        // Write the 24-bit length into the first three bytes
+        buffer[0] = @intCast((self.length >> 16) & 0xFF);
+        buffer[1] = @intCast((self.length >> 8) & 0xFF);
+        buffer[2] = @intCast(self.length & 0xFF);
+
         buffer[3] = @intFromEnum(self.frame_type);
         buffer[4] = self.flags.value;
-        const reserved: u8 = @intFromBool(self.reserved);
-        const stream_id: u8 = @intCast(self.stream_id >> 24);
-        buffer[5] = ((reserved << 7) | stream_id);
 
-        std.mem.writeInt(u32, buffer[5..9], self.stream_id & 0x7fffffff, .big);
+        // Combine the reserved bit and stream ID
+        var stream_id_raw: u32 = self.stream_id & 0x7FFFFFFF;
+        if (self.reserved) {
+            stream_id_raw |= 0x80000000;
+        }
+        std.mem.writeInt(u32, buffer[5..9], stream_id_raw, .big);
+
         try writer.writeAll(&buffer);
     }
 };
@@ -144,7 +205,7 @@ pub const Frame = struct {
             if (padding_length.? >= payload_length) {
                 return error.InvalidPaddingLength;
             }
-            payload_length -= @as(u24, padding_length.? + 1); // Subtract padding length
+            payload_length -= @as(u32, padding_length.? + 1); // Subtract padding length
             log.debug("Padding length: {}\n", .{padding_length.?});
         }
 

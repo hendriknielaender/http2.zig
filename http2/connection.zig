@@ -19,9 +19,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         settings: Settings,
         recv_window_size: i32 = 65535,
         send_window_size: i32 = 65535,
-        streams: std.AutoHashMap(u31, *Stream),
+        streams: std.AutoHashMap(u32, *Stream),
         hpack_dynamic_table: Hpack.DynamicTable,
         goaway_sent: bool = false,
+        expecting_continuation_stream_id: ?u32 = null,
 
         pub fn init(allocator: *std.mem.Allocator, reader: ReaderType, writer: WriterType, comptime is_server: bool) !@This() {
             var self = @This(){
@@ -31,7 +32,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 .settings = Settings.default(),
                 .recv_window_size = 65535,
                 .send_window_size = 65535,
-                .streams = std.AutoHashMap(u31, *Stream).init(allocator.*),
+                .streams = std.AutoHashMap(u32, *Stream).init(allocator.*),
                 .hpack_dynamic_table = try Hpack.DynamicTable.init(allocator, 4096),
             };
 
@@ -58,11 +59,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         pub fn deinit(self: @This()) void {
-            // Deinitialize streams
-            // var it = self.streams.iterator();
-            // while (it.next()) |entry| {
-            //     entry.value_ptr.*.deinit();
-            // }
+            // Deinitialize and free streams
+            var it = self.streams.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.*.deinit();
+            }
             @constCast(&self.streams).deinit();
 
             self.hpack_dynamic_table.table.deinit();
@@ -73,8 +74,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try self.writer.writeAll(http2_preface);
         }
 
-        pub fn highestStreamId(self: @This()) u31 {
-            var highest_stream_id: u31 = 0;
+        pub fn highestStreamId(self: @This()) u32 {
+            var highest_stream_id: u32 = 0;
 
             var it = self.streams.iterator();
             while (it.next()) |entry| {
@@ -104,6 +105,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         log.err("Frame Size exceeded, sending GOAWAY.\n", .{});
                         try self.sendGoAway(self.highestStreamId(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
                         return;
+                    } else if (err == error.UnexpectedEOF) {
+                        log.debug("Client closed the connection (UnexpectedEOF)\n", .{});
+                        break; // Exit the loop to close the connection gracefully
                     } else if (err == error.BrokenPipe or err == error.ConnectionResetByPeer) {
                         log.err("Client disconnected unexpectedly (BrokenPipe/ConnectionResetByPeer)\n", .{});
                         return; // Gracefully exit the connection handler
@@ -112,8 +116,32 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         return err; // Handle non-frame-related errors
                     }
                 };
-
                 defer frame.deinit(self.allocator);
+
+                var it = self.streams.iterator();
+                while (it.next()) |entry| {
+                    const stream = entry.value_ptr.*;
+                    if (stream.request_complete and stream.state != .Closed) {
+                        // Process the request if not already processed
+                        try self.processRequest(stream);
+                        stream.state = .Closed;
+                    }
+                }
+
+                // Check for incomplete header blocks
+                if (self.expecting_continuation_stream_id) |expected_stream_id| {
+                    if (frame.header.frame_type != .CONTINUATION or frame.header.stream_id != expected_stream_id) {
+                        // Protocol error: received a frame other than CONTINUATION while expecting one
+                        log.err("Received frame type {s} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id, expected_stream_id });
+                        try self.sendGoAway(0, 0x01, "Expected CONTINUATION frame: PROTOCOL_ERROR");
+                        return error.ProtocolError;
+                    }
+                } else if (frame.header.frame_type == .CONTINUATION) {
+                    // Protocol error: received CONTINUATION frame when not expecting one
+                    log.err("Received unexpected CONTINUATION frame on stream {d}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
+                    try self.sendGoAway(0, 0x01, "Unexpected CONTINUATION frame: PROTOCOL_ERROR");
+                    return error.ProtocolError;
+                }
 
                 // If GOAWAY has been sent, we should stop processing new frames
                 if (self.goaway_sent) {
@@ -144,18 +172,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     continue; // Ignore frames with invalid or undefined flags
                 }
 
-                if (frame.header.frame_type != .CONTINUATION) {
-                    // Check if any stream is expecting a CONTINUATION frame
-                    var it = self.streams.iterator();
-                    while (it.next()) |entry| {
-                        const stream = entry.value_ptr.*;
-                        if (stream.expecting_continuation) {
-                            try self.sendGoAway(0, 0x01, "Expected CONTINUATION frame: PROTOCOL_ERROR");
-                            return;
-                        }
-                    }
-                }
-
                 // Dispatch frames with stream IDs to the appropriate stream
                 if (frame.header.stream_id != 0) {
                     var stream = try self.getStream(frame.header.stream_id);
@@ -166,10 +182,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                             log.err("Compression error occurred, sending GOAWAY with COMPRESSION_ERROR\n", .{});
                             try self.sendGoAway(0, 0x9, "Compression error: COMPRESSION_ERROR");
                             return; // Exit the loop to close the connection
-                        } else if (err == error.InvalidStreamState) {
+                        } else if (err == error.InvalidStreamState or err == error.IdleStreamError) {
                             log.err("Invalid stream state, sending GOAWAY with PROTOCOL_ERROR\n", .{});
                             try self.sendGoAway(0, 0x1, "Invalid stream state: PROTOCOL_ERROR");
-                            break;
+                            return; // Exit the loop to close the connection
                         } else {
                             // Handle other errors if necessary
                         }
@@ -180,8 +196,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         .SETTINGS => {
                             log.debug("Received SETTINGS frame\n", .{});
                             try self.applyFrameSettings(frame);
-                            try self.sendSettingsAck();
-                            log.debug("Sent SETTINGS ACK\n", .{});
+                            // Only send SETTINGS ACK if the ACK flag is not set
+                            if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
+                                try self.sendSettingsAck();
+                                log.debug("Sent SETTINGS ACK\n", .{});
+                            }
                         },
                         .PING => {
                             log.debug("Received PING frame, responding with PING (ACK)\n", .{});
@@ -241,16 +260,18 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             log.debug("Sent PING frame (flags: {any}, opaque_data: {any})\n", .{ frame_header.flags.value, opaque_data });
         }
 
-        fn processRequest(self: *@This(), stream_id: u31) !void {
-            log.debug("Processing request for stream ID: {d}\n", .{stream_id});
+        // connection.zig
+        pub fn processRequest(self: *@This(), stream: *Stream) !void {
+            log.debug("Processing request for stream ID: {d}\n", .{stream.id});
 
             // Prepare a basic response: "Hello, World!"
             const response_body = "Hello, World!";
             const response_headers = [_]Hpack.HeaderField{
                 .{ .name = ":status", .value = "200" },
+                .{ .name = "content-length", .value = "13" },
             };
 
-            var buffer = std.ArrayList(u8).init(self.allocator);
+            var buffer = std.ArrayList(u8).init(self.allocator.*);
             defer buffer.deinit();
 
             // Encode headers and write them to the buffer
@@ -269,7 +290,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         .value = FrameFlags.END_HEADERS, // Mark end of headers
                     },
                     .reserved = false,
-                    .stream_id = stream_id,
+                    .stream_id = stream.id,
                 },
                 .payload = encoded_headers,
             };
@@ -284,7 +305,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         .value = FrameFlags.END_STREAM, // Mark end of stream
                     },
                     .reserved = false,
-                    .stream_id = stream_id,
+                    .stream_id = stream.id,
                 },
                 .payload = response_body,
             };
@@ -334,19 +355,27 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         pub fn receiveFrame(self: *@This()) !Frame {
             var header_buf: [9]u8 = undefined;
 
-            // Read the frame header (9 bytes)
-            _ = try self.reader.readAll(&header_buf);
+            // Read the frame header (9 bytes) in a loop to handle partial reads
+            var header_read: usize = 0;
+            while (header_read < 9) {
+                const bytes_read = try self.reader.read(header_buf[header_read..]);
+                if (bytes_read == 0) {
+                    return error.UnexpectedEOF;
+                }
+                header_read += bytes_read;
+            }
 
-            // Parse frame length (first 3 bytes)
-            const length: u24 = std.mem.readInt(u24, header_buf[0..3], .big);
+            // Manually parse frame length (first 3 bytes)
+            const length: u32 = (@as(u32, header_buf[0]) << 16) | (@as(u32, header_buf[1]) << 8) | @as(u32, header_buf[2]);
+
+            log.debug("Received frame length: {d}, max_frame_size: {d}\n", .{ length, self.settings.max_frame_size });
 
             // Validate the length against the max_frame_size
             if (length > self.settings.max_frame_size) {
-                log.err("Received frame size exceeds SETTINGS_MAX_FRAME_SIZE, sending GOAWAY\n", .{});
+                log.err("Received frame size {d} exceeds SETTINGS_MAX_FRAME_SIZE {d}, sending GOAWAY\n", .{ length, self.settings.max_frame_size });
                 return error.FrameSizeError; // Send FRAME_SIZE_ERROR and close the connection
             }
 
-            // Continue parsing the frame header as before
             const frame_type_val: u8 = header_buf[3];
 
             // Attempt to convert the integer to a valid FrameType
@@ -356,12 +385,21 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             };
 
             const flags = FrameFlags{ .value = header_buf[4] };
-            const stream_id_u32: u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
-            const stream_id: u31 = @intCast(stream_id_u32);
 
-            // Read the frame payload
+            // Parse the stream ID (last 4 bytes of the header) in big-endian
+            const stream_id_u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
+            const stream_id: u32 = @intCast(stream_id_u32);
+
+            // Read the frame payload in a loop to ensure all data is read
             const payload = try self.allocator.alloc(u8, length);
-            _ = try self.reader.readAll(payload);
+            var total_read: usize = 0;
+            while (total_read < length) {
+                const bytes_read = try self.reader.read(payload[total_read..]);
+                if (bytes_read == 0) {
+                    return error.UnexpectedEOF;
+                }
+                total_read += bytes_read;
+            }
 
             return Frame{
                 .header = FrameHeader{
@@ -392,6 +430,16 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 return error.InvalidStreamId;
             }
 
+            if (frame.header.flags.value & FrameFlags.ACK != 0) {
+                if (frame.payload.len != 0) {
+                    log.err("SETTINGS frame with ACK flag and non-zero payload length\n", .{});
+                    return error.FrameSizeError;
+                }
+                // Do not apply settings when ACK flag is set
+                log.debug("Received SETTINGS ACK, no settings to apply.\n", .{});
+                return;
+            }
+
             if (frame.payload.len % 6 != 0) {
                 log.err("Invalid SETTINGS frame size: {any}\n", .{frame.payload.len});
                 return error.InvalidSettingsFrameSize;
@@ -402,20 +450,16 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             var i: usize = 0;
             while (i + 6 <= buffer_size) {
+                // Ensure we have enough bytes for the setting ID and value
+                // Read the setting ID (2 bytes)
+                const id_ptr: *const [2]u8 = @ptrCast(&buffer[i]);
+                const id = std.mem.readInt(u16, id_ptr, .big);
 
-                // Safely read the ID and Value using std.mem.readInt with endian handling
-                const id_slice: *const [2]u8 = @ptrCast(&buffer[i .. i + 2]);
-
-                const id: u16 = std.mem.readInt(u16, id_slice, .big);
-
-                const value_slice: *const [4]u8 = @ptrCast(&buffer[i + 2 .. i + 6]);
-
-                const value: u32 = std.mem.readInt(u32, value_slice, .big);
+                // Read the setting value (4 bytes)
+                const value_ptr: *const [4]u8 = @ptrCast(&buffer[i + 2]);
+                const value = std.mem.readInt(u32, value_ptr, .big);
 
                 log.debug("Setting ID: {d}, Value: {d}\n", .{ id, value });
-                log.debug("Setting ID: {d}, Value: {d}\n", .{ id, value });
-
-                // In applyFrameSettings, when applying settings
 
                 switch (id) {
                     1 => { // SETTINGS_HEADER_TABLE_SIZE
@@ -434,8 +478,22 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         if (value > 2147483647) {
                             return error.FlowControlError; // Initial window size too large
                         }
+                        const old_initial_window_size = self.settings.initial_window_size;
                         self.settings.initial_window_size = value;
-                        // TODO: Update window size for all open streams
+                        const value_i32: i32 = @intCast(value);
+                        const old_iw_i32: i32 = @intCast(old_initial_window_size);
+                        const delta: i32 = value_i32 - old_iw_i32;
+
+                        // Adjust window sizes of all open streams
+                        var it = self.streams.iterator();
+                        while (it.next()) |entry| {
+                            const stream = entry.value_ptr.*;
+                            stream.recv_window_size += delta;
+                            if (stream.recv_window_size > 2147483647 or stream.recv_window_size < 0) {
+                                // The value MUST be treated as a connection error of type FLOW_CONTROL_ERROR.
+                                return error.FlowControlError;
+                            }
+                        }
                     },
                     5 => { // SETTINGS_MAX_FRAME_SIZE
                         if (value < 16384 or value > 16777215) {
@@ -509,7 +567,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         /// Sends a GOAWAY frame with the given parameters.
-        pub fn sendGoAway(self: *@This(), last_stream_id: u31, error_code: u32, debug_data: []const u8) !void {
+        pub fn sendGoAway(self: *@This(), last_stream_id: u32, error_code: u32, debug_data: []const u8) !void {
             const payload_size = 8 + debug_data.len;
 
             // Log the goaway details before allocation attempt
@@ -567,7 +625,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
         pub fn close(self: *@This()) !void {
             // Determine the highest stream ID that was processed
-            var highest_stream_id: u31 = 0;
+            var highest_stream_id: u32 = 0;
 
             var it = self.streams.iterator();
             while (it.next()) |entry| {
@@ -596,15 +654,13 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             log.debug("Connection closed gracefully with GOAWAY frame\n", .{});
         }
 
-        pub fn getStream(self: *@This(), stream_id: u31) !*Stream {
+        pub fn getStream(self: *@This(), stream_id: u32) !*Stream {
             if (self.streams.get(stream_id)) |stream| {
                 return stream;
             } else {
-                var stream = try Stream.init(self.allocator, self, stream_id);
-                defer stream.deinit();
-
-                try self.streams.put(stream_id, &stream);
-                return &stream;
+                const stream = try Stream.init(self.allocator, self, stream_id);
+                try self.streams.put(stream_id, stream);
+                return stream;
             }
         }
 
@@ -619,7 +675,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             self.recv_window_size += delta;
         }
 
-        fn sendWindowUpdate(self: *@This(), stream_id: u31, increment: i32) !void {
+        fn sendWindowUpdate(self: *@This(), stream_id: u32, increment: i32) !void {
             var frame_header = FrameHeader{
                 .length = 4,
                 .frame_type = .WINDOW_UPDATE,
@@ -643,7 +699,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             const pay: *const [4]u8 = @ptrCast(frame.payload[0..4]);
             const increment = std.mem.readInt(u32, pay, .big);
 
-            if (increment > 0x7FFFFFFF) { // u31 max value
+            if (increment > 0x7FFFFFFF) { // u32 max value
                 return error.FlowControlError;
             }
 

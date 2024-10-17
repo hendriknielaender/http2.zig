@@ -7,6 +7,8 @@ const FrameFlags = @import("frame.zig").FrameFlags;
 const Connection = @import("connection.zig").Connection;
 const Hpack = @import("hpack.zig").Hpack;
 
+const log = std.log.scoped(.stream);
+
 pub const StreamState = enum {
     Idle,
     ReservedLocal,
@@ -19,7 +21,7 @@ pub const StreamState = enum {
 
 /// Represents an HTTP/2 Stream
 pub const Stream = struct {
-    id: u31,
+    id: u32,
     state: StreamState,
     conn: *Connection(std.io.AnyReader, std.io.AnyWriter),
     recv_window_size: i32,
@@ -30,9 +32,11 @@ pub const Stream = struct {
     send_data: std.ArrayList(u8),
     header_block_fragments: std.ArrayList(u8),
     expecting_continuation: bool,
+    request_complete: bool = false,
 
-    pub fn init(allocator: *std.mem.Allocator, conn: *Connection(std.io.AnyReader, std.io.AnyWriter), id: u31) !Stream {
-        return Stream{
+    pub fn init(allocator: *std.mem.Allocator, conn: *Connection(std.io.AnyReader, std.io.AnyWriter), id: u32) !*Stream {
+        const self = try allocator.create(Stream);
+        self.* = Stream{
             .id = id,
             .state = .Idle,
             .conn = conn,
@@ -45,31 +49,78 @@ pub const Stream = struct {
             .header_block_fragments = std.ArrayList(u8).init(allocator.*),
             .expecting_continuation = false,
         };
+        return self;
     }
 
-    pub fn deinit(self: @This()) void {
+    pub fn deinit(self: *Stream) void {
+        if (self.expecting_continuation) {
+            self.conn.expecting_continuation_stream_id = null;
+        }
         self.recv_headers.deinit();
         self.send_headers.deinit();
         self.recv_data.deinit();
         self.send_data.deinit();
         self.header_block_fragments.deinit();
+        self.conn.allocator.destroy(self);
     }
 
     /// Handles incoming frames for the stream
     pub fn handleFrame(self: *Stream, frame: Frame) !void {
-        std.debug.print("Handling frame type: {d}, stream ID: {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
+        log.debug("Handling frame type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
+
+        // Check if we're expecting a CONTINUATION frame
+        if (self.expecting_continuation and frame.header.frame_type != FrameType.CONTINUATION) {
+            // Protocol error: received a frame other than CONTINUATION while expecting CONTINUATION
+            log.err("Received frame type {s} while expecting CONTINUATION frame: PROTOCOL_ERROR\n", .{@tagName(frame.header.frame_type)});
+            try self.conn.sendGoAway(0, 0x01, "Expected CONTINUATION frame: PROTOCOL_ERROR");
+            return error.ProtocolError;
+        }
 
         switch (frame.header.frame_type) {
             FrameType.HEADERS => {
-                std.debug.print("Handling HEADERS frame\n", .{});
+                log.debug("Handling HEADERS frame\n", .{});
                 try self.handleHeadersFrame(frame);
             },
             FrameType.CONTINUATION => {
-                std.debug.print("Handling CONTINUATION frame\n", .{});
+                log.debug("Handling CONTINUATION frame\n", .{});
                 try self.handleContinuationFrame(frame);
             },
             FrameType.DATA => {
-                std.debug.print("Handling DATA frame\n", .{});
+                log.debug("Handling DATA frame\n", .{});
+                try self.handleData(frame);
+            },
+            FrameType.WINDOW_UPDATE => try self.handleWindowUpdate(frame),
+            FrameType.RST_STREAM => try self.handleRstStream(),
+            else => {
+                // Handle other frame types or ignore them as appropriate
+                log.debug("Received frame type {s} which is not handled in current state\n", .{@tagName(frame.header.frame_type)});
+            },
+        }
+
+        // After handling the frame, check if the request is complete
+        if (self.request_complete) {
+            // Process the request
+            try self.conn.processRequest(self);
+            self.state = .HalfClosedRemote; // Update the stream state
+        }
+
+        log.debug("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
+    }
+
+    pub fn handleFrame2(self: *Stream, frame: Frame) !void {
+        log.debug("Handling frame type: {d}, stream ID: {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
+
+        switch (frame.header.frame_type) {
+            FrameType.HEADERS => {
+                log.debug("Handling HEADERS frame\n", .{});
+                try self.handleHeadersFrame(frame);
+            },
+            FrameType.CONTINUATION => {
+                log.debug("Handling CONTINUATION frame\n", .{});
+                try self.handleContinuationFrame(frame);
+            },
+            FrameType.DATA => {
+                log.debug("Handling DATA frame\n", .{});
                 try self.handleData(frame);
             },
             FrameType.WINDOW_UPDATE => try self.handleWindowUpdate(frame),
@@ -77,10 +128,44 @@ pub const Stream = struct {
             else => {},
         }
 
-        std.debug.print("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
+        // After handling the frame, check if the request is complete
+        if (self.request_complete) {
+            // Process the request
+            try self.conn.processRequest(self);
+            self.state = .HalfClosedRemote; // Update the stream state
+        }
+
+        log.debug("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
     }
 
     fn handleHeadersFrame(self: *Stream, frame: Frame) !void {
+        if (self.expecting_continuation) {
+            // Protocol error: already expecting continuation on this stream
+            try self.conn.sendGoAway(0, 0x01, "Unexpected HEADERS frame while expecting CONTINUATION: PROTOCOL_ERROR");
+            return error.ProtocolError;
+        }
+
+        // Update stream state based on current state and the frame received
+        switch (self.state) {
+            .Idle => {
+                // Receiving a HEADERS frame in idle state is valid; transition to Open
+                self.state = .Open;
+            },
+            .ReservedLocal, .ReservedRemote => {
+                // Receiving a HEADERS frame in Reserved state is a protocol error
+                try self.conn.sendGoAway(0, 0x01, "HEADERS frame received in reserved state: PROTOCOL_ERROR");
+                return;
+            },
+            .Open, .HalfClosedRemote => {
+                // Valid to receive HEADERS frame; proceed without state change
+            },
+            .HalfClosedLocal, .Closed => {
+                // Invalid to receive HEADERS frame; send GOAWAY with PROTOCOL_ERROR
+                try self.conn.sendGoAway(0, 0x01, "HEADERS frame received in invalid state: PROTOCOL_ERROR");
+                return;
+            },
+        }
+
         if (self.expecting_continuation) {
             // Protocol error: already expecting continuation on this stream
             try self.conn.sendGoAway(0, 0x01, "Unexpected HEADERS frame: PROTOCOL_ERROR");
@@ -93,12 +178,20 @@ pub const Stream = struct {
             // Attempt to decode the header block
             try self.decodeHeaderBlock();
             self.header_block_fragments.clearAndFree();
+            self.conn.expecting_continuation_stream_id = null;
         } else {
             self.expecting_continuation = true;
+            self.conn.expecting_continuation_stream_id = self.id;
         }
 
         if (frame.header.flags.isEndStream()) {
-            self.state = .HalfClosedRemote;
+            if (self.state == .Open) {
+                self.state = .HalfClosedRemote;
+            } else if (self.state == .HalfClosedLocal) {
+                self.state = .Closed;
+            }
+            self.request_complete = true; // Set the flag
+            self.conn.expecting_continuation_stream_id = self.id;
         }
     }
 
@@ -116,6 +209,7 @@ pub const Stream = struct {
             try self.decodeHeaderBlock();
             self.header_block_fragments.clearAndFree();
             self.expecting_continuation = false;
+            self.conn.expecting_continuation_stream_id = null;
         }
     }
 
@@ -123,8 +217,14 @@ pub const Stream = struct {
         const header_block = self.header_block_fragments.items;
 
         var headers = std.ArrayList(Hpack.HeaderField).init(self.conn.allocator.*);
-
-        defer headers.deinit();
+        defer {
+            // Deinitialize headers and free allocated strings
+            for (headers.items) |header| {
+                self.conn.allocator.free(header.name);
+                self.conn.allocator.free(header.value);
+            }
+            headers.deinit();
+        }
 
         var cursor: usize = 0;
         while (cursor < header_block.len) {
@@ -132,29 +232,36 @@ pub const Stream = struct {
 
             var decoded_header = Hpack.decodeHeaderField(remaining_data, &self.conn.hpack_dynamic_table, self.conn.allocator) catch |err| {
                 // Decompression failed
-                std.debug.print("Header decompression failed: {}\n", .{err});
+                log.err("Header decompression failed: {}\n", .{err});
                 try self.conn.sendGoAway(0, 0x09, "Compression Error: COMPRESSION_ERROR");
                 return error.CompressionError;
             };
 
-            defer decoded_header.deinit();
+            // Copy the header name and value to new allocations
+            const header_copy = Hpack.HeaderField{
+                .name = try self.conn.allocator.dupe(u8, decoded_header.header.name),
+                .value = try self.conn.allocator.dupe(u8, decoded_header.header.value),
+            };
+            try headers.append(header_copy);
 
-            try headers.append(decoded_header.header);
+            // Now it's safe to deinitialize the decoded_header
+            decoded_header.deinit();
 
             cursor += decoded_header.bytes_consumed;
         }
 
         // Successfully decoded headers
-        std.debug.print("Successfully decoded headers:\n", .{});
+        log.debug("Successfully decoded headers:\n", .{});
         for (headers.items) |header| {
-            std.debug.print("{s}: {s}\n", .{ header.name, header.value });
+            log.debug("{s}: {s}\n", .{ header.name, header.value });
         }
 
         // You can now process the headers as needed...
+        // For example, store them in the stream's recv_headers list
     }
 
     fn handleData(self: *Stream, frame: Frame) !void {
-        if (self.state != .Open and self.state != .HalfClosedRemote) {
+        if (self.state != .Open and self.state != .HalfClosedLocal) {
             return error.InvalidStreamState;
         }
         try self.recv_data.appendSlice(frame.payload);
@@ -163,13 +270,24 @@ pub const Stream = struct {
             return error.FlowControlError;
         }
         if (frame.header.flags.isEndStream()) {
-            self.state = .HalfClosedRemote;
+            if (self.state == .Open) {
+                self.state = .HalfClosedRemote;
+            } else if (self.state == .HalfClosedLocal) {
+                self.state = .Closed;
+            }
+            self.request_complete = true;
         }
     }
 
     fn handleWindowUpdate(self: *Stream, frame: Frame) !void {
+        if (self.state == .Idle) {
+            log.err("WINDOW_UPDATE received on idle stream {d}\n", .{self.id});
+            return error.InvalidStreamState;
+        }
+
+        // Existing code to handle WINDOW_UPDATE frame
         // Ensure the payload is at least 4 bytes long
-        if (frame.payload.len < 4) {
+        if (frame.payload.len != 4) {
             return error.InvalidFrameSize;
         }
 
@@ -177,22 +295,22 @@ pub const Stream = struct {
         const pay: *const [4]u8 = @ptrCast(frame.payload[0..4]);
         const increment = std.mem.readInt(u32, pay, .big);
 
-        // Ensure the increment does not exceed the u31 limit
+        // Ensure the increment does not exceed the u32 limit
         if (increment > 0x7FFFFFFF) {
             return error.FlowControlError;
         }
 
         self.send_window_size += @intCast(increment);
-        if (self.send_window_size > 2147483647) { // u31 maximum value
+        if (self.send_window_size > 2147483647) { // u32 maximum value
             return error.FlowControlError;
         }
     }
 
     fn handleRstStream(self: *Stream) !void {
-        std.debug.print("Received RST_STREAM frame\n", .{});
+        log.debug("Received RST_STREAM frame\n", .{});
 
         if (self.state == .Idle) {
-            std.debug.print("RST_STREAM received on idle stream {d}\n", .{self.id});
+            log.err("RST_STREAM received on idle stream {d}\n", .{self.id});
             return error.IdleStreamError;
         }
 
@@ -203,7 +321,7 @@ pub const Stream = struct {
     /// Updates the send window size for the stream
     pub fn updateSendWindow(self: *Stream, increment: i32) !void {
         self.send_window_size += increment;
-        if (self.send_window_size > 2147483647) { // u31 maximum value
+        if (self.send_window_size > 2147483647) { // u32 maximum value
             return error.FlowControlError;
         }
     }
