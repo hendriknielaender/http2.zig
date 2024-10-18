@@ -238,15 +238,21 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                             }
                         },
                         .PING => {
-                            log.debug("Received PING frame, responding with PING (ACK)\n", .{});
+                            log.debug("Received PING frame\n", .{});
 
-                            // Respond with the same opaque data and ACK flag set
                             if (frame.payload.len != 8) {
                                 log.debug("Invalid PING frame size, expected 8 bytes.\n", .{});
                                 return error.InvalidPingPayloadSize;
                             }
 
-                            try self.sendPing(frame.payload, true); // Send PING response with ACK
+                            // Check if the ACK flag is not set before responding
+                            if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
+                                log.debug("Responding to PING frame with ACK\n", .{});
+                                try self.sendPing(frame.payload, true); // Send PING response with ACK
+                            } else {
+                                log.debug("Received PING frame with ACK flag set, no response sent.\n", .{});
+                                // Do not respond to PING frames that already have ACK flag set
+                            }
                         },
                         .WINDOW_UPDATE => {
                             log.debug("Received WINDOW_UPDATE frame\n", .{});
