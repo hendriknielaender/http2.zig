@@ -184,7 +184,8 @@ pub const Stream = struct {
     fn handleHeadersFrame(self: *Stream, frame: Frame) !void {
         if (self.expecting_continuation) {
             // Protocol error: already expecting continuation on this stream
-            try self.conn.send_goaway(0, 0x01, "Unexpected HEADERS frame while expecting CONTINUATION: PROTOCOL_ERROR");
+            log.err("Received HEADERS frame while expecting CONTINUATION on stream {d}: PROTOCOL_ERROR\n", .{self.id});
+            try self.conn.send_goaway(0, 0x1, "Unexpected HEADERS frame while expecting CONTINUATION: PROTOCOL_ERROR");
             return error.ProtocolError;
         }
 
@@ -196,33 +197,30 @@ pub const Stream = struct {
             },
             .ReservedLocal, .ReservedRemote => {
                 // Receiving a HEADERS frame in Reserved state is a protocol error
-                try self.conn.send_goaway(0, 0x01, "HEADERS frame received in reserved state: PROTOCOL_ERROR");
-                return;
+                log.err("HEADERS frame received in reserved state on stream {d}: PROTOCOL_ERROR\n", .{self.id});
+                try self.conn.send_goaway(0, 0x1, "HEADERS frame received in reserved state: PROTOCOL_ERROR");
+                return error.ProtocolError;
             },
             .Open, .HalfClosedRemote => {
                 // Valid to receive HEADERS frame; proceed without state change
             },
             .HalfClosedLocal, .Closed => {
                 // Invalid to receive HEADERS frame; send GOAWAY with PROTOCOL_ERROR
-                try self.conn.send_goaway(0, 0x01, "HEADERS frame received in invalid state: PROTOCOL_ERROR");
-                return;
+                log.err("HEADERS frame received in invalid state on stream {d}: PROTOCOL_ERROR\n", .{self.id});
+                try self.conn.send_goaway(0, 0x1, "HEADERS frame received in invalid state: PROTOCOL_ERROR");
+                return error.ProtocolError;
             },
         }
 
-        if (self.expecting_continuation) {
-            // Protocol error: already expecting continuation on this stream
-            try self.conn.send_goaway(0, 0x01, "Unexpected HEADERS frame: PROTOCOL_ERROR");
-            return;
-        }
-
+        // Append the header block fragment
         try self.header_block_fragments.appendSlice(frame.payload);
 
         if (frame.header.flags.isEndHeaders()) {
             // Attempt to decode the header block
             try self.decodeHeaderBlock();
             self.header_block_fragments.clearAndFree();
-            self.conn.expecting_continuation_stream_id = null;
         } else {
+            // Set expectation for CONTINUATION frames
             self.expecting_continuation = true;
             self.conn.expecting_continuation_stream_id = self.id;
         }
@@ -234,26 +232,33 @@ pub const Stream = struct {
                 self.state = .Closed;
             }
             self.request_complete = true; // Set the flag
-            self.conn.expecting_continuation_stream_id = self.id;
         }
+
+        log.debug("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
     }
 
     fn handleContinuationFrame(self: *Stream, frame: Frame) !void {
         if (!self.expecting_continuation) {
             // Protocol error: not expecting continuation on this stream
-            try self.conn.send_goaway(0, 0x01, "Unexpected CONTINUATION frame: PROTOCOL_ERROR");
-            return;
+            log.err("Received unexpected CONTINUATION frame on stream {d}: PROTOCOL_ERROR\n", .{self.id});
+            try self.conn.send_goaway(0, 0x1, "Unexpected CONTINUATION frame: PROTOCOL_ERROR");
+            return error.ProtocolError;
         }
 
+        // Append the continuation fragment
         try self.header_block_fragments.appendSlice(frame.payload);
 
         if (frame.header.flags.isEndHeaders()) {
-            // Attempt to decode the header block
+            // Attempt to decode the complete header block
             try self.decodeHeaderBlock();
             self.header_block_fragments.clearAndFree();
+
+            // Clear the continuation expectation
             self.expecting_continuation = false;
             self.conn.expecting_continuation_stream_id = null;
         }
+
+        log.debug("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
     }
 
     fn decodeHeaderBlock(self: *Stream) !void {

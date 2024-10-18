@@ -109,6 +109,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     continue;
                 }
 
+                // **Check for Ongoing Header Block on a Different Stream**
+                if (self.expecting_continuation_stream_id) |expected_stream_id| {
+                    if (frame.header.stream_id != expected_stream_id and !is_connection_level_frame(frame.header.frame_type)) {
+                        log.err("Received frame on stream {d} while expecting continuation on stream {d}: PROTOCOL_ERROR\n", .{ frame.header.stream_id, expected_stream_id });
+                        try self.send_goaway(self.last_stream_id, 0x1, "Unexpected frame while expecting CONTINUATION: PROTOCOL_ERROR");
+                        return error.ProtocolError;
+                    }
+                }
+
                 try process_pending_streams(self);
 
                 log.debug("Received frame of type: {d}, stream ID: {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
