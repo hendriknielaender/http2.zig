@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const Frame = @import("frame.zig").Frame;
 const FrameHeader = @import("frame.zig").FrameHeader;
 const FrameType = @import("frame.zig").FrameType;
+const FrameTypes = @import("frame.zig");
 const FrameFlags = @import("frame.zig").FrameFlags;
 const Connection = @import("connection.zig").Connection;
 const Hpack = @import("hpack.zig").Hpack;
@@ -66,54 +67,54 @@ pub const Stream = struct {
 
     /// Handles incoming frames for the stream
     pub fn handleFrame(self: *Stream, frame: Frame) !void {
-        log.debug("Handling frame type: {s}, stream ID: {d}\n", .{ @tagName(frame.header.frame_type), frame.header.stream_id });
+        log.debug("Handling frame type: {d}, stream ID: {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
 
         // Check if the stream is closed
         if (self.state == .Closed) {
             // Only PRIORITY frames are allowed on closed streams
-            if (frame.header.frame_type != .PRIORITY) {
-                log.err("Received frame type {s} on closed stream {d}: STREAM_CLOSED\n", .{ @tagName(frame.header.frame_type), self.id });
+            if (frame.header.frame_type != FrameTypes.FRAME_TYPE_PRIORITY) {
+                log.err("Received frame type {d} on closed stream {d}: STREAM_CLOSED\n", .{ frame.header.frame_type, self.id });
                 try self.sendRstStream(0x5); // STREAM_CLOSED
                 return error.StreamClosed;
             }
         }
         // Check if we're expecting a CONTINUATION frame
-        if (self.expecting_continuation and frame.header.frame_type != FrameType.CONTINUATION) {
+        if (self.expecting_continuation and frame.header.frame_type != FrameTypes.FRAME_TYPE_CONTINUATION) {
             // Protocol error: received a frame other than CONTINUATION while expecting CONTINUATION
-            log.err("Received frame type {s} while expecting CONTINUATION frame: PROTOCOL_ERROR\n", .{@tagName(frame.header.frame_type)});
-            try self.conn.sendGoAway(0, 0x01, "Expected CONTINUATION frame: PROTOCOL_ERROR");
+            log.err("Received frame type {d} while expecting CONTINUATION frame: PROTOCOL_ERROR\n", .{frame.header.frame_type});
+            try self.conn.send_goaway(0, 0x01, "Expected CONTINUATION frame: PROTOCOL_ERROR");
             return error.ProtocolError;
         }
 
         switch (frame.header.frame_type) {
-            FrameType.HEADERS => {
+            FrameTypes.FRAME_TYPE_HEADERS => {
                 log.debug("Handling HEADERS frame\n", .{});
                 try self.handleHeadersFrame(frame);
             },
-            FrameType.CONTINUATION => {
+            FrameTypes.FRAME_TYPE_CONTINUATION => {
                 log.debug("Handling CONTINUATION frame\n", .{});
                 try self.handleContinuationFrame(frame);
             },
-            FrameType.DATA => {
+            FrameTypes.FRAME_TYPE_DATA => {
                 log.debug("Handling DATA frame\n", .{});
                 try self.handleData(frame);
             },
-            FrameType.WINDOW_UPDATE => try self.handleWindowUpdate(frame),
-            FrameType.RST_STREAM => try self.handleRstStream(),
-            FrameType.PRIORITY => {
+            FrameTypes.FRAME_TYPE_WINDOW_UPDATE => try self.handleWindowUpdate(frame),
+            FrameTypes.FRAME_TYPE_RST_STREAM => try self.handleRstStream(),
+            FrameTypes.FRAME_TYPE_PRIORITY => {
                 log.debug("Handling PRIORITY frame\n", .{});
                 try self.handlePriorityFrame(frame);
             },
             else => {
                 // Handle other frame types or ignore them as appropriate
-                log.debug("Received frame type {s} which is not handled in current state\n", .{@tagName(frame.header.frame_type)});
+                log.debug("Received frame type {d} which is not handled in current state\n", .{frame.header.frame_type});
             },
         }
 
         // After handling the frame, check if the request is complete
         if (self.request_complete) {
             // Process the request
-            try self.conn.processRequest(self);
+            try self.conn.process_request(self);
             self.state = .HalfClosedRemote; // Update the stream state
         }
 
@@ -166,7 +167,7 @@ pub const Stream = struct {
         var frame = Frame{
             .header = FrameHeader{
                 .length = 4,
-                .frame_type = .RST_STREAM,
+                .frame_type = FrameTypes.FRAME_TYPE_RST_STREAM,
                 .flags = FrameFlags.init(0),
                 .reserved = false,
                 .stream_id = self.id,
@@ -183,7 +184,7 @@ pub const Stream = struct {
     fn handleHeadersFrame(self: *Stream, frame: Frame) !void {
         if (self.expecting_continuation) {
             // Protocol error: already expecting continuation on this stream
-            try self.conn.sendGoAway(0, 0x01, "Unexpected HEADERS frame while expecting CONTINUATION: PROTOCOL_ERROR");
+            try self.conn.send_goaway(0, 0x01, "Unexpected HEADERS frame while expecting CONTINUATION: PROTOCOL_ERROR");
             return error.ProtocolError;
         }
 
@@ -195,7 +196,7 @@ pub const Stream = struct {
             },
             .ReservedLocal, .ReservedRemote => {
                 // Receiving a HEADERS frame in Reserved state is a protocol error
-                try self.conn.sendGoAway(0, 0x01, "HEADERS frame received in reserved state: PROTOCOL_ERROR");
+                try self.conn.send_goaway(0, 0x01, "HEADERS frame received in reserved state: PROTOCOL_ERROR");
                 return;
             },
             .Open, .HalfClosedRemote => {
@@ -203,14 +204,14 @@ pub const Stream = struct {
             },
             .HalfClosedLocal, .Closed => {
                 // Invalid to receive HEADERS frame; send GOAWAY with PROTOCOL_ERROR
-                try self.conn.sendGoAway(0, 0x01, "HEADERS frame received in invalid state: PROTOCOL_ERROR");
+                try self.conn.send_goaway(0, 0x01, "HEADERS frame received in invalid state: PROTOCOL_ERROR");
                 return;
             },
         }
 
         if (self.expecting_continuation) {
             // Protocol error: already expecting continuation on this stream
-            try self.conn.sendGoAway(0, 0x01, "Unexpected HEADERS frame: PROTOCOL_ERROR");
+            try self.conn.send_goaway(0, 0x01, "Unexpected HEADERS frame: PROTOCOL_ERROR");
             return;
         }
 
@@ -240,7 +241,7 @@ pub const Stream = struct {
     fn handleContinuationFrame(self: *Stream, frame: Frame) !void {
         if (!self.expecting_continuation) {
             // Protocol error: not expecting continuation on this stream
-            try self.conn.sendGoAway(0, 0x01, "Unexpected CONTINUATION frame: PROTOCOL_ERROR");
+            try self.conn.send_goaway(0, 0x01, "Unexpected CONTINUATION frame: PROTOCOL_ERROR");
             return;
         }
 
@@ -275,7 +276,7 @@ pub const Stream = struct {
             var decoded_header = Hpack.decodeHeaderField(remaining_data, &self.conn.hpack_dynamic_table, self.conn.allocator) catch |err| {
                 // Decompression failed
                 log.err("Header decompression failed: {}\n", .{err});
-                try self.conn.sendGoAway(0, 0x09, "Compression Error: COMPRESSION_ERROR");
+                try self.conn.send_goaway(0, 0x09, "Compression Error: COMPRESSION_ERROR");
                 return error.CompressionError;
             };
 
@@ -407,7 +408,7 @@ pub const Stream = struct {
         var frame = Frame{
             .header = FrameHeader{
                 .length = @intCast(data.len),
-                .frame_type = .DATA,
+                .frame_type = FrameTypes.FRAME_TYPE_DATA,
                 .flags = frame_flags,
                 .reserved = false,
                 .stream_id = self.id,
@@ -424,7 +425,7 @@ pub const Stream = struct {
         const frame = Frame{
             .header = FrameHeader{
                 .length = 0,
-                .frame_type = .RST_STREAM,
+                .frame_type = FrameTypes.FRAME_TYPE_RST_STREAM,
                 .flags = .{},
                 .stream_id = self.id,
             },
@@ -455,7 +456,7 @@ test "create and handle stream" {
     const headers_frame = Frame{
         .header = FrameHeader{
             .length = @intCast(4),
-            .frame_type = .HEADERS,
+            .frame_type = FrameTypes.FRAME_TYPE_HEADERS,
             .flags = FrameFlags.init(end_headers_flag),
             .reserved = false,
             .stream_id = 1,

@@ -3,19 +3,19 @@ const assert = std.debug.assert;
 
 const log = std.log.scoped(.frame);
 
-/// Represents the type of an HTTP/2 frame
-pub const FrameType = enum(u8) {
-    DATA = 0,
-    HEADERS = 1,
-    PRIORITY = 2,
-    RST_STREAM = 3,
-    SETTINGS = 4,
-    PUSH_PROMISE = 5,
-    PING = 6,
-    GOAWAY = 7,
-    WINDOW_UPDATE = 8,
-    CONTINUATION = 9,
-};
+pub const FrameType = u8;
+
+// Define constants for known frame types
+pub const FRAME_TYPE_DATA = 0x0;
+pub const FRAME_TYPE_HEADERS = 0x1;
+pub const FRAME_TYPE_PRIORITY = 0x2;
+pub const FRAME_TYPE_RST_STREAM = 0x3;
+pub const FRAME_TYPE_SETTINGS = 0x4;
+pub const FRAME_TYPE_PUSH_PROMISE = 0x5;
+pub const FRAME_TYPE_PING = 0x6;
+pub const FRAME_TYPE_GOAWAY = 0x7;
+pub const FRAME_TYPE_WINDOW_UPDATE = 0x8;
+pub const FRAME_TYPE_CONTINUATION = 0x9;
 
 /// Represents the flags of an HTTP/2 frame
 pub const FrameFlags = struct {
@@ -88,15 +88,7 @@ pub const FrameHeader = struct {
             return error.InvalidFrameLength;
         }
 
-        const frame_type_value: u8 = buffer[3];
-        var frame_type: FrameType = undefined;
-        const frame_type_result: FrameType = @enumFromInt(frame_type_value);
-        if (frame_type_result) |ft| {
-            frame_type = ft;
-        } else {
-            // Handle unknown frame types by assigning a special value
-            frame_type = FrameType(0xFF); // Assign an invalid value that's not used
-        }
+        const frame_type: u8 = buffer[3];
 
         const flags = FrameFlags.init(buffer[4]);
 
@@ -164,7 +156,7 @@ pub const FrameHeader = struct {
         buffer[1] = @intCast((self.length >> 8) & 0xFF);
         buffer[2] = @intCast(self.length & 0xFF);
 
-        buffer[3] = @intFromEnum(self.frame_type);
+        buffer[3] = self.frame_type;
         buffer[4] = self.flags.value;
 
         // Combine the reserved bit and stream ID
@@ -251,7 +243,7 @@ test "frame header read and write" {
 
     var header = FrameHeader{
         .length = 16,
-        .frame_type = .SETTINGS,
+        .frame_type = FRAME_TYPE_SETTINGS,
         .flags = FrameFlags.init(0),
         .reserved = false,
         .stream_id = 0,
@@ -297,7 +289,7 @@ test "frame read and write" {
     // Create the frame with the payload
     var frame = Frame.init(FrameHeader{
         .length = 16,
-        .frame_type = .SETTINGS,
+        .frame_type = FRAME_TYPE_SETTINGS,
         .flags = FrameFlags.init(0),
         .reserved = false,
         .stream_id = 0,
