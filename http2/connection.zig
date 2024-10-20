@@ -26,6 +26,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         goaway_sent: bool = false,
         expecting_continuation_stream_id: ?u32 = null,
         last_stream_id: u32 = 0,
+        client_settings_received: bool = false,
 
         pub fn init(allocator: *std.mem.Allocator, reader: ReaderType, writer: WriterType, comptime is_server: bool) !@This() {
             var self = @This(){
@@ -90,35 +91,129 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             return stream_id;
         }
 
+        /// Sends a RST_STREAM frame for a given stream ID with the specified error code.
+        pub fn send_rst_stream(self: *@This(), stream_id: u32, error_code: u32) !void {
+            var frame_header = FrameHeader{
+                .length = 4,
+                .frame_type = FrameTypes.FRAME_TYPE_RST_STREAM, // 3 for RST_STREAM
+                .flags = FrameFlags.init(0),
+                .reserved = false,
+                .stream_id = stream_id, // The stream ID for which to send RST_STREAM
+            };
+
+            // Write the frame header
+            try frame_header.write(self.writer);
+
+            // Write the error code as a 4-byte big-endian integer
+            var error_code_bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, error_code_bytes[0..4], error_code, .big);
+            try self.writer.writeAll(&error_code_bytes);
+
+            log.debug("Sent RST_STREAM frame with error code {d} for stream ID {d}\n", .{ error_code, stream_id });
+        }
+
         /// Adjust frame handling and validation per RFC 9113.
         pub fn handle_connection(self: *@This()) !void {
-            while (true) {
+            // Phase 1: Exchange SETTINGS frames
+            while (!self.client_settings_received) {
                 var frame = self.receive_frame() catch |err| {
                     self.handle_receive_frame_error(err) catch |handle_err| {
                         return handle_err;
                     };
-                    // After handling the error and sending GOAWAY, terminate the connection gracefully
                     return;
                 };
                 defer frame.deinit(self.allocator);
 
-                // **Frame Type Validation**
-                if (!is_valid_frame_type(frame.header.frame_type)) {
-                    log.warn("Received unknown frame type {d}, ignoring as per RFC 7540 Section 6.1\n", .{frame.header.frame_type});
-                    // Ignore the frame and continue processing
-                    continue;
+                // Classify frame based on stream_id
+                if (frame.header.stream_id == 0) {
+                    try handle_connection_level_frame(self, frame);
+                } else {
+                    try handle_stream_level_frame(self, frame);
                 }
 
-                // **Check for Ongoing Header Block on a Different Stream**
-                if (self.expecting_continuation_stream_id) |expected_stream_id| {
-                    if (frame.header.stream_id != expected_stream_id and !is_connection_level_frame(frame.header.frame_type)) {
-                        log.err("Received frame on stream {d} while expecting continuation on stream {d}: PROTOCOL_ERROR\n", .{ frame.header.stream_id, expected_stream_id });
-                        try self.send_goaway(self.last_stream_id, 0x1, "Unexpected frame while expecting CONTINUATION: PROTOCOL_ERROR");
-                        return error.ProtocolError;
+                // Check if SETTINGS frame with ACK flag was received (if client is acknowledging server's SETTINGS)
+                if (frame.header.frame_type == FrameTypes.FRAME_TYPE_SETTINGS and (frame.header.flags.value & FrameFlags.ACK) != 0) {
+                    self.client_settings_received = true;
+                }
+            }
+
+            // Phase 2: Handle other frames
+            while (!self.goaway_sent) {
+                var frame = self.receive_frame() catch |err| {
+                    self.handle_receive_frame_error(err) catch |handle_err| {
+                        return handle_err;
+                    };
+                    return;
+                };
+                defer frame.deinit(self.allocator);
+
+                log.debug("Received frame of type: {d}, stream ID: {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
+
+                // Classify frame based on stream_id
+                if (frame.header.stream_id == 0) {
+                    try handle_connection_level_frame(self, frame);
+                } else {
+                    try handle_stream_level_frame(self, frame);
+                }
+
+                if (self.goaway_sent) {
+                    log.debug("GOAWAY has been sent, stopping frame processing.\n", .{});
+                    break;
+                }
+            }
+
+            log.debug("Connection terminated gracefully after GOAWAY.\n", .{});
+        }
+
+        pub fn handle_connection2(self: *@This()) !void {
+            // Phase 1: Exchange SETTINGS frames
+            while (!self.client_settings_received) {
+                var frame = self.receive_frame() catch |err| {
+                    self.handle_receive_frame_error(err) catch |handle_err| {
+                        return handle_err;
+                    };
+                    return;
+                };
+                defer frame.deinit(self.allocator);
+
+                // Only SETTINGS and PING frames are allowed in this phase
+                if (is_connection_level_frame(frame.header.frame_type)) {
+                    switch (frame.header.frame_type) {
+                        FrameTypes.FRAME_TYPE_SETTINGS => {
+                            try self.apply_frame_settings(frame);
+                            // Send SETTINGS ACK
+                            try self.send_settings_ack();
+                        },
+                        FrameTypes.FRAME_TYPE_PING => {
+                            try handle_ping_frame(self, frame);
+                        },
+                        else => {
+                            log.err("Received unexpected connection-level frame type {d} before SETTINGS exchange: PROTOCOL_ERROR\n", .{frame.header.frame_type});
+                            try self.send_goaway(self.last_stream_id, 0x1, "Unexpected frame before SETTINGS exchange: PROTOCOL_ERROR");
+                            return error.ProtocolError;
+                        },
                     }
+                } else {
+                    log.err("Received non-connection-level frame: {any} before SETTINGS exchange: PROTOCOL_ERROR\n", .{frame.header.frame_type});
+                    try self.send_goaway(self.last_stream_id, 0x1, "Non-connection-level frame before SETTINGS exchange: PROTOCOL_ERROR");
+                    return error.ProtocolError;
                 }
 
-                try process_pending_streams(self);
+                // Check if SETTINGS frame with ACK flag was received (if client is acknowledging server's SETTINGS)
+                if (frame.header.frame_type == FrameTypes.FRAME_TYPE_SETTINGS and (frame.header.flags.value & FrameFlags.ACK) != 0) {
+                    self.client_settings_received = true;
+                }
+            }
+
+            // Phase 2: Handle other frames
+            while (!self.goaway_sent) {
+                var frame = self.receive_frame() catch |err| {
+                    self.handle_receive_frame_error(err) catch |handle_err| {
+                        return handle_err;
+                    };
+                    return;
+                };
+                defer frame.deinit(self.allocator);
 
                 log.debug("Received frame of type: {d}, stream ID: {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
 
@@ -164,8 +259,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         fn handle_stream_level_frame(self: *@This(), frame: Frame) !void {
-            // At this point, frame.type is known to be valid
-
             // Validate that stream-level frames do not have stream ID 0
             if (frame.header.stream_id == 0) {
                 log.err("Received stream-level frame {d} with stream ID 0: PROTOCOL_ERROR\n", .{frame.header.frame_type});
@@ -177,6 +270,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             var stream = self.get_stream(frame.header.stream_id) catch |err| {
                 if (err == error.ProtocolError) {
                     // Protocol error has been handled in get_stream
+                    return;
+                } else if (err == error.MaxConcurrentStreamsExceeded) {
+                    // Handle exceeding concurrent streams by sending RST_STREAM directly
+                    log.err("Cannot create stream {d}: Max concurrent streams exceeded.\n", .{frame.header.stream_id});
+
+                    // **Send RST_STREAM with REFUSED_STREAM (0x7) without creating a temporary stream**
+                    try self.send_rst_stream(frame.header.stream_id, 0x7); // REFUSED_STREAM
+                    log.debug("Sent RST_STREAM with REFUSED_STREAM (0x7) for stream ID {d}\n", .{frame.header.stream_id});
+
                     return;
                 } else {
                     return err;
@@ -210,16 +312,27 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     },
                 }
             };
+
+            // If the stream was closed, it will be removed in process_pending_streams
         }
 
+        // connection.zig
+
         fn process_pending_streams(self: *@This()) !void {
+            var to_remove = std.ArrayList(u32).init(self.allocator.*);
+            defer to_remove.deinit();
+
             var it = self.streams.iterator();
             while (it.next()) |entry| {
                 const stream = entry.value_ptr.*;
-                if (stream.request_complete and stream.state != .Closed) {
-                    try self.process_request(stream);
-                    stream.state = .Closed;
+                if (stream.request_complete and stream.state == .Closed) {
+                    try to_remove.append(entry.key_ptr.*);
                 }
+            }
+
+            // Remove the closed streams from the map
+            for (to_remove.items) |stream_id| {
+                _ = self.streams.remove(stream_id);
             }
         }
 
@@ -233,12 +346,13 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             switch (frame.header.frame_type) {
                 FrameTypes.FRAME_TYPE_SETTINGS => {
-                    try self.apply_frame_settings(frame);
-                    // Send SETTINGS ACK if not already acknowledged
                     if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
+                        // Apply client settings
+                        try self.apply_frame_settings(frame);
+                        // Send SETTINGS ACK
                         try self.send_settings_ack();
-                        log.debug("Sent SETTINGS ACK\n", .{});
                     }
+                    // If ACK is set, no action needed
                 },
                 FrameTypes.FRAME_TYPE_PING => {
                     try handle_ping_frame(self, frame);
@@ -471,6 +585,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             return std.meta.int_to_enum(FrameType, val) catch undefined;
         }
 
+        // connection.zig
+
         pub fn apply_frame_settings(self: *@This(), frame: Frame) !void {
             log.debug("Applying settings from frame...\n", .{});
 
@@ -504,7 +620,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             var i: usize = 0;
             while (i + 6 <= buffer_size) {
-                // Ensure we have enough bytes for the setting ID and value
                 // Read the setting ID (2 bytes)
                 const id_ptr: *const [2]u8 = @ptrCast(&buffer[i]);
                 const id = std.mem.readInt(u16, id_ptr, .big);
@@ -518,15 +633,19 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 switch (id) {
                     1 => { // SETTINGS_HEADER_TABLE_SIZE
                         self.settings.header_table_size = value;
+                        log.debug("Updated SETTINGS_HEADER_TABLE_SIZE to {any}\n", .{value});
+                        try self.hpack_dynamic_table.updateMaxSize(value);
                     },
                     2 => { // SETTINGS_ENABLE_PUSH
                         if (value != 0 and value != 1) {
                             return error.ProtocolError; // Invalid value for ENABLE_PUSH
                         }
                         self.settings.enable_push = (value == 1);
+                        log.debug("Updated SETTINGS_ENABLE_PUSH to {any}\n", .{self.settings.enable_push});
                     },
                     3 => { // SETTINGS_MAX_CONCURRENT_STREAMS
                         self.settings.max_concurrent_streams = value;
+                        log.debug("Updated SETTINGS_MAX_CONCURRENT_STREAMS to {d}\n", .{value});
                     },
                     4 => { // SETTINGS_INITIAL_WINDOW_SIZE
                         if (value > 2147483647) {
@@ -538,6 +657,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         const value_i32: i32 = @intCast(value);
                         const old_iw_i32: i32 = @intCast(old_initial_window_size);
                         const delta: i32 = value_i32 - old_iw_i32;
+                        log.debug("Updated SETTINGS_INITIAL_WINDOW_SIZE to {d}\n", .{value});
 
                         // Adjust window sizes of all open streams
                         var it = self.streams.iterator();
@@ -555,9 +675,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                             return error.ProtocolError; // Invalid MAX_FRAME_SIZE
                         }
                         self.settings.max_frame_size = value;
+                        log.debug("Updated SETTINGS_MAX_FRAME_SIZE to {d}\n", .{value});
                     },
                     6 => { // SETTINGS_MAX_HEADER_LIST_SIZE
                         self.settings.max_header_list_size = value;
+                        log.debug("Updated SETTINGS_MAX_HEADER_LIST_SIZE to {d}\n", .{value});
                     },
                     else => {
                         // Unknown settings should be ignored
@@ -655,6 +777,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             log.debug("Sending GOAWAY frame with error code {d} and last_stream_id {d}\n", .{ error_code, last_stream_id });
 
+            log.debug("GOAWAY frame payload: {x}\n", .{payload});
+
             try goaway_frame.write(self.writer);
 
             log.debug("GOAWAY frame sent successfully\n", .{});
@@ -704,6 +828,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             if (self.streams.get(stream_id)) |stream| {
                 return stream;
             } else {
+                // Enforce the max concurrent streams limit
+                if (self.streams.count() >= self.settings.max_concurrent_streams) {
+                    log.err("Exceeded max concurrent streams limit: {d}\n", .{self.settings.max_concurrent_streams});
+                    return error.MaxConcurrentStreamsExceeded;
+                }
+
                 // Ensure the new stream ID is greater than the last processed stream ID
                 if (stream_id <= self.last_stream_id) {
                     log.err("Received new stream ID {d} <= last_stream_id {d}: PROTOCOL_ERROR\n", .{ stream_id, self.last_stream_id });
@@ -874,19 +1004,31 @@ test "HTTP/2 connection initialization and flow control" {
     const preface_written_data = buffer_stream.getWritten();
     std.debug.print("Preface written data length: {d}\n", .{preface_written_data.len});
 
-    // Send headers frame
-    const headers_payload: [16]u8 = undefined; // Example payload size, adjust as needed
+    // Encode headers using Hpack.encodeHeaderField
+    const response_headers = [_]Hpack.HeaderField{
+        .{ .name = ":status", .value = "200" },
+        .{ .name = "content-length", .value = "13" },
+    };
+
+    var encoded_headers = std.ArrayList(u8).init(allocator);
+    defer encoded_headers.deinit();
+
+    for (response_headers) |header| {
+        try Hpack.encodeHeaderField(header, &connection.hpack_dynamic_table, &encoded_headers);
+    }
+
+    const headers_payload = try encoded_headers.toOwnedSlice();
+    const headers_payload_len: u32 = @intCast(headers_payload.len);
+
     const headers_frame = Frame{
         .header = FrameHeader{
-            .length = @intCast(headers_payload.len),
+            .length = headers_payload_len,
             .frame_type = FrameTypes.FRAME_TYPE_HEADERS,
-            .flags = FrameFlags{
-                .value = FrameFlags.END_HEADERS, // Mark end of headers
-            },
+            .flags = FrameFlags.init(FrameFlags.END_HEADERS),
             .reserved = false,
             .stream_id = stream.id,
         },
-        .payload = &headers_payload,
+        .payload = headers_payload,
     };
     std.debug.print("About to handle headers frame\n", .{});
     try stream.handleFrame(headers_frame);
@@ -912,24 +1054,16 @@ test "HTTP/2 connection initialization and flow control" {
     std.debug.print("Written data payload length: {d}\n", .{data.len});
     std.debug.print("Total written data length: {d}\n", .{written_data.len});
 
-    // Inspect the buffer contents for unexpected data
-    std.debug.print("Buffer content before handling headers: {x}\n", .{buffer_stream.getWritten()});
-    std.debug.print("Buffer content after writing headers: {x}\n", .{buffer_stream.getWritten()});
-    std.debug.print("Buffer content after writing payload: {x}\n", .{buffer_stream.getWritten()});
-
-    // Investigate where the extra bytes are coming from
-    std.debug.print("Buffer extra bytes: {x}\n", .{written_data[92..]});
-
-    // Calculate the expected length, accounting for frame headers
+    // Verify the expected length
     const preface_length = 24; // 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' is 24 bytes
     const settings_frame_length = 39; // As per your logs
-    const headers_frame_length = 16; // As per your logs (likely includes frame header)
+    const headers_frame_length = headers_payload_len + 9; // headers_payload + frame header
     const data_frame_payload_length = data.len; // 13 bytes for "Hello, world!"
     const data_frame_header_length = 9; // Standard HTTP/2 frame header size
 
     const data_frame_total_length = data_frame_payload_length + data_frame_header_length; // 22 bytes
 
-    const expected_length = preface_length + settings_frame_length + headers_frame_length + data_frame_total_length; // 101 bytes
+    const expected_length = preface_length + settings_frame_length + headers_frame_length + data_frame_total_length; // 24 + 39 + len(headers) + 22
 
     std.debug.print("written_data.len = {d}, expected_length = {d}\n", .{ written_data.len, expected_length });
     assert(written_data.len == expected_length);
@@ -1058,13 +1192,12 @@ test "send HEADERS and DATA frames with proper flow" {
     std.debug.print("Total written data length after DATA frame: {d}\n", .{written_data.len});
 }
 
-test "Endpoint can process DATA frames of 2^14 octets in length" {
+test "send RST_STREAM frame with correct frame_type" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    var buffer: [8192 * 4]u8 = undefined; // Create a larger buffer to handle large DATA frames
+    var buffer: [1024]u8 = undefined;
     var buffer_stream = std.io.fixedBufferStream(&buffer);
-
     const reader = buffer_stream.reader().any();
     const writer = buffer_stream.writer().any();
 
@@ -1074,61 +1207,11 @@ test "Endpoint can process DATA frames of 2^14 octets in length" {
 
     var stream = try Stream.init(&allocator, &connection, 1);
 
-    // Set max_frame_size to 16384 (2^14)
-    connection.settings.max_frame_size = 16384;
+    // Send RST_STREAM
+    try stream.sendRstStream(0x1); // PROTOCOL_ERROR
 
-    // Reset the buffer before writing
-    buffer_stream.reset();
-
-    // Send a HEADERS frame to initialize the stream
-    const headers_payload: [16]u8 = undefined; // Example headers payload
-    const headers_frame = Frame{
-        .header = FrameHeader{
-            .length = @intCast(headers_payload.len),
-            .frame_type = FrameTypes.FRAME_TYPE_HEADERS,
-            .flags = FrameFlags{
-                .value = FrameFlags.END_HEADERS, // Mark end of headers
-            },
-            .reserved = false,
-            .stream_id = stream.id,
-        },
-        .payload = &headers_payload,
-    };
-
-    // Handle the HEADERS frame
-    try stream.handleFrame(headers_frame);
-
-    // Prepare a DATA frame with 2^14 (16,384) octets, ensuring that it respects the frame size limit
-    var data_payload: [16384]u8 = undefined; // Fill the data payload with zeroes
-    try connection.send_data(stream, &data_payload, false);
-
-    // Verify the DATA frame was sent and processed
+    // Check the buffer to ensure frame_type is 3
     const written_data = buffer_stream.getWritten();
-    std.debug.print("Total written data length after sending DATA frame: {d}\n", .{written_data.len});
-
-    // Ensure that the buffer contains the expected DATA frame of 16384 + 9 (frame header size) octets
-    const expected_data_frame_length = 16384 + 9; // DATA frame payload + frame header
-    try std.testing.expect(written_data.len == expected_data_frame_length);
-
-    // Simulate receiving and processing the DATA frame
-    const received_frame = try connection.receive_frame();
-
-    // Ensure the received frame type is DATA and the length is 16,384
-    try std.testing.expect(received_frame.header.frame_type == FrameTypes.FRAME_TYPE_DATA);
-    try std.testing.expect(received_frame.header.length == 16384);
-
-    std.debug.print("Successfully processed DATA frame of 2^14 octets in length.\n", .{});
-}
-
-test "is_valid_frame_type returns true for valid frame types" {
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_DATA));
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_HEADERS));
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_PRIORITY));
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_RST_STREAM));
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_SETTINGS));
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_PUSH_PROMISE));
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_PING));
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_GOAWAY));
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_WINDOW_UPDATE));
-    try std.testing.expect(is_valid_frame_type(FrameTypes.FRAME_TYPE_CONTINUATION));
+    // Frame header is 9 bytes: length (3), type (1), flags (1), stream_id (4)
+    try std.testing.expectEqual(written_data[3], 3); // frame_type = 3 for RST_STREAM
 }

@@ -156,29 +156,24 @@ pub const Stream = struct {
         );
     }
 
-    fn sendRstStream(self: *Stream, error_code: u32) !void {
-        var buffer: [4]u8 = undefined;
-
-        buffer[0] = @intCast((error_code >> 24) & 0xFF);
-        buffer[1] = @intCast((error_code >> 16) & 0xFF);
-        buffer[2] = @intCast((error_code >> 8) & 0xFF);
-        buffer[3] = @intCast(error_code & 0xFF);
-
-        var frame = Frame{
-            .header = FrameHeader{
-                .length = 4,
-                .frame_type = FrameTypes.FRAME_TYPE_RST_STREAM,
-                .flags = FrameFlags.init(0),
-                .reserved = false,
-                .stream_id = self.id,
-            },
-            .payload = &buffer,
+    pub fn sendRstStream(self: *@This(), error_code: u32) !void {
+        var frame_header = FrameHeader{
+            .length = 4,
+            .frame_type = FrameTypes.FRAME_TYPE_RST_STREAM, // 3 for RST_STREAM
+            .flags = FrameFlags.init(0),
+            .reserved = false,
+            .stream_id = self.id, // Ensure correct stream ID
         };
-        try frame.write(self.conn.writer);
-        log.debug(
-            "Sent RST_STREAM frame for stream {d} with error code {d}\n",
-            .{ self.id, error_code },
-        );
+
+        // Write the frame header
+        try frame_header.write(self.conn.writer);
+
+        // Write the error code as a 4-byte big-endian integer
+        var error_code_bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, error_code_bytes[0..4], error_code, .big);
+        try self.conn.writer.writeAll(&error_code_bytes);
+
+        log.debug("Sent RST_STREAM frame with error code {d} for stream ID {d}\n", .{ error_code, self.id });
     }
 
     fn handleHeadersFrame(self: *Stream, frame: Frame) !void {

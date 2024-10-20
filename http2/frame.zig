@@ -66,6 +66,14 @@ pub const FrameFlags = struct {
     pub fn isPriority(self: FrameFlags) bool {
         return self.has(FrameFlags.PRIORITY);
     }
+
+    pub fn setAck(self: *FrameFlags) void {
+        self.value |= FrameFlags.ACK;
+    }
+
+    pub fn isAck(self: FrameFlags) bool {
+        return self.has(FrameFlags.ACK);
+    }
 };
 
 /// Represents an HTTP/2 frame header
@@ -230,6 +238,7 @@ pub const Frame = struct {
         if (self.header.flags.isPadded()) {
             const padding_length = self.padding_length orelse unreachable;
             var padding: [255]u8 = undefined; // Max padding length per frame is 255
+            for (&padding) |*byte| byte.* = 0; // Initialize padding with zeros
             try writer.writeAll(padding[0..padding_length]);
         }
     }
