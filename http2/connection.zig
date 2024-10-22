@@ -296,8 +296,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         return;
                     },
                     error.StreamClosed => {
-                        try self.send_goaway(self.last_stream_id, 0x5, "Frame received on closed stream: STREAM_CLOSED");
-                        return error.StreamClosed;
+                        log.debug("Stream {d}: Detected StreamClosed error, sending RST_STREAM with STREAM_CLOSED (0x5)\n", .{frame.header.stream_id});
+                        try self.send_rst_stream(frame.header.stream_id, 0x5); // STREAM_CLOSED
+                        return;
                     },
                     error.ProtocolError => {
                         try self.send_goaway(self.last_stream_id, 0x1, "Protocol error: PROTOCOL_ERROR");
@@ -434,7 +435,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             log.debug("Sent PING frame (flags: {d}, opaque_data: {any})\n", .{ frame_header.flags.value, opaque_data });
         }
 
-        // connection.zig
         pub fn process_request(self: *@This(), stream: *Stream) !void {
             log.debug("Processing request for stream ID: {d}\n", .{stream.id});
 

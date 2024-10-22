@@ -78,6 +78,19 @@ pub const Stream = struct {
                 return error.StreamClosed;
             }
         }
+
+        // **Add this block to handle HalfClosedRemote state**
+        if (self.state == .HalfClosedRemote) {
+            if (frame.header.frame_type != FrameTypes.FRAME_TYPE_WINDOW_UPDATE and
+                frame.header.frame_type != FrameTypes.FRAME_TYPE_PRIORITY and
+                frame.header.frame_type != FrameTypes.FRAME_TYPE_RST_STREAM)
+            {
+                log.err("Received frame type {d} on half-closed (remote) stream {d}: STREAM_CLOSED\n", .{ frame.header.frame_type, self.id });
+                try self.sendRstStream(0x5); // STREAM_CLOSED
+                return error.StreamClosed;
+            }
+        }
+
         // Check if we're expecting a CONTINUATION frame
         if (self.expecting_continuation and frame.header.frame_type != FrameTypes.FRAME_TYPE_CONTINUATION) {
             // Protocol error: received a frame other than CONTINUATION while expecting CONTINUATION
@@ -89,6 +102,10 @@ pub const Stream = struct {
         switch (frame.header.frame_type) {
             FrameTypes.FRAME_TYPE_HEADERS => {
                 log.debug("Handling HEADERS frame\n", .{});
+                if (frame.header.flags.value & FrameFlags.END_STREAM != 0) {
+                    self.state = StreamState.HalfClosedRemote;
+                    log.debug("Stream {d}: Transitioned to HalfClosedRemote\n", .{self.id});
+                }
                 try self.handleHeadersFrame(frame);
             },
             FrameTypes.FRAME_TYPE_CONTINUATION => {
