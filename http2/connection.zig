@@ -263,6 +263,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
                 // Handle specific errors accordingly
                 switch (err) {
+                    error.FrameSizeError => {
+                        log.err("Frame size error on stream {d}: FRAME_SIZE_ERROR\n", .{frame.header.stream_id});
+                        try self.send_goaway(self.last_stream_id, 0x6, "Frame size error: FRAME_SIZE_ERROR");
+                        return;
+                    },
                     error.CompressionError => {
                         try self.send_goaway(0, 0x9, "Compression error: COMPRESSION_ERROR");
                         return;
