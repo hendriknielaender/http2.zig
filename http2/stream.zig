@@ -232,6 +232,10 @@ pub const Stream = struct {
             // Attempt to decode the header block
             try self.decodeHeaderBlock();
             self.header_block_fragments.clearAndFree();
+
+            // Clear the continuation expectation
+            self.expecting_continuation = false;
+            self.conn.expecting_continuation_stream_id = null;
         } else {
             // Set expectation for CONTINUATION frames
             self.expecting_continuation = true;

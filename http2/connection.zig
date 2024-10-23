@@ -147,6 +147,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 };
                 defer frame.deinit(self.allocator);
 
+                if (self.expecting_continuation_stream_id) |stream_id| {
+                    if (frame.header.stream_id != stream_id or frame.header.frame_type != FrameTypes.FRAME_TYPE_CONTINUATION) {
+                        // Received a frame other than CONTINUATION while expecting CONTINUATION
+                        log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR\n", .{ frame.header.frame_type, frame.header.stream_id, stream_id });
+                        try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
+                        return error.ProtocolError;
+                    }
+                }
+
                 if (!is_valid_frame_type(frame.header.frame_type)) {
                     // Unknown frame type, ignore it as per RFC 7540 Section 5.5
                     log.debug("Ignoring unknown frame type {d}\n", .{frame.header.frame_type});
@@ -335,10 +344,22 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 }
             };
 
+            // If the frame is a HEADERS or PUSH_PROMISE frame without END_HEADERS, set expecting_continuation_stream_id
+            if (frame.header.frame_type == FrameTypes.FRAME_TYPE_HEADERS or frame.header.frame_type == FrameTypes.FRAME_TYPE_PUSH_PROMISE) {
+                if ((frame.header.flags.value & FrameFlags.END_HEADERS) == 0) {
+                    self.expecting_continuation_stream_id = frame.header.stream_id;
+                }
+            }
+
+            // If the frame is a CONTINUATION frame with END_HEADERS, clear expecting_continuation_stream_id
+            if (frame.header.frame_type == FrameTypes.FRAME_TYPE_CONTINUATION) {
+                if ((frame.header.flags.value & FrameFlags.END_HEADERS) != 0) {
+                    self.expecting_continuation_stream_id = null;
+                }
+            }
+
             // If the stream was closed, it will be removed in process_pending_streams
         }
-
-        // connection.zig
 
         fn process_pending_streams(self: *@This()) !void {
             var to_remove = std.ArrayList(u32).init(self.allocator.*);
