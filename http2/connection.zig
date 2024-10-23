@@ -112,6 +112,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             log.debug("Sent RST_STREAM frame with error code {d} for stream ID {d}\n", .{ error_code, stream_id });
         }
 
+        fn error_code_from_error(err: anyerror) u32 {
+            return switch (err) {
+                error.FrameSizeError => 0x6, // FRAME_SIZE_ERROR
+                error.ProtocolError => 0x1, // PROTOCOL_ERROR
+                // Map other errors as needed...
+                else => 0x1, // Default to PROTOCOL_ERROR
+            };
+        }
+
         /// Adjust frame handling and validation per RFC 9113.
         pub fn handle_connection(self: *@This()) !void {
             // Phase 1: Exchange SETTINGS frames
@@ -167,76 +176,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 const is_conn_level = is_connection_level_frame(frame.header.frame_type);
 
                 if (is_conn_level) {
-                    try handle_connection_level_frame(self, frame);
-                } else {
-                    try handle_stream_level_frame(self, frame);
-                }
-
-                if (self.goaway_sent) {
-                    log.debug("GOAWAY has been sent, stopping frame processing.\n", .{});
-                    break;
-                }
-            }
-
-            log.debug("Connection terminated gracefully after GOAWAY.\n", .{});
-        }
-
-        pub fn handle_connection2(self: *@This()) !void {
-            // Phase 1: Exchange SETTINGS frames
-            while (!self.client_settings_received) {
-                var frame = self.receive_frame() catch |err| {
-                    self.handle_receive_frame_error(err) catch |handle_err| {
-                        return handle_err;
+                    handle_connection_level_frame(self, frame) catch |err| {
+                        // **Send GOAWAY on error and close the connection**
+                        log.err("Error handling connection-level frame: {s}\n", .{@errorName(err)});
+                        try self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error");
+                        return err;
                     };
-                    return;
-                };
-                defer frame.deinit(self.allocator);
-
-                // Only SETTINGS and PING frames are allowed in this phase
-                if (is_connection_level_frame(frame.header.frame_type)) {
-                    switch (frame.header.frame_type) {
-                        FrameTypes.FRAME_TYPE_SETTINGS => {
-                            try self.apply_frame_settings(frame);
-                            // Send SETTINGS ACK
-                            try self.send_settings_ack();
-                        },
-                        FrameTypes.FRAME_TYPE_PING => {
-                            try handle_ping_frame(self, frame);
-                        },
-                        else => {
-                            log.err("Received unexpected connection-level frame type {d} before SETTINGS exchange: PROTOCOL_ERROR\n", .{frame.header.frame_type});
-                            try self.send_goaway(self.last_stream_id, 0x1, "Unexpected frame before SETTINGS exchange: PROTOCOL_ERROR");
-                            return error.ProtocolError;
-                        },
-                    }
-                } else {
-                    log.err("Received non-connection-level frame: {any} before SETTINGS exchange: PROTOCOL_ERROR\n", .{frame.header.frame_type});
-                    try self.send_goaway(self.last_stream_id, 0x1, "Non-connection-level frame before SETTINGS exchange: PROTOCOL_ERROR");
-                    return error.ProtocolError;
-                }
-
-                // Check if SETTINGS frame with ACK flag was received (if client is acknowledging server's SETTINGS)
-                if (frame.header.frame_type == FrameTypes.FRAME_TYPE_SETTINGS and (frame.header.flags.value & FrameFlags.ACK) != 0) {
-                    self.client_settings_received = true;
-                }
-            }
-
-            // Phase 2: Handle other frames
-            while (!self.goaway_sent) {
-                var frame = self.receive_frame() catch |err| {
-                    self.handle_receive_frame_error(err) catch |handle_err| {
-                        return handle_err;
-                    };
-                    return;
-                };
-                defer frame.deinit(self.allocator);
-
-                log.debug("Received frame of type: {d}, stream ID: {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
-
-                const is_conn_level = is_connection_level_frame(frame.header.frame_type);
-
-                if (is_conn_level) {
-                    try handle_connection_level_frame(self, frame);
                 } else {
                     try handle_stream_level_frame(self, frame);
                 }
@@ -395,9 +340,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             switch (frame.header.frame_type) {
                 FrameTypes.FRAME_TYPE_SETTINGS => {
+                    try self.apply_frame_settings(frame);
+
                     if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
-                        // Apply client settings
-                        try self.apply_frame_settings(frame);
                         // Send SETTINGS ACK
                         try self.send_settings_ack();
                     }
