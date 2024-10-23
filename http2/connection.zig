@@ -147,6 +147,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 };
                 defer frame.deinit(self.allocator);
 
+                if (!is_valid_frame_type(frame.header.frame_type)) {
+                    // Unknown frame type, ignore it as per RFC 7540 Section 5.5
+                    log.debug("Ignoring unknown frame type {d}\n", .{frame.header.frame_type});
+                    continue; // Ignore this frame and continue processing
+                }
+
                 log.debug("Received frame of type: {d}, stream ID: {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
 
                 const is_conn_level = is_connection_level_frame(frame.header.frame_type);
@@ -260,6 +266,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         fn handle_stream_level_frame(self: *@This(), frame: Frame) !void {
+            if (!is_valid_frame_type(frame.header.frame_type)) {
+                // Unknown frame type, ignore as per RFC 7540 Section 5.5
+                log.debug("Ignoring unknown stream-level frame type {d}\n", .{frame.header.frame_type});
+                return;
+            }
+
             // Validate that stream-level frames do not have stream ID 0
             if (frame.header.stream_id == 0) {
                 log.err("Received stream-level frame {d} with stream ID 0: PROTOCOL_ERROR\n", .{frame.header.frame_type});
@@ -347,6 +359,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         fn handle_connection_level_frame(self: *@This(), frame: Frame) !void {
+            if (!is_valid_frame_type(frame.header.frame_type)) {
+                // Unknown frame type, ignore as per RFC 7540 Section 5.5
+                log.debug("Ignoring unknown connection-level frame type {d}\n", .{frame.header.frame_type});
+                return;
+            }
+
             // Validate that connection-level frames have stream ID 0
             if (frame.header.stream_id != 0) {
                 log.err("Received {d} frame with non-zero stream ID {d}: PROTOCOL_ERROR\n", .{ frame.header.frame_type, frame.header.stream_id });
