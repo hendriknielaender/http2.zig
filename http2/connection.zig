@@ -149,8 +149,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
                 log.debug("Received frame of type: {d}, stream ID: {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
 
-                // Classify frame based on stream_id
-                if (frame.header.stream_id == 0) {
+                const is_conn_level = is_connection_level_frame(frame.header.frame_type);
+
+                if (is_conn_level) {
                     try handle_connection_level_frame(self, frame);
                 } else {
                     try handle_stream_level_frame(self, frame);
@@ -289,6 +290,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             stream.handleFrame(frame) catch |err| {
                 log.err("Error handling frame in stream {d}: {s}\n", .{ frame.header.stream_id, @errorName(err) });
 
+                // If a GOAWAY has been sent, do not send additional frames
+                if (self.goaway_sent) {
+                    return;
+                }
+
                 // Handle specific errors accordingly
                 switch (err) {
                     error.CompressionError => {
@@ -296,8 +302,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         return;
                     },
                     error.StreamClosed => {
-                        log.debug("Stream {d}: Detected StreamClosed error, sending RST_STREAM with STREAM_CLOSED (0x5)\n", .{frame.header.stream_id});
-                        try self.send_rst_stream(frame.header.stream_id, 0x5); // STREAM_CLOSED
+                        // Do not send RST_STREAM if GOAWAY has been sent
+                        if (!self.goaway_sent) {
+                            log.debug("Stream {d}: Detected StreamClosed error, sending RST_STREAM with STREAM_CLOSED (0x5)\n", .{frame.header.stream_id});
+                            try self.send_rst_stream(frame.header.stream_id, 0x5); // STREAM_CLOSED
+                        }
                         return;
                     },
                     error.ProtocolError => {
@@ -486,6 +495,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try data_frame.write(self.writer);
 
             log.debug("Sent 200 OK response with body: \"Hello, World!\"\n", .{});
+
+            if (stream.state == .Open) {
+                stream.state = .HalfClosedLocal;
+            } else if (stream.state == .HalfClosedRemote) {
+                stream.state = .Closed;
+            }
         }
 
         pub fn send_settings(self: @This()) !void {

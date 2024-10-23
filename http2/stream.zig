@@ -74,12 +74,14 @@ pub const Stream = struct {
             // Only PRIORITY frames are allowed on closed streams
             if (frame.header.frame_type != FrameTypes.FRAME_TYPE_PRIORITY) {
                 log.err("Received frame type {d} on closed stream {d}: STREAM_CLOSED\n", .{ frame.header.frame_type, self.id });
-                try self.sendRstStream(0x5); // STREAM_CLOSED
+
+                // Send GOAWAY with STREAM_CLOSED error code
+                try self.conn.send_goaway(self.conn.highest_stream_id(), 0x5, "Frame received on closed stream: STREAM_CLOSED");
+                self.conn.goaway_sent = true;
                 return error.StreamClosed;
             }
         }
 
-        // **Add this block to handle HalfClosedRemote state**
         if (self.state == .HalfClosedRemote) {
             if (frame.header.frame_type != FrameTypes.FRAME_TYPE_WINDOW_UPDATE and
                 frame.header.frame_type != FrameTypes.FRAME_TYPE_PRIORITY and
@@ -132,7 +134,6 @@ pub const Stream = struct {
         if (self.request_complete) {
             // Process the request
             try self.conn.process_request(self);
-            self.state = .HalfClosedRemote; // Update the stream state
         }
 
         log.debug("Frame handling completed for stream ID: {d}\n", .{frame.header.stream_id});
