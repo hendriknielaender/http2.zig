@@ -589,8 +589,6 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             return std.meta.int_to_enum(FrameType, val) catch undefined;
         }
 
-        // connection.zig
-
         pub fn apply_frame_settings(self: *@This(), frame: Frame) !void {
             log.debug("Applying settings from frame...\n", .{});
 
@@ -890,10 +888,18 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 return error.InvalidFrameSize;
             }
 
-            const pay: *const [4]u8 = @ptrCast(frame.payload[0..4]);
-            const increment = std.mem.readInt(u32, pay, .big);
+            const increment = std.mem.readInt(u32, frame.payload[0..4], .big);
 
-            if (increment > 0x7FFFFFFF) { // u32 max value
+            // **Check if increment is zero**
+            if (increment == 0) {
+                log.err("Received WINDOW_UPDATE with increment 0, sending GOAWAY: PROTOCOL_ERROR.\n", .{});
+                try self.send_goaway(self.highest_stream_id(), 0x1, "WINDOW_UPDATE with increment 0: PROTOCOL_ERROR");
+                return error.ProtocolError;
+            }
+
+            if (increment > 0x7FFFFFFF) { // Maximum allowed value
+                log.err("Received WINDOW_UPDATE with increment exceeding maximum value, sending GOAWAY: FLOW_CONTROL_ERROR.\n", .{});
+                try self.send_goaway(self.highest_stream_id(), 0x3, "WINDOW_UPDATE increment too large: FLOW_CONTROL_ERROR");
                 return error.FlowControlError;
             }
 
