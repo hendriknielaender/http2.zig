@@ -24,6 +24,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         streams: std.AutoHashMap(u32, *Stream),
         hpack_dynamic_table: Hpack.DynamicTable,
         goaway_sent: bool = false,
+        goaway_received: bool = false,
         expecting_continuation_stream_id: ?u32 = null,
         last_stream_id: u32 = 0,
         client_settings_received: bool = false,
@@ -183,11 +184,16 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                         return err;
                     };
                 } else {
+                    if (self.goaway_received and frame.header.stream_id > self.last_stream_id) {
+                        // Ignore frames with stream IDs higher than the last stream ID in GOAWAY
+                        log.debug("Ignoring frame on stream {d} as it exceeds last_stream_id {d}\n", .{ frame.header.stream_id, self.last_stream_id });
+                        continue;
+                    }
                     try handle_stream_level_frame(self, frame);
                 }
 
-                if (self.goaway_sent) {
-                    log.debug("GOAWAY has been sent, stopping frame processing.\n", .{});
+                if (self.goaway_sent and self.goaway_received) {
+                    log.debug("Both GOAWAY sent and received, stopping frame processing.\n", .{});
                     break;
                 }
             }
@@ -214,8 +220,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 log.debug("GOAWAY debug data: {any}\n", .{debug_data});
             }
 
-            // Set the goaway_sent flag and gracefully close the connection
-            self.goaway_sent = true;
+            // Set the goaway_received flag
+            self.goaway_received = true;
+
+            // Update the highest stream ID we can process
+            self.last_stream_id = last_stream_id;
             return;
         }
 
@@ -231,6 +240,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 log.err("Received stream-level frame {d} with stream ID 0: PROTOCOL_ERROR\n", .{frame.header.frame_type});
                 try self.send_goaway(self.last_stream_id, 0x1, "Stream-level frame with stream ID 0: PROTOCOL_ERROR");
                 return error.ProtocolError;
+            }
+
+            if (self.goaway_received and frame.header.stream_id > self.last_stream_id) {
+                // Ignore frames with stream IDs higher than the last stream ID in GOAWAY
+                log.debug("Ignoring frame on stream {d} as it exceeds peer_last_stream_id {d}\n", .{ frame.header.stream_id, self.last_stream_id });
+                return;
             }
 
             // Retrieve the corresponding stream
