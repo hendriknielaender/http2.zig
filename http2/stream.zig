@@ -183,44 +183,53 @@ pub const Stream = struct {
             .stream_id = self.id, // Ensure correct stream ID
         };
 
-        // Write the frame header
         try frame_header.write(self.conn.writer);
 
-        // Write the error code as a 4-byte big-endian integer
         var error_code_bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, error_code_bytes[0..4], error_code, .big);
         try self.conn.writer.writeAll(&error_code_bytes);
 
         log.debug("Sent RST_STREAM frame with error code {d} for stream ID {d}\n", .{ error_code, self.id });
+
+        self.state = .Closed;
     }
 
     fn handleHeadersFrame(self: *Stream, frame: Frame) !void {
         if (self.expecting_continuation) {
             // Protocol error: already expecting continuation on this stream
             log.err("Received HEADERS frame while expecting CONTINUATION on stream {d}: PROTOCOL_ERROR\n", .{self.id});
-            try self.conn.send_goaway(0, 0x1, "Unexpected HEADERS frame while expecting CONTINUATION: PROTOCOL_ERROR");
+            try self.sendRstStream(0x1); // PROTOCOL_ERROR
             return error.ProtocolError;
         }
 
-        // Update stream state based on current state and the frame received
         switch (self.state) {
             .Idle => {
                 // Receiving a HEADERS frame in idle state is valid; transition to Open
                 self.state = .Open;
             },
+            .Open => {
+                // Receiving a second HEADERS frame in Open state
+                // Check if it's a trailing header (END_STREAM flag set)
+                if ((frame.header.flags.value & FrameFlags.END_STREAM) != 0) {
+                    // It's a trailing header
+                    // Proceed without changing state
+                } else {
+                    // Protocol error: receiving a second HEADERS frame without END_STREAM
+                    log.err("Received second HEADERS frame without END_STREAM on stream {d}: PROTOCOL_ERROR\n", .{self.id});
+                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    return error.ProtocolError;
+                }
+            },
+            .HalfClosedRemote, .HalfClosedLocal, .Closed => {
+                // Invalid to receive HEADERS frame; send RST_STREAM
+                log.err("HEADERS frame received in invalid state on stream {d}: STREAM_CLOSED\n", .{self.id});
+                try self.sendRstStream(0x5); // STREAM_CLOSED
+                return error.StreamClosed;
+            },
             .ReservedLocal, .ReservedRemote => {
-                // Receiving a HEADERS frame in Reserved state is a protocol error
+                // Protocol error
                 log.err("HEADERS frame received in reserved state on stream {d}: PROTOCOL_ERROR\n", .{self.id});
-                try self.conn.send_goaway(0, 0x1, "HEADERS frame received in reserved state: PROTOCOL_ERROR");
-                return error.ProtocolError;
-            },
-            .Open, .HalfClosedRemote => {
-                // Valid to receive HEADERS frame; proceed without state change
-            },
-            .HalfClosedLocal, .Closed => {
-                // Invalid to receive HEADERS frame; send GOAWAY with PROTOCOL_ERROR
-                log.err("HEADERS frame received in invalid state on stream {d}: PROTOCOL_ERROR\n", .{self.id});
-                try self.conn.send_goaway(0, 0x1, "HEADERS frame received in invalid state: PROTOCOL_ERROR");
+                try self.sendRstStream(0x1); // PROTOCOL_ERROR
                 return error.ProtocolError;
             },
         }
