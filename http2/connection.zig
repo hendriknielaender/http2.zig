@@ -248,6 +248,15 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 return;
             }
 
+            // Check if the frame is a PUSH_PROMISE frame
+            if (frame.header.frame_type == FrameTypes.FRAME_TYPE_PUSH_PROMISE) {
+                // Clients must not send PUSH_PROMISE frames
+                log.err("Received PUSH_PROMISE frame from client on stream {d}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
+                try self.send_goaway(self.last_stream_id, 0x1, "Client sent PUSH_PROMISE: PROTOCOL_ERROR");
+                self.goaway_sent = true;
+                return error.ProtocolError;
+            }
+
             // Retrieve the corresponding stream
             var stream = self.get_stream(frame.header.stream_id) catch |err| {
                 if (err == error.ProtocolError) {
