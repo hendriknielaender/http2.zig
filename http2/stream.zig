@@ -101,13 +101,10 @@ pub const Stream = struct {
             return error.ProtocolError;
         }
 
+        // Process the frame first
         switch (frame.header.frame_type) {
             FrameTypes.FRAME_TYPE_HEADERS => {
                 log.debug("Handling HEADERS frame\n", .{});
-                if (frame.header.flags.value & FrameFlags.END_STREAM != 0) {
-                    self.state = StreamState.HalfClosedRemote;
-                    log.debug("Stream {d}: Transitioned to HalfClosedRemote\n", .{self.id});
-                }
                 try self.handleHeadersFrame(frame);
             },
             FrameTypes.FRAME_TYPE_CONTINUATION => {
@@ -128,6 +125,17 @@ pub const Stream = struct {
                 // Handle other frame types or ignore them as appropriate
                 log.debug("Received frame type {d} which is not handled in current state\n", .{frame.header.frame_type});
             },
+        }
+
+        // After handling the frame, update the state based on the END_STREAM flag
+        if (frame.header.flags.isEndStream()) {
+            if (self.state == .Open) {
+                self.state = .HalfClosedRemote;
+                log.debug("Stream {d}: Transitioned to HalfClosedRemote\n", .{self.id});
+            } else if (self.state == .HalfClosedLocal) {
+                self.state = .Closed;
+                log.debug("Stream {d}: Transitioned to Closed\n", .{self.id});
+            }
         }
 
         // After handling the frame, check if the request is complete
@@ -330,8 +338,52 @@ pub const Stream = struct {
             log.debug("{s}: {s}\n", .{ header.name, header.value });
         }
 
+        try self.validateHeaders(headers.items);
+
         // You can now process the headers as needed...
         // For example, store them in the stream's recv_headers list
+    }
+
+    fn validateHeaders(self: *Stream, headers: []Hpack.HeaderField) !void {
+        var pseudo_header_fields = std.ArrayList([]const u8).init(self.conn.allocator.*);
+        defer pseudo_header_fields.deinit();
+
+        var header_fields_after_pseudo = false;
+
+        for (headers) |header| {
+            if (header.name[0] == ':') {
+                if (header_fields_after_pseudo) {
+                    // Pseudo-header fields must appear before regular header fields
+                    log.err("Pseudo-header field after regular header field: PROTOCOL_ERROR\n", .{});
+                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    return error.ProtocolError;
+                }
+
+                // Collect pseudo-header field names
+                try pseudo_header_fields.append(header.name);
+            } else {
+                header_fields_after_pseudo = true;
+            }
+        }
+
+        // Allowed pseudo-header fields in request:
+        const allowed_pseudo_headers = [_][]const u8{ ":method", ":scheme", ":authority", ":path" };
+
+        for (pseudo_header_fields.items) |ph_name| {
+            var is_allowed = false;
+            for (allowed_pseudo_headers) |allowed| {
+                if (std.mem.eql(u8, ph_name, allowed)) {
+                    is_allowed = true;
+                    break;
+                }
+            }
+            if (!is_allowed) {
+                // Unknown pseudo-header field
+                log.err("Unknown pseudo-header field: {s}: PROTOCOL_ERROR\n", .{ph_name});
+                try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                return error.ProtocolError;
+            }
+        }
     }
 
     fn handleData(self: *Stream, frame: Frame) !void {
