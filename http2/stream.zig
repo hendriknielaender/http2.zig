@@ -397,6 +397,13 @@ pub const Stream = struct {
                         return error.ProtocolError;
                     }
                 }
+
+                // **Uppercase Header Field Name Validation**
+                if (!isAllLowercase(header.name)) {
+                    log.err("Header field name contains uppercase letters: {s}: PROTOCOL_ERROR\n", .{header.name});
+                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    return error.ProtocolError;
+                }
             }
         }
 
@@ -628,6 +635,15 @@ pub const Stream = struct {
         try frame.write(self.conn.writer);
     }
 };
+
+fn isAllLowercase(s: []const u8) bool {
+    for (s) |c| {
+        if (c >= 'A' and c <= 'Z') {
+            return false;
+        }
+    }
+    return true;
+}
 
 test "create and handle stream" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
