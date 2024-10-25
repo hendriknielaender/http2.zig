@@ -33,6 +33,9 @@ pub const Stream = struct {
     send_data: std.ArrayList(u8),
     header_block_fragments: std.ArrayList(u8),
     expecting_continuation: bool,
+    headers: std.ArrayList(Hpack.HeaderField),
+    content_length: ?usize = null,
+    total_data_received: usize = 0,
     request_complete: bool = false,
 
     pub fn init(allocator: *std.mem.Allocator, conn: *Connection(std.io.AnyReader, std.io.AnyWriter), id: u32) !*Stream {
@@ -49,6 +52,9 @@ pub const Stream = struct {
             .send_data = std.ArrayList(u8).init(allocator.*),
             .header_block_fragments = std.ArrayList(u8).init(allocator.*),
             .expecting_continuation = false,
+            .headers = std.ArrayList(Hpack.HeaderField).init(allocator.*),
+            .content_length = null,
+            .total_data_received = 0,
         };
         return self;
     }
@@ -62,6 +68,14 @@ pub const Stream = struct {
         self.recv_data.deinit();
         self.send_data.deinit();
         self.header_block_fragments.deinit();
+
+        // Deinitialize headers and free allocated strings
+        for (self.headers.items) |header| {
+            self.conn.allocator.free(header.name);
+            self.conn.allocator.free(header.value);
+        }
+        self.headers.deinit();
+
         self.conn.allocator.destroy(self);
     }
 
@@ -298,15 +312,12 @@ pub const Stream = struct {
     fn decodeHeaderBlock(self: *Stream) !void {
         const header_block = self.header_block_fragments.items;
 
-        var headers = std.ArrayList(Hpack.HeaderField).init(self.conn.allocator.*);
-        defer {
-            // Deinitialize headers and free allocated strings
-            for (headers.items) |header| {
-                self.conn.allocator.free(header.name);
-                self.conn.allocator.free(header.value);
-            }
-            headers.deinit();
+        // Clear any existing headers
+        for (self.headers.items) |header| {
+            self.conn.allocator.free(header.name);
+            self.conn.allocator.free(header.value);
         }
+        self.headers.clearRetainingCapacity();
 
         var cursor: usize = 0;
         while (cursor < header_block.len) {
@@ -324,7 +335,7 @@ pub const Stream = struct {
                 .name = try self.conn.allocator.dupe(u8, decoded_header.header.name),
                 .value = try self.conn.allocator.dupe(u8, decoded_header.header.value),
             };
-            try headers.append(header_copy);
+            try self.headers.append(header_copy);
 
             // Now it's safe to deinitialize the decoded_header
             decoded_header.deinit();
@@ -334,14 +345,14 @@ pub const Stream = struct {
 
         // Successfully decoded headers
         log.debug("Successfully decoded headers:\n", .{});
-        for (headers.items) |header| {
+        for (self.headers.items) |header| {
             log.debug("{s}: {s}\n", .{ header.name, header.value });
         }
 
-        try self.validateHeaders(headers.items);
+        // Validate the headers
+        try self.validateHeaders(self.headers.items);
 
-        // You can now process the headers as needed...
-        // For example, store them in the stream's recv_headers list
+        // Now you can process the headers as needed...
     }
 
     fn validateHeaders(self: *Stream, headers: []Hpack.HeaderField) !void {
@@ -432,6 +443,21 @@ pub const Stream = struct {
                 return error.ProtocolError;
             }
         }
+
+        // After existing validation, parse content-length
+        for (headers) |header| {
+            if (std.mem.eql(u8, header.name, "content-length")) {
+                // Parse the content-length value
+                const content_length_str = header.value;
+                const content_length_result = std.fmt.parseInt(usize, content_length_str, 10) catch |err| {
+                    log.err("Error: {any} Invalid content-length value: {s}: PROTOCOL_ERROR\n", .{ err, content_length_str });
+                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    return error.ProtocolError;
+                };
+
+                self.content_length = content_length_result;
+            }
+        }
     }
 
     fn isConnectionSpecificHeader(header_name: []const u8) bool {
@@ -478,12 +504,23 @@ pub const Stream = struct {
 
         // Now 'payload' contains the actual data without padding
         try self.recv_data.appendSlice(payload);
+        self.total_data_received += payload.len; // Update total data received
+
         self.recv_window_size -= @intCast(frame.header.length);
         if (self.recv_window_size < 0) {
             return error.FlowControlError;
         }
 
         if (frame.header.flags.isEndStream()) {
+            // **Validate total_data_received against content_length**
+            if (self.content_length) |expected_length| {
+                if (self.total_data_received != expected_length) {
+                    log.err("Received data length ({d}) does not match content-length ({d}): PROTOCOL_ERROR\n", .{ self.total_data_received, expected_length });
+                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    return error.ProtocolError;
+                }
+            }
+
             if (self.state == .Open) {
                 self.state = .HalfClosedRemote;
             } else if (self.state == .HalfClosedLocal) {
