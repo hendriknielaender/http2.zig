@@ -345,7 +345,7 @@ pub const Stream = struct {
     }
 
     fn validateHeaders(self: *Stream, headers: []Hpack.HeaderField) !void {
-        var pseudo_header_fields = std.ArrayList([]const u8).init(self.conn.allocator.*);
+        var pseudo_header_fields = std.StringHashMap([]const u8).init(self.conn.allocator.*);
         defer pseudo_header_fields.deinit();
 
         var header_fields_after_pseudo = false;
@@ -359,12 +359,19 @@ pub const Stream = struct {
                     return error.ProtocolError;
                 }
 
-                // Collect pseudo-header field names
-                try pseudo_header_fields.append(header.name);
+                // Check for duplicate pseudo-header fields
+                if (pseudo_header_fields.contains(header.name)) {
+                    log.err("Duplicate pseudo-header field: {s}: PROTOCOL_ERROR\n", .{header.name});
+                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    return error.ProtocolError;
+                }
+
+                // Collect pseudo-header fields
+                try pseudo_header_fields.put(header.name, header.value);
             } else {
                 header_fields_after_pseudo = true;
 
-                // **Check for connection-specific header fields**
+                // Check for connection-specific header fields
                 if (isConnectionSpecificHeader(header.name)) {
                     log.err("Connection-specific header field '{s}' is prohibited in HTTP/2: PROTOCOL_ERROR\n", .{header.name});
                     try self.sendRstStream(0x1); // PROTOCOL_ERROR
@@ -376,7 +383,10 @@ pub const Stream = struct {
         // Allowed pseudo-header fields in request:
         const allowed_pseudo_headers = [_][]const u8{ ":method", ":scheme", ":authority", ":path" };
 
-        for (pseudo_header_fields.items) |ph_name| {
+        // Validate that all pseudo-header fields are allowed
+        var it = pseudo_header_fields.iterator();
+        while (it.next()) |entry| {
+            const ph_name = entry.key_ptr.*;
             var is_allowed = false;
             for (allowed_pseudo_headers) |allowed| {
                 if (std.mem.eql(u8, ph_name, allowed)) {
@@ -387,6 +397,37 @@ pub const Stream = struct {
             if (!is_allowed) {
                 // Unknown pseudo-header field
                 log.err("Unknown pseudo-header field: {s}: PROTOCOL_ERROR\n", .{ph_name});
+                try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                return error.ProtocolError;
+            }
+        }
+
+        // Required pseudo-header fields in request (except for CONNECT method)
+        const required_pseudo_headers = [_][]const u8{ ":method", ":scheme", ":path" };
+
+        // Validate required pseudo-header fields
+        for (required_pseudo_headers) |required| {
+            if (!pseudo_header_fields.contains(required)) {
+                log.err("Missing required pseudo-header field: {s}: PROTOCOL_ERROR\n", .{required});
+                try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                return error.ProtocolError;
+            } else {
+                // Check for empty value
+                const value = pseudo_header_fields.get(required).?;
+                if (value.len == 0) {
+                    log.err("Empty value for required pseudo-header field: {s}: PROTOCOL_ERROR\n", .{required});
+                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    return error.ProtocolError;
+                }
+            }
+        }
+
+        // Additional validation for CONNECT method
+        const method = pseudo_header_fields.get(":method").?;
+        if (std.mem.eql(u8, method, "CONNECT")) {
+            // For CONNECT, :scheme and :path must be omitted
+            if (pseudo_header_fields.contains(":scheme") or pseudo_header_fields.contains(":path")) {
+                log.err("CONNECT method must not contain :scheme or :path pseudo-header fields: PROTOCOL_ERROR\n", .{});
                 try self.sendRstStream(0x1); // PROTOCOL_ERROR
                 return error.ProtocolError;
             }
