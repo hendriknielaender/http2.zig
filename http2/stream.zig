@@ -363,6 +363,13 @@ pub const Stream = struct {
                 try pseudo_header_fields.append(header.name);
             } else {
                 header_fields_after_pseudo = true;
+
+                // **Check for connection-specific header fields**
+                if (isConnectionSpecificHeader(header.name)) {
+                    log.err("Connection-specific header field '{s}' is prohibited in HTTP/2: PROTOCOL_ERROR\n", .{header.name});
+                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    return error.ProtocolError;
+                }
             }
         }
 
@@ -384,6 +391,23 @@ pub const Stream = struct {
                 return error.ProtocolError;
             }
         }
+    }
+
+    fn isConnectionSpecificHeader(header_name: []const u8) bool {
+        const prohibited_headers = [_][]const u8{
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "transfer-encoding",
+            "upgrade",
+        };
+
+        for (prohibited_headers) |prohibited| {
+            if (std.mem.eql(u8, header_name, prohibited)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     fn handleData(self: *Stream, frame: Frame) !void {
