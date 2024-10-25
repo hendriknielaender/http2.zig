@@ -388,6 +388,15 @@ pub const Stream = struct {
                     try self.sendRstStream(0x1); // PROTOCOL_ERROR
                     return error.ProtocolError;
                 }
+
+                // **TE Header Validation**
+                if (std.mem.eql(u8, header.name, "te")) {
+                    if (!std.mem.eql(u8, header.value, "trailers")) {
+                        log.err("Invalid TE header field value: {s}: PROTOCOL_ERROR\n", .{header.value});
+                        try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                        return error.ProtocolError;
+                    }
+                }
             }
         }
 
