@@ -881,14 +881,23 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         fn update_send_window(self: *@This(), increment: i32) !void {
-            self.send_window_size += increment;
-            if (self.send_window_size > 2147483647) { // Max value for a signed 31-bit integer
+            const ov = @addWithOverflow(self.send_window_size, increment);
+            if (ov[0] > 2147483647 or ov[0] < 0) {
+                log.err("Flow control window overflow detected. Sending GOAWAY with FLOW_CONTROL_ERROR.\n", .{});
+                try self.send_goaway(self.highest_stream_id(), 0x3, "Flow control window exceeded limits: FLOW_CONTROL_ERROR");
                 return error.FlowControlError;
             }
+            self.send_window_size = ov[0];
         }
 
-        fn update_recv_window(self: *@This(), delta: i32) void {
-            self.recv_window_size += delta;
+        fn update_recv_window(self: *@This(), delta: i32) !void {
+            const ov = @addWithOverflow(self.recv_window_size, delta);
+            if (ov[0] > 2147483647 or ov[0] < 0) {
+                log.err("Receive window overflow detected. Sending GOAWAY with FLOW_CONTROL_ERROR.\n", .{});
+                try self.send_goaway(self.highest_stream_id(), 0x3, "Receive window exceeded limits: FLOW_CONTROL_ERROR");
+                return error.FlowControlError;
+            }
+            self.recv_window_size = ov[0];
         }
 
         fn send_window_update(self: *@This(), stream_id: u32, increment: i32) !void {
