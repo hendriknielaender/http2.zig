@@ -461,10 +461,17 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             log.debug("Processing request for stream ID: {d}\n", .{stream.id});
 
             // Prepare a basic response: "Hello, World!"
-            const response_body = "Hello, World!";
+            const response_body =
+                \\<!DOCTYPE html>
+                \\<html>
+                \\<body>
+                \\<h1>Hello, World!</h1>
+                \\</body>
+                \\</html>
+            ;
             const response_headers = [_]Hpack.HeaderField{
                 .{ .name = ":status", .value = "200" },
-                .{ .name = "content-length", .value = "13" },
+                .{ .name = "content-type", .value = "text/html" },
             };
 
             var buffer = std.ArrayList(u8).init(self.allocator.*);
