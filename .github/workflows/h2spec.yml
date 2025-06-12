@@ -96,13 +96,19 @@ jobs:
       - name: Generate test certificates
         if: matrix.protocol == 'tls'
         run: |
-          openssl req -x509 -newkey rsa:2048 -keyout examples/hello-world/server.key \
-            -out examples/hello-world/server.crt -days 365 -nodes \
+          echo "Generating TLS certificates..."
+          openssl req -x509 -newkey rsa:2048 -keyout key.pem \
+            -out cert.pem -days 365 -nodes \
             -subj "/CN=localhost" \
             -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
-          # Copy to project root for compatibility
-          cp examples/hello-world/server.crt cert.pem
-          cp examples/hello-world/server.key key.pem
+          
+          # Also create in examples directory for backup
+          mkdir -p examples/hello-world
+          cp cert.pem examples/hello-world/server.crt
+          cp key.pem examples/hello-world/server.key
+          
+          echo "Certificate files created:"
+          ls -la cert.pem key.pem
 
       - name: Build HTTP/2 server
         run: zig build
@@ -116,20 +122,45 @@ jobs:
       - name: Start TLS HTTP/2 server (background)
         if: matrix.protocol == 'tls'
         run: |
-          cd examples/hello-world
-          timeout ${{ env.TIMEOUT_DURATION }} ../../zig-out/bin/hello_world_server > ../../test-results/server-tls.log 2>&1 &
-          echo $! > ../../test-results/server.pid
+          echo "Starting HTTP/2 server..."
+          echo "Current directory: $(pwd)"
+          echo "Certificate files:"
+          ls -la cert.pem key.pem || echo "Certificate files missing!"
+          echo "Binary location:"
+          ls -la zig-out/bin/hello_world_server || echo "Binary missing!"
+          
+          # Start server in background
+          timeout ${{ env.TIMEOUT_DURATION }} ./zig-out/bin/hello_world_server > test-results/server-tls.log 2>&1 &
+          echo $! > test-results/server.pid
           sleep 5  # Give server time to start
+          
+          echo "Server PID: $(cat test-results/server.pid)"
+          echo "Server logs so far:"
+          cat test-results/server-tls.log || echo "No logs yet"
           
       - name: Wait for TLS server to be ready
         if: matrix.protocol == 'tls'
         run: |
+          echo "Waiting for server to be ready..."
           for i in {1..30}; do
-            if curl -k -s --http2 https://localhost:${{ env.SERVER_PORT }} &>/dev/null; then
-              echo "TLS server is ready"
+            # Check if process is still running
+            if ! ps -p $(cat test-results/server.pid) > /dev/null 2>&1; then
+              echo "Server process died! Check logs:"
+              cat test-results/server-tls.log
+              exit 1
+            fi
+            
+            # Check if server is responding
+            if curl -k -s --http2 https://localhost:${{ env.SERVER_PORT }} --max-time 5 &>/dev/null; then
+              echo "TLS server is ready and responding"
               break
             fi
             echo "Waiting for TLS server... ($i/30)"
+            if [ $i -eq 30 ]; then
+              echo "Server never became ready. Final logs:"
+              cat test-results/server-tls.log
+              exit 1
+            fi
             sleep 2
           done
 
