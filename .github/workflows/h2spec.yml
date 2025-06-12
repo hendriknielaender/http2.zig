@@ -150,7 +150,7 @@ jobs:
               exit 1
             fi
             
-            # Check if server is responding
+            # Check if server is responding with HTTP/2
             if curl -k -s --http2 https://localhost:${{ env.SERVER_PORT }} --max-time 5 &>/dev/null; then
               echo "TLS server is ready and responding"
               break
@@ -172,12 +172,13 @@ jobs:
           
           # First check if server is responding
           echo "Testing server connectivity..."
-          if ! curl -k -s --http2 https://localhost:${{ env.SERVER_PORT }} --max-time 10; then
+          if ! curl -k -s --http2 https://localhost:${{ env.SERVER_PORT }} --max-time 10 &>/dev/null; then
             echo "Server is not responding properly"
             echo "Server logs:"
             cat test-results/server-tls.log || echo "No server logs found"
             exit 1
           fi
+          echo "Server connectivity confirmed"
           
           # Run h2spec using Docker with host networking
           echo "Running h2spec tests using Docker..."
