@@ -118,8 +118,6 @@ pub const FrameHeader = struct {
         var buffer: [9]u8 = undefined;
         _ = try reader.readAll(&buffer);
 
-        log.debug("Buffer content: {x}\n", .{buffer});
-
         // Parse the 24-bit length from the first three bytes
         const length: u32 = (@as(u32, buffer[0]) << 16) | (@as(u32, buffer[1]) << 8) | @as(u32, buffer[2]);
 
@@ -130,13 +128,11 @@ pub const FrameHeader = struct {
 
         const frame_type_value: u8 = buffer[3];
         if (frame_type_value > FRAME_TYPE_CONTINUATION) {
-            log.err("Invalid frame_type_value: {}\n", .{frame_type_value});
             return error.InvalidEnumValue;
         }
 
         const frame_type: FrameType = frame_type_value;
         const flags = FrameFlags.init(buffer[4]);
-        log.debug("Frame flags value: 0x{x}, isPadded: {}, isEndHeaders: {}\n", .{ flags.value, flags.isPadded(), flags.isEndHeaders() });
 
         // Parse the 31-bit stream ID from the last four bytes
         const stream_id_raw = std.mem.readInt(u32, buffer[5..9], .big);
@@ -196,8 +192,6 @@ pub const Frame = struct {
 
     pub fn read(reader: anytype, allocator: *std.mem.Allocator) !Frame {
         const header = try FrameHeader.read(reader);
-        log.debug("Read FrameHeader: {any}\n", .{header});
-        log.debug("Frame type: {d}, flags: 0x{x}, length: {d}, padded: {}\n", .{ header.frame_type, header.flags.value, header.length, header.flags.isPadded() });
 
         var payload_length = header.length;
         var padding_length: ?u8 = null;
@@ -207,9 +201,7 @@ pub const Frame = struct {
             if (padding_length.? >= payload_length) {
                 return error.InvalidPaddingLength;
             }
-            const original_payload_length = payload_length;
             payload_length -= @as(u32, padding_length.? + 1); // Subtract padding length
-            log.debug("PADDED frame: original_length={d}, padding_length={d}, data_length={d}\n", .{ original_payload_length, padding_length.?, payload_length });
         }
 
         const payload = try allocator.alloc(u8, payload_length);
@@ -229,8 +221,6 @@ pub const Frame = struct {
     pub fn write(self: *Frame, writer: anytype) !void {
         // Write the frame header first
         try self.header.write(writer);
-
-        log.debug("Frame.write called with payload length: {d}\n", .{self.payload.len});
 
         // Write the payload only if it's not empty
         if (self.payload.len > 0) {
@@ -266,8 +256,6 @@ test "frame header read and write" {
 
     // Write to the buffer
     try header.write(&writer);
-
-    std.debug.print("Written buffer: {x}\n", .{buffer});
 
     // Recreate the FixedBufferStream to reset the read position
     stream = std.io.fixedBufferStream(&buffer);
@@ -309,8 +297,6 @@ test "frame read and write" {
 
     try frame.write(&writer);
 
-    std.debug.print("Written buffer: {x}\n", .{buffer[0..25]});
-
     // Copy the data from buffer to read_buffer
     var read_buffer: [4096]u8 = undefined;
     for (buffer, 0..) |byte, i| {
@@ -324,10 +310,6 @@ test "frame read and write" {
     // Read the frame back from the buffer
     const read_frame = try Frame.read(&reader, &allocator);
 
-    std.debug.print("Read FrameHeader: {any}\n", .{read_frame.header});
-    std.debug.print("Read payload: {x}\n", .{read_frame.payload});
-    std.debug.print("Original payload: {x}\n", .{frame.payload});
-
     // Assert that the read frame matches the written frame
     assert(read_frame.header.length == frame.header.length);
     assert(read_frame.header.frame_type == frame.header.frame_type);
@@ -337,6 +319,4 @@ test "frame read and write" {
 
     // Compare payloads directly; should be the same
     assert(std.mem.eql(u8, read_frame.payload, frame.payload));
-
-    std.debug.print("Read frame payload: {x}\n", .{read_frame.payload});
 }

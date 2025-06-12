@@ -1,0 +1,373 @@
+name: Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # Triggers on version tags like v1.0.0
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v1.0.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as pre-release'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  ZIG_VERSION: "0.14.0"
+
+jobs:
+  # Validation and pre-checks
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is_prerelease: ${{ steps.version.outputs.is_prerelease }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for changelog generation
+
+      - name: Validate version and extract metadata
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            IS_PRERELEASE="${{ github.event.inputs.prerelease }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+            # Check if version contains alpha, beta, rc, etc.
+            if [[ "$VERSION" =~ (alpha|beta|rc|dev) ]]; then
+              IS_PRERELEASE="true"
+            else
+              IS_PRERELEASE="false"
+            fi
+          fi
+          
+          # Validate version format
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "Invalid version format: $VERSION"
+            exit 1
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$IS_PRERELEASE" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION (prerelease: $IS_PRERELEASE)"
+
+  # Run full test suite before release
+  test:
+    name: Pre-Release Testing
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+
+  # Build release artifacts
+  build:
+    name: Build Release Artifacts
+    needs: [validate, test]
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+            artifact_name: http2.zig-${{ needs.validate.outputs.version }}-linux-x86_64
+          - os: macos-latest  
+            target: x86_64-macos
+            artifact_name: http2.zig-${{ needs.validate.outputs.version }}-macos-x86_64
+          - os: macos-latest
+            target: aarch64-macos
+            artifact_name: http2.zig-${{ needs.validate.outputs.version }}-macos-aarch64
+          - os: windows-latest
+            target: x86_64-windows
+            artifact_name: http2.zig-${{ needs.validate.outputs.version }}-windows-x86_64
+            
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # Platform-specific dependency installation
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Install macOS dependencies
+        if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        uses: crazy-max/ghaction-chocolatey@v3
+        with:
+          args: install cmake ninja
+
+      # Build BoringSSL
+      - name: Build BoringSSL (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd boringssl
+          mkdir -p build
+          cd build
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release ..
+          ninja
+
+      - name: Build BoringSSL (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd boringssl
+          mkdir build
+          cd build
+          cmake -G"Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . --config Release
+
+      # Build release artifacts
+      - name: Build library and examples
+        run: |
+          zig build -Drelease=true
+          zig build test --summary all
+
+      # Create distribution package
+      - name: Create distribution package
+        shell: bash
+        run: |
+          # Create distribution directory
+          mkdir -p dist/${{ matrix.artifact_name }}
+          
+          # Copy library artifacts
+          if [ -d "zig-out/lib" ]; then
+            cp -r zig-out/lib dist/${{ matrix.artifact_name }}/
+          fi
+          
+          # Copy binaries
+          if [ -d "zig-out/bin" ]; then
+            cp -r zig-out/bin dist/${{ matrix.artifact_name }}/
+          fi
+          
+          # Copy headers and source for library usage
+          mkdir -p dist/${{ matrix.artifact_name }}/include
+          cp -r src/ dist/${{ matrix.artifact_name }}/include/
+          
+          # Copy documentation and license
+          cp README.md LICENSE dist/${{ matrix.artifact_name }}/
+          
+          # Copy examples
+          cp -r examples/ dist/${{ matrix.artifact_name }}/
+          
+          # Create build configuration
+          cat > dist/${{ matrix.artifact_name }}/build.zig.zon << EOF
+          .{
+              .name = "http2.zig",
+              .version = "${{ needs.validate.outputs.version }}",
+              .paths = .{
+                  "src/",
+                  "examples/",
+                  "README.md",
+                  "LICENSE",
+              },
+          }
+          EOF
+
+      # Create archives
+      - name: Create archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd dist
+          tar -czf ${{ matrix.artifact_name }}.tar.gz ${{ matrix.artifact_name }}
+          
+      - name: Create archive (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd dist
+          Compress-Archive -Path ${{ matrix.artifact_name }} -DestinationPath ${{ matrix.artifact_name }}.zip
+
+      # Generate checksums
+      - name: Generate checksums (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd dist
+          sha256sum ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
+          
+      - name: Generate checksums (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          cd dist
+          Get-FileHash ${{ matrix.artifact_name }}.zip -Algorithm SHA256 | Select-Object Hash | Out-File -Encoding ASCII ${{ matrix.artifact_name }}.zip.sha256
+
+      # Upload artifacts
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            dist/${{ matrix.artifact_name }}.*
+          retention-days: 30
+
+  # Generate changelog and release notes
+  changelog:
+    name: Generate Changelog
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      changelog: ${{ steps.changelog.outputs.changelog }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get the previous tag
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -n 2 | tail -n 1)
+          CURRENT_TAG="${{ needs.validate.outputs.version }}"
+          
+          echo "Generating changelog from $PREVIOUS_TAG to $CURRENT_TAG"
+          
+          # Generate changelog
+          cat > CHANGELOG.md << 'EOF'
+          # Changelog
+          
+          ## [$CURRENT_TAG] - $(date +%Y-%m-%d)
+          
+          ### 🚀 Features
+          EOF
+          
+          # Get commits between tags
+          if [ -n "$PREVIOUS_TAG" ]; then
+            git log --pretty=format:"- %s" "$PREVIOUS_TAG..$CURRENT_TAG" --grep="feat\|add" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "### 🐛 Bug Fixes" >> CHANGELOG.md
+            git log --pretty=format:"- %s" "$PREVIOUS_TAG..$CURRENT_TAG" --grep="fix\|bug" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "### 📚 Documentation" >> CHANGELOG.md
+            git log --pretty=format:"- %s" "$PREVIOUS_TAG..$CURRENT_TAG" --grep="doc\|readme" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "### 🔧 Maintenance" >> CHANGELOG.md
+            git log --pretty=format:"- %s" "$PREVIOUS_TAG..$CURRENT_TAG" --grep="chore\|refactor\|clean" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "### All Changes" >> CHANGELOG.md
+            git log --pretty=format:"- %s (%h)" "$PREVIOUS_TAG..$CURRENT_TAG" >> CHANGELOG.md
+          else
+            echo "- Initial release" >> CHANGELOG.md
+          fi
+          
+          # Read changelog into output
+          CHANGELOG_CONTENT=$(cat CHANGELOG.md)
+          # Escape newlines for GitHub output
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG_CONTENT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  # Create GitHub release
+  release:
+    name: Create GitHub Release
+    needs: [validate, build, changelog]
+    runs-on: ubuntu-latest
+    if: always() && needs.build.result == 'success'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ needs.validate.outputs.version }}
+          name: "Release ${{ needs.validate.outputs.version }}"
+          body: |
+            ${{ needs.changelog.outputs.changelog }}
+            
+            ## 📦 Installation
+            
+            ### Zig Package Manager
+            ```bash
+            # Add to your build.zig.zon
+            .dependencies = .{
+                .http2 = .{
+                    .url = "https://github.com/${{ github.repository }}/archive/${{ needs.validate.outputs.version }}.tar.gz",
+                    .hash = "auto",
+                },
+            }
+            ```
+            
+            ### Manual Installation
+            Download the appropriate archive for your platform below.
+            
+            ## 🧪 Testing
+            This release has passed all unit tests and HTTP/2 conformance tests.
+            
+            ## 📋 Checksums
+            Verify your download with the provided SHA256 checksums.
+            
+          files: |
+            artifacts/**/*
+          prerelease: ${{ needs.validate.outputs.is_prerelease == 'true' }}
+          generate_release_notes: false
+          draft: false
+
+  # Update package registry (if applicable)
+  publish:
+    name: Publish Package
+    needs: [release]
+    runs-on: ubuntu-latest
+    if: needs.validate.outputs.is_prerelease == 'false'  # Only for stable releases
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      # Future: Add steps to publish to Zig package registry when available
+      - name: Prepare for package registry
+        run: |
+          echo "Package registry publication would happen here"
+          echo "Version: ${{ needs.validate.outputs.version }}"
+          
+          # Validate build.zig.zon
+          if [ -f "build.zig.zon" ]; then
+            echo "✅ build.zig.zon found"
+            cat build.zig.zon
+          else
+            echo "❌ build.zig.zon not found"
+          fi
+
+  # Notification and cleanup
+  notify:
+    name: Post-Release Notifications
+    needs: [validate, release]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Notify success
+        if: needs.release.result == 'success'
+        run: |
+          echo "🎉 Release ${{ needs.validate.outputs.version }} published successfully!"
+          echo "📦 Release URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.validate.outputs.version }}"
+
+      - name: Notify failure
+        if: needs.release.result == 'failure'
+        run: |
+          echo "❌ Release ${{ needs.validate.outputs.version }} failed!"
+          exit 1

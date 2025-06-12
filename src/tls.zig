@@ -126,29 +126,47 @@ pub const TlsServerContext = struct {
         };
     }
 
-    /// Sets the ALPN protocols on the server context to exactly the given `alpn_proto` (e.g. "h2").
+    /// Sets up ALPN callback for server-side protocol negotiation.
+    /// For servers, we use SSL_CTX_set_alpn_select_cb instead of SSL_CTX_set_alpn_protos.
     fn set_alpn(self: *TlsServerContext, alpn_proto: []const u8) !void {
-        if (alpn_proto.len == 0 or alpn_proto.len > 255) {
-            return TlsError.InitFailed;
+        _ = alpn_proto; // We'll hardcode "h2" in the callback for now
+        
+        // Set the ALPN selection callback for server-side negotiation
+        boringssl.SSL_CTX_set_alpn_select_cb(self.ctx, alpn_select_callback, null);
+    }
+    
+    /// ALPN selection callback - called when client sends ALPN extension
+    fn alpn_select_callback(
+        ssl: ?*boringssl.SSL,
+        out: [*c][*c]const u8,
+        outlen: [*c]u8,
+        in: [*c]const u8,
+        inlen: c_uint,
+        arg: ?*anyopaque,
+    ) callconv(.c) c_int {
+        _ = ssl;
+        _ = arg;
+        
+        // Search for "h2" in the client's ALPN list
+        var offset: c_uint = 0;
+        while (offset < inlen) {
+            const proto_len = in[offset];
+            if (offset + 1 + proto_len > inlen) break;
+            
+            // Check if this protocol is "h2"
+            if (proto_len == 2 and 
+                in[offset + 1] == 'h' and in[offset + 2] == '2') {
+                // Found "h2" - select it
+                out.* = in + offset + 1;
+                outlen.* = 2;
+                return boringssl.SSL_TLSEXT_ERR_OK;
+            }
+            
+            offset += 1 + proto_len;
         }
-
-        // BoringSSL expects wire‐format for ALPN: length‐prefixed string(s).
-        // For a single protocol "h2", that's [2, 'h', '2'].
-        var buf: [256]u8 = undefined;
-        buf[0] = @as(u8, @intCast(alpn_proto.len));
-        @memcpy(buf[1 .. 1 + alpn_proto.len], alpn_proto);
-
-        const total_len = 1 + alpn_proto.len; // length byte + protocol
-        const c_len: c_uint = @intCast(total_len);
-
-        const rc = boringssl.SSL_CTX_set_alpn_protos(
-            self.ctx,
-            &buf,
-            c_len,
-        );
-        if (rc != 0) {
-            return TlsError.InitFailed;
-        }
+        
+        // "h2" not found in client list
+        return boringssl.SSL_TLSEXT_ERR_NOACK;
     }
 
     /// Load server certificate and private key files (PEM) into the SSL_CTX.
