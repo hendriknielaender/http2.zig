@@ -1,13 +1,12 @@
+.DS_Store
+
 zig-out/
 .zig-cache/
 
-server_cert.pem
-server_key.pem
-client_cert.pem
-client_key.pem
+*.pem
+*.crt
+*.key
 
-dhparam.pem
+boringssl/
 
 server.log
-
-start.sh

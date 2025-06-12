@@ -129,13 +129,14 @@ pub const FrameHeader = struct {
         }
 
         const frame_type_value: u8 = buffer[3];
-        if (frame_type_value > @intFromEnum(FrameType.CONTINUATION)) {
+        if (frame_type_value > FRAME_TYPE_CONTINUATION) {
             log.err("Invalid frame_type_value: {}\n", .{frame_type_value});
             return error.InvalidEnumValue;
         }
 
-        const frame_type: FrameType = @enumFromInt(frame_type_value);
+        const frame_type: FrameType = frame_type_value;
         const flags = FrameFlags.init(buffer[4]);
+        log.debug("Frame flags value: 0x{x}, isPadded: {}, isEndHeaders: {}\n", .{ flags.value, flags.isPadded(), flags.isEndHeaders() });
 
         // Parse the 31-bit stream ID from the last four bytes
         const stream_id_raw = std.mem.readInt(u32, buffer[5..9], .big);
@@ -196,6 +197,7 @@ pub const Frame = struct {
     pub fn read(reader: anytype, allocator: *std.mem.Allocator) !Frame {
         const header = try FrameHeader.read(reader);
         log.debug("Read FrameHeader: {any}\n", .{header});
+        log.debug("Frame type: {d}, flags: 0x{x}, length: {d}, padded: {}\n", .{ header.frame_type, header.flags.value, header.length, header.flags.isPadded() });
 
         var payload_length = header.length;
         var padding_length: ?u8 = null;
@@ -205,8 +207,9 @@ pub const Frame = struct {
             if (padding_length.? >= payload_length) {
                 return error.InvalidPaddingLength;
             }
+            const original_payload_length = payload_length;
             payload_length -= @as(u32, padding_length.? + 1); // Subtract padding length
-            log.debug("Padding length: {}\n", .{padding_length.?});
+            log.debug("PADDED frame: original_length={d}, padding_length={d}, data_length={d}\n", .{ original_payload_length, padding_length.?, payload_length });
         }
 
         const payload = try allocator.alloc(u8, payload_length);

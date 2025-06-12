@@ -37,6 +37,10 @@ pub const Stream = struct {
     content_length: ?usize = null,
     total_data_received: usize = 0,
     request_complete: bool = false,
+    // Priority fields for HTTP/2 stream dependencies
+    stream_dependency: u32 = 0,
+    exclusive: bool = false,
+    weight: u16 = 16, // Default weight is 16 (represented as 15 in wire format)
 
     pub fn init(allocator: *std.mem.Allocator, conn: *Connection(std.io.AnyReader, std.io.AnyWriter), id: u32) !*Stream {
         const self = try allocator.create(Stream);
@@ -83,18 +87,7 @@ pub const Stream = struct {
     pub fn handleFrame(self: *Stream, frame: Frame) !void {
         log.debug("Handling frame type: {d}, stream ID: {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
 
-        // Check if the stream is closed
-        if (self.state == .Closed) {
-            // Only PRIORITY frames are allowed on closed streams
-            if (frame.header.frame_type != FrameTypes.FRAME_TYPE_PRIORITY) {
-                log.err("Received frame type {d} on closed stream {d}: STREAM_CLOSED\n", .{ frame.header.frame_type, self.id });
-
-                // Send GOAWAY with STREAM_CLOSED error code
-                try self.conn.send_goaway(self.conn.highest_stream_id(), 0x5, "Frame received on closed stream: STREAM_CLOSED");
-                self.conn.goaway_sent = true;
-                return error.StreamClosed;
-            }
-        }
+        // Closed stream handling is now done at the connection level before this function is called
 
         if (self.state == .HalfClosedRemote) {
             if (frame.header.frame_type != FrameTypes.FRAME_TYPE_WINDOW_UPDATE and
@@ -130,7 +123,7 @@ pub const Stream = struct {
                 try self.handleData(frame);
             },
             FrameTypes.FRAME_TYPE_WINDOW_UPDATE => try self.handleWindowUpdate(frame),
-            FrameTypes.FRAME_TYPE_RST_STREAM => try self.handleRstStream(),
+            FrameTypes.FRAME_TYPE_RST_STREAM => try self.handleRstStream(frame),
             FrameTypes.FRAME_TYPE_PRIORITY => {
                 log.debug("Handling PRIORITY frame\n", .{});
                 try self.handlePriorityFrame(frame);
@@ -142,6 +135,7 @@ pub const Stream = struct {
         }
 
         // After handling the frame, update the state based on the END_STREAM flag
+        // This only applies to incoming frames from the client, not outgoing server responses
         if (frame.header.flags.isEndStream()) {
             if (self.state == .Open) {
                 self.state = .HalfClosedRemote;
@@ -149,6 +143,7 @@ pub const Stream = struct {
             } else if (self.state == .HalfClosedLocal) {
                 self.state = .Closed;
                 log.debug("Stream {d}: Transitioned to Closed\n", .{self.id});
+                try self.conn.mark_stream_closed(self.id);
             }
         }
 
@@ -186,6 +181,7 @@ pub const Stream = struct {
             log.err("Stream {d} has a dependency on itself: PROTOCOL_ERROR\n", .{self.id});
             try self.sendRstStream(0x1); // PROTOCOL_ERROR
             self.state = .Closed;
+            try self.conn.mark_stream_closed(self.id);
             return error.ProtocolError;
         }
 
@@ -242,10 +238,16 @@ pub const Stream = struct {
                     return error.ProtocolError;
                 }
             },
-            .HalfClosedRemote, .HalfClosedLocal, .Closed => {
-                // Invalid to receive HEADERS frame; send RST_STREAM
-                log.err("HEADERS frame received in invalid state on stream {d}: STREAM_CLOSED\n", .{self.id});
+            .HalfClosedRemote, .HalfClosedLocal => {
+                // Invalid to receive HEADERS frame on half-closed streams
+                log.err("HEADERS frame received on half-closed stream {d}: STREAM_CLOSED\n", .{self.id});
                 try self.sendRstStream(0x5); // STREAM_CLOSED
+                return error.StreamClosed;
+            },
+            .Closed => {
+                // For closed streams, GOAWAY was already sent by the general check above
+                // Don't send additional RST_STREAM
+                log.err("HEADERS frame received on closed stream {d}: already handled by GOAWAY\n", .{self.id});
                 return error.StreamClosed;
             },
             .ReservedLocal, .ReservedRemote => {
@@ -256,8 +258,71 @@ pub const Stream = struct {
             },
         }
 
-        // Append the header block fragment
-        try self.header_block_fragments.appendSlice(frame.payload);
+        // Parse HEADERS frame payload considering PRIORITY and PADDED flags
+        var hpack_data = frame.payload;
+        log.debug("HEADERS frame payload ({d} bytes): {any}\n", .{ hpack_data.len, hpack_data });
+
+        // Handle PADDED flag: strip padding length byte and trailing padding
+        // RFC 7540 Section 6.1: PADDED frames include padding length as first byte
+        if (frame.header.flags.has(FrameFlags.PADDED)) {
+            if (hpack_data.len == 0) {
+                log.err("PADDED HEADERS frame has zero payload length: FRAME_SIZE_ERROR\n", .{});
+                try self.sendRstStream(0x6); // FRAME_SIZE_ERROR
+                return error.FrameSizeError;
+            }
+
+            const padding_length = hpack_data[0];
+            log.debug("HEADERS frame has padding length: {d}\n", .{padding_length});
+
+            // Ensure we have enough bytes for padding length + data + padding
+            if (1 + padding_length >= hpack_data.len) {
+                log.err("PADDED HEADERS frame has invalid padding length: FRAME_SIZE_ERROR\n", .{});
+                try self.sendRstStream(0x6); // FRAME_SIZE_ERROR
+                return error.FrameSizeError;
+            }
+
+            // Extract just the HPACK data (skip padding length byte and trailing padding)
+            const hpack_start = 1;
+            const hpack_end = hpack_data.len - padding_length;
+            hpack_data = hpack_data[hpack_start..hpack_end];
+            log.debug("After padding removal, HPACK data ({d} bytes): {any}\n", .{ hpack_data.len, hpack_data });
+        }
+
+        // Extract priority information from HEADERS frame when PRIORITY flag is set.
+        // RFC 7540 Section 6.2: PRIORITY flag adds 5 bytes before HPACK data.
+        if (frame.header.flags.has(FrameFlags.PRIORITY)) {
+            if (hpack_data.len < 5) {
+                log.err("HEADERS frame with PRIORITY flag has insufficient payload length: FRAME_SIZE_ERROR\n", .{});
+                try self.sendRstStream(0x6); // FRAME_SIZE_ERROR
+                return error.FrameSizeError;
+            }
+
+            // Extract priority information (5 bytes)
+            const stream_dependency_raw = std.mem.readInt(u32, hpack_data[0..4], .big);
+            const exclusive = (stream_dependency_raw & 0x80000000) != 0;
+            const stream_dependency = stream_dependency_raw & 0x7FFFFFFF;
+            const weight: u16 = @as(u16, hpack_data[4]) + 1; // Weight is 0-255, but represents 1-256
+
+            // Check for self-dependency which is a protocol error
+            if (stream_dependency == self.id) {
+                log.err("HEADERS frame with PRIORITY depends on itself (stream {d}): PROTOCOL_ERROR\n", .{self.id});
+                try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                return error.ProtocolError;
+            }
+
+            log.debug("HEADERS frame with PRIORITY: depends on stream {d} (exclusive: {}), weight: {d}\n", .{ stream_dependency, exclusive, weight });
+
+            // Store priority information (implementation-specific)
+            self.stream_dependency = stream_dependency;
+            self.exclusive = exclusive;
+            self.weight = weight;
+
+            // Skip priority information for HPACK processing
+            hpack_data = hpack_data[5..];
+        }
+
+        // Append the header block fragment (HPACK data only)
+        try self.header_block_fragments.appendSlice(hpack_data);
 
         if (frame.header.flags.isEndHeaders()) {
             // Attempt to decode the header block
@@ -278,6 +343,7 @@ pub const Stream = struct {
                 self.state = .HalfClosedRemote;
             } else if (self.state == .HalfClosedLocal) {
                 self.state = .Closed;
+                try self.conn.mark_stream_closed(self.id);
             }
             self.request_complete = true; // Set the flag
         }
@@ -330,12 +396,16 @@ pub const Stream = struct {
                 return error.CompressionError;
             };
 
-            // Copy the header name and value to new allocations
-            const header_copy = Hpack.HeaderField{
-                .name = try self.conn.allocator.dupe(u8, decoded_header.header.name),
-                .value = try self.conn.allocator.dupe(u8, decoded_header.header.value),
-            };
-            try self.headers.append(header_copy);
+            // Filter out empty headers from HPACK dynamic table size updates.
+            // Size updates return empty HeaderField which should not be added to headers list.
+            if (decoded_header.header.name.len > 0) {
+                // Copy the header name and value to new allocations
+                const header_copy = Hpack.HeaderField{
+                    .name = try self.conn.allocator.dupe(u8, decoded_header.header.name),
+                    .value = try self.conn.allocator.dupe(u8, decoded_header.header.value),
+                };
+                try self.headers.append(header_copy);
+            }
 
             // Now it's safe to deinitialize the decoded_header
             decoded_header.deinit();
@@ -362,6 +432,13 @@ pub const Stream = struct {
         var header_fields_after_pseudo = false;
 
         for (headers) |header| {
+            // Validate header name length to prevent buffer underflow attacks.
+            if (header.name.len == 0) {
+                log.err("Empty header name: PROTOCOL_ERROR\n", .{});
+                try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                return error.ProtocolError;
+            }
+
             if (header.name[0] == ':') {
                 if (header_fields_after_pseudo) {
                     // Pseudo-header fields must appear before regular header fields
@@ -541,6 +618,7 @@ pub const Stream = struct {
                 self.state = .HalfClosedRemote;
             } else if (self.state == .HalfClosedLocal) {
                 self.state = .Closed;
+                try self.conn.mark_stream_closed(self.id);
             }
             self.request_complete = true;
         }
@@ -562,6 +640,13 @@ pub const Stream = struct {
         const pay: *const [4]u8 = @ptrCast(frame.payload[0..4]);
         const increment = std.mem.readInt(u32, pay, .big);
 
+        // Check if increment is zero (RFC 7540 Section 6.9.1)
+        if (increment == 0) {
+            log.err("WINDOW_UPDATE received with increment 0 on stream {d}: PROTOCOL_ERROR\n", .{self.id});
+            try self.sendRstStream(0x1); // PROTOCOL_ERROR
+            return error.ProtocolError;
+        }
+
         // Ensure the increment does not exceed the u32 limit
         if (increment > 0x7FFFFFFF) {
             return error.FlowControlError;
@@ -573,16 +658,28 @@ pub const Stream = struct {
         }
     }
 
-    fn handleRstStream(self: *Stream) !void {
-        log.debug("Received RST_STREAM frame\n", .{});
+    fn handleRstStream(self: *Stream, frame: Frame) !void {
+        log.debug("Received RST_STREAM frame on stream {d}\n", .{self.id});
+
+        if (frame.payload.len != 4) {
+            log.err("RST_STREAM frame has invalid payload length: {d} (expected 4)\n", .{frame.payload.len});
+            return error.FrameSizeError;
+        }
 
         if (self.state == .Idle) {
             log.err("RST_STREAM received on idle stream {d}\n", .{self.id});
             return error.IdleStreamError;
         }
 
-        // Handle RST_STREAM frame
+        // Extract error code from RST_STREAM frame
+        const error_code = std.mem.readInt(u32, frame.payload[0..4], .big);
+        log.debug("RST_STREAM error code: {d}\n", .{error_code});
+
+        // RST_STREAM immediately transitions the stream to closed state
         self.state = .Closed;
+
+        // Immediately mark this stream as closed in the connection
+        try self.conn.mark_stream_closed(self.id);
     }
 
     /// Updates the send window size for the stream
@@ -623,6 +720,7 @@ pub const Stream = struct {
     /// Closes the stream gracefully
     pub fn close(self: *Stream) !void {
         self.state = .Closed;
+        try self.conn.mark_stream_closed(self.id);
         const frame = Frame{
             .header = FrameHeader{
                 .length = 0,
@@ -671,10 +769,10 @@ test "create and handle stream" {
             .reserved = false,
             .stream_id = 1,
         },
-        .payload = &[_]u8{ 0x82, 0x86, 0x44, 0x89 }, // Example header block
+        .payload = &[_]u8{ 0x82, 0x86, 0x84, 0x81 }, // Valid header block: :method GET, :scheme http, :path /, :authority
     };
     try stream.handleFrame(headers_frame);
-    try std.testing.expectEqual(@as(usize, 4), stream.recv_headers.items.len);
+    try std.testing.expectEqual(@as(usize, 4), stream.headers.items.len);
 
     const data = "Hello, world!";
     try stream.sendData(data, false);

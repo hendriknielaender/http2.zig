@@ -1,11 +1,12 @@
 .{
-    .name = "hello-world-example",
+    .name = .hello_world_example,
     .version = "0.0.1",
     .minimum_zig_version = "0.13.0",
+    .fingerprint = 0x2a7e8c2e74370be9,
 
     .dependencies = .{
         .http2 = .{
-            .path = "../../http2", // Path to the HTTP/2 library project
+            .path = "../..", // Path to the HTTP/2 library project root
         },
     },
 
