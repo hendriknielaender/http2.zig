@@ -537,7 +537,7 @@ pub const Hpack = struct {
         log.debug("Initial byte value: {any}, max_prefix_value: {any}, initial value: {any}, cursor: {any}\n", .{ encoded[0], max_prefix_value_u8, value, cursor });
 
         if (value < max_prefix_value) {
-            log.err("Decoded integer with value={any}, bytes_consumed={any}\n", .{ value, cursor });
+            log.debug("Decoded integer with value={any}, bytes_consumed={any}\n", .{ value, cursor });
             return DecodedInt{ .value = value, .bytes_consumed = cursor };
         }
 
@@ -779,26 +779,20 @@ test "HPACK encoding and decoding of :status and content-length using static tab
     defer buffer.deinit();
 
     // Debug output
-    std.debug.print("Encoding :status header...\n", .{});
 
     // Check if :status is in the static table
     if (Hpack.StaticTable.getStaticIndex(status_field.name, status_field.value)) |idx| {
-        std.debug.print(":status is found in static table at index {d}\n", .{idx});
         try Hpack.encodeInt(idx, 7, &buffer, 0x80); // Indexed Header Field (Section 6.1)
     } else {
-        std.debug.print(":status is not in static table, encoding as literal\n", .{});
         try Hpack.encodeHeaderField(status_field, &dynamic_table, &buffer);
     }
 
     // Debug output
-    std.debug.print("Encoding content-length header...\n", .{});
 
     // Check if content-length is in the static table
     if (Hpack.StaticTable.getStaticIndex(content_length_field.name, content_length_field.value)) |idx| {
-        std.debug.print("content-length is found in static table at index {d}\n", .{idx});
         try Hpack.encodeInt(idx, 7, &buffer, 0x80); // Indexed Header Field (Section 6.1)
     } else {
-        std.debug.print("content-length is not in static table, encoding as literal\n", .{});
         try Hpack.encodeHeaderField(content_length_field, &dynamic_table, &buffer);
     }
 
@@ -806,7 +800,6 @@ test "HPACK encoding and decoding of :status and content-length using static tab
     try std.testing.expect(buffer.items.len > 0);
 
     // Debug output
-    std.debug.print("Encoded buffer: {x}\n", .{buffer.items});
 
     // Decode the headers
     var decoded_headers = std.ArrayList(Hpack.DecodedHeader).init(allocator);
@@ -817,7 +810,6 @@ test "HPACK encoding and decoding of :status and content-length using static tab
 
     var cursor: usize = 0;
     while (cursor < buffer.items.len) {
-        std.debug.print("Decoding header at cursor position {d}\n", .{cursor});
         const decoded_header = try Hpack.decodeHeaderField(buffer.items[cursor..], &dynamic_table, &allocator);
         try decoded_headers.append(decoded_header);
         cursor += decoded_header.bytes_consumed;
@@ -834,5 +826,4 @@ test "HPACK encoding and decoding of :status and content-length using static tab
     try std.testing.expectEqualStrings("content-length", decoded_content_length.name);
     try std.testing.expectEqualStrings("13", decoded_content_length.value);
 
-    std.debug.print("Decoded headers match successfully.\n", .{});
 }

@@ -1,0 +1,152 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  ZIG_VERSION: "0.14.0"
+  CACHE_VERSION: "v1"
+
+jobs:
+  # Code quality checks
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache Zig artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: linux-zig-${{ env.CACHE_VERSION }}-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            linux-zig-${{ env.CACHE_VERSION }}-${{ env.ZIG_VERSION }}-
+
+      - name: Check code formatting
+        run: zig fmt --check src/ examples/
+
+      - name: Run linter (build check)
+        run: zig build -Drelease=false
+
+  # Unit tests on Linux
+  test:
+    name: Unit Tests
+    strategy:
+      matrix:
+        build-mode: [debug, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive  # For BoringSSL
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache Zig artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: linux-zig-${{ env.CACHE_VERSION }}-${{ env.ZIG_VERSION }}-${{ matrix.build-mode }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          restore-keys: |
+            linux-zig-${{ env.CACHE_VERSION }}-${{ env.ZIG_VERSION }}-${{ matrix.build-mode }}-
+
+      # Install dependencies
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      # Build BoringSSL
+      - name: Build BoringSSL
+        run: |
+          cd boringssl
+          mkdir -p build
+          cd build
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release ..
+          ninja
+
+      # Run tests
+      - name: Run unit tests (Debug)
+        if: matrix.build-mode == 'debug'
+        run: zig build test -Drelease=false --summary all
+
+      - name: Run unit tests (Release)
+        if: matrix.build-mode == 'release'
+        run: zig build test --summary all
+
+      - name: Build example
+        run: zig build
+
+      # Upload test results and coverage
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.build-mode }}
+          path: |
+            zig-out/
+            .zig-cache/
+          retention-days: 7
+
+
+  # Documentation generation
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Generate documentation
+        run: zig build docs
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        if: github.ref == 'refs/heads/main'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./zig-out/docs
+          force_orphan: true
+
+  # Notify on completion
+  notify:
+    name: Notify Status
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    if: always()
+    steps:
+      - name: Notify success
+        if: needs.lint.result == 'success' && needs.test.result == 'success'
+        run: echo "✅ All CI checks passed successfully!"
+
+      - name: Notify failure
+        if: needs.lint.result == 'failure' || needs.test.result == 'failure'
+        run: |
+          echo "❌ CI checks failed:"
+          echo "  Lint: ${{ needs.lint.result }}"
+          echo "  Test: ${{ needs.test.result }}"
+          exit 1

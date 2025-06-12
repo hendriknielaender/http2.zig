@@ -16,7 +16,11 @@ const minimum_zig_version = "0.14.0";
 pub fn build(b: *std.Build) void {
     // Standard target and optimization options
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{});
+    
+    // Default to ReleaseFast for best performance (no runtime safety, maximum speed optimization)
+    // Users can override with -Drelease=false to enable Debug mode for development
+    const release = b.option(bool, "release", "optimize for end users") orelse true;
+    const optimize = if (release) std.builtin.OptimizeMode.ReleaseFast else b.standardOptimizeOption(.{});
 
     const boringssl_include_path = b.path("boringssl/include");
     const boringssl_lib_path = b.path("boringssl/build");
@@ -98,6 +102,8 @@ fn add_test_suite(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) void {
+    const boringssl_include_path = b.path("boringssl/include");
+    const boringssl_lib_path = b.path("boringssl/build");
     // Unit tests for all modules
     const test_modules = [_][]const u8{
         "src/http2.zig",
@@ -107,7 +113,7 @@ fn add_test_suite(
         "src/hpack.zig",
     };
 
-    var all_tests_step = b.step("test", "Run all unit tests");
+    var all_tests_step = b.step("test", "Run all unit tests (use: zig build test --summary all)");
 
     for (test_modules) |module_path| {
         const module_test = b.addTest(.{
@@ -115,6 +121,19 @@ fn add_test_suite(
             .target = target,
             .optimize = optimize,
         });
+        
+        // Only add BoringSSL linking for modules that need TLS functionality
+        const needs_boringssl = std.mem.eql(u8, module_path, "src/http2.zig") or 
+                                std.mem.eql(u8, module_path, "src/connection.zig");
+        
+        if (needs_boringssl) {
+            module_test.linkLibC();
+            module_test.linkLibCpp();
+            module_test.addIncludePath(boringssl_include_path);
+            module_test.addLibraryPath(boringssl_lib_path);
+            module_test.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
+            module_test.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
+        }
 
         const run_test = b.addRunArtifact(module_test);
         all_tests_step.dependOn(&run_test.step);

@@ -1,0 +1,277 @@
+name: HTTP/2 Conformance Testing
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  ZIG_VERSION: "0.14.0"
+  H2SPEC_VERSION: "2.6.0"
+  SERVER_PORT: 9001
+  TIMEOUT_DURATION: 300  # 5 minutes
+
+jobs:
+  h2spec-conformance:
+    name: HTTP/2 Conformance Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        protocol: [tls, plaintext]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Cache Zig artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: ${{ runner.os }}-zig-h2spec-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build openssl curl jq
+
+      - name: Install h2spec
+        run: |
+          wget -q https://github.com/summerwind/h2spec/releases/download/v${{ env.H2SPEC_VERSION }}/h2spec_linux_amd64.tar.gz
+          tar -xzf h2spec_linux_amd64.tar.gz
+          sudo mv h2spec /usr/local/bin/
+          h2spec --version
+
+      - name: Build BoringSSL
+        run: |
+          cd boringssl
+          mkdir -p build
+          cd build
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release ..
+          ninja
+          cd ../..
+
+      - name: Generate test certificates
+        if: matrix.protocol == 'tls'
+        run: |
+          openssl req -x509 -newkey rsa:2048 -keyout examples/hello-world/server.key \
+            -out examples/hello-world/server.crt -days 365 -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+          # Copy to project root for compatibility
+          cp examples/hello-world/server.crt cert.pem
+          cp examples/hello-world/server.key key.pem
+
+      - name: Build HTTP/2 server
+        run: zig build
+
+      - name: Create server configuration
+        run: |
+          mkdir -p test-results
+          echo "Server will run on port ${{ env.SERVER_PORT }}"
+
+      # TLS-enabled server testing
+      - name: Start TLS HTTP/2 server (background)
+        if: matrix.protocol == 'tls'
+        run: |
+          cd examples/hello-world
+          timeout ${{ env.TIMEOUT_DURATION }} ../../zig-out/bin/hello_world_server > ../../test-results/server-tls.log 2>&1 &
+          echo $! > ../../test-results/server.pid
+          sleep 5  # Give server time to start
+          
+      - name: Wait for TLS server to be ready
+        if: matrix.protocol == 'tls'
+        run: |
+          for i in {1..30}; do
+            if curl -k -s --http2 https://localhost:${{ env.SERVER_PORT }} &>/dev/null; then
+              echo "TLS server is ready"
+              break
+            fi
+            echo "Waiting for TLS server... ($i/30)"
+            sleep 2
+          done
+
+      - name: Run h2spec tests (TLS)
+        if: matrix.protocol == 'tls'
+        continue-on-error: true
+        run: |
+          echo "Running h2spec conformance tests against TLS server..."
+          h2spec --host localhost --port ${{ env.SERVER_PORT }} --tls --insecure \
+            --timeout 30 --json > test-results/h2spec-tls-results.json
+          
+          # Also run in human-readable format
+          h2spec --host localhost --port ${{ env.SERVER_PORT }} --tls --insecure \
+            --timeout 30 > test-results/h2spec-tls-results.txt || true
+
+      # Plain HTTP/2 server testing (h2c)
+      - name: Start Plain HTTP/2 server (background)
+        if: matrix.protocol == 'plaintext'
+        run: |
+          # Note: This requires a plaintext HTTP/2 implementation
+          # For now, we'll skip this as the current implementation is TLS-only
+          echo "Plaintext HTTP/2 (h2c) testing skipped - TLS-only implementation"
+          exit 0
+
+      - name: Stop server
+        if: always() && matrix.protocol == 'tls'
+        run: |
+          if [ -f test-results/server.pid ]; then
+            PID=$(cat test-results/server.pid)
+            if ps -p $PID > /dev/null; then
+              kill $PID || true
+              sleep 2
+              kill -9 $PID || true
+            fi
+          fi
+          # Cleanup any remaining processes
+          pkill -f hello_world_server || true
+
+      - name: Parse test results
+        if: matrix.protocol == 'tls'
+        run: |
+          if [ -f test-results/h2spec-tls-results.json ]; then
+            echo "=== H2SPEC CONFORMANCE TEST RESULTS ==="
+            
+            # Extract summary statistics
+            TOTAL=$(jq '.tests | length' test-results/h2spec-tls-results.json)
+            PASSED=$(jq '[.tests[] | select(.result == "passed")] | length' test-results/h2spec-tls-results.json)
+            FAILED=$(jq '[.tests[] | select(.result == "failed")] | length' test-results/h2spec-tls-results.json)
+            SKIPPED=$(jq '[.tests[] | select(.result == "skipped")] | length' test-results/h2spec-tls-results.json)
+            
+            echo "Total Tests: $TOTAL"
+            echo "Passed: $PASSED"
+            echo "Failed: $FAILED" 
+            echo "Skipped: $SKIPPED"
+            echo ""
+            
+            # Show failed tests
+            if [ "$FAILED" -gt 0 ]; then
+              echo "=== FAILED TESTS ==="
+              jq -r '.tests[] | select(.result == "failed") | "❌ \(.section): \(.description)"' test-results/h2spec-tls-results.json
+              echo ""
+            fi
+            
+            # Calculate pass rate
+            if [ "$TOTAL" -gt 0 ]; then
+              PASS_RATE=$(echo "scale=2; $PASSED * 100 / $TOTAL" | bc -l)
+              echo "Pass Rate: ${PASS_RATE}%"
+              
+              # Set pass rate in environment for badge generation
+              echo "H2SPEC_PASS_RATE=${PASS_RATE}" >> $GITHUB_ENV
+              echo "H2SPEC_PASSED=${PASSED}" >> $GITHUB_ENV  
+              echo "H2SPEC_TOTAL=${TOTAL}" >> $GITHUB_ENV
+            fi
+          else
+            echo "No test results found"
+            exit 1
+          fi
+
+      - name: Generate conformance badge data
+        if: matrix.protocol == 'tls' && github.ref == 'refs/heads/main'
+        run: |
+          # Create badge data for shields.io
+          PASS_RATE=${H2SPEC_PASS_RATE:-0}
+          PASSED=${H2SPEC_PASSED:-0}
+          TOTAL=${H2SPEC_TOTAL:-0}
+          
+          # Determine badge color based on pass rate
+          if (( $(echo "$PASS_RATE >= 95" | bc -l) )); then
+            COLOR="brightgreen"
+          elif (( $(echo "$PASS_RATE >= 80" | bc -l) )); then
+            COLOR="green"
+          elif (( $(echo "$PASS_RATE >= 60" | bc -l) )); then
+            COLOR="yellow"
+          else
+            COLOR="red"
+          fi
+          
+          # Create badge JSON
+          cat > test-results/h2spec-badge.json << EOF
+          {
+            "schemaVersion": 1,
+            "label": "h2spec",
+            "message": "${PASSED}/${TOTAL} (${PASS_RATE}%)",
+            "color": "${COLOR}"
+          }
+          EOF
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h2spec-results-${{ matrix.protocol }}
+          path: |
+            test-results/
+          retention-days: 30
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-logs-${{ matrix.protocol }}
+          path: |
+            test-results/*.log
+          retention-days: 7
+
+      # Publish results to GitHub Pages (for main branch)
+      - name: Publish conformance results
+        if: matrix.protocol == 'tls' && github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: test-results
+          destination_dir: conformance
+          keep_files: true
+
+      - name: Comment PR with results
+        if: matrix.protocol == 'tls' && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = './test-results/h2spec-tls-results.json';
+            
+            if (fs.existsSync(path)) {
+              const results = JSON.parse(fs.readFileSync(path, 'utf8'));
+              const total = results.tests.length;
+              const passed = results.tests.filter(t => t.result === 'passed').length;
+              const failed = results.tests.filter(t => t.result === 'failed').length;
+              const passRate = ((passed / total) * 100).toFixed(1);
+              
+              let body = `## 🔍 HTTP/2 Conformance Test Results\n\n`;
+              body += `| Metric | Value |\n`;
+              body += `|--------|-------|\n`;
+              body += `| **Total Tests** | ${total} |\n`;
+              body += `| **Passed** | ✅ ${passed} |\n`;
+              body += `| **Failed** | ❌ ${failed} |\n`;
+              body += `| **Pass Rate** | ${passRate}% |\n\n`;
+              
+              if (failed > 0) {
+                body += `### ❌ Failed Tests\n\n`;
+                const failedTests = results.tests.filter(t => t.result === 'failed');
+                failedTests.slice(0, 10).forEach(test => {
+                  body += `- **${test.section}**: ${test.description}\n`;
+                });
+                if (failedTests.length > 10) {
+                  body += `\n... and ${failedTests.length - 10} more failures\n`;
+                }
+              }
+              
+              body += `\n📊 [View detailed results in the workflow artifacts](${context.payload.pull_request.html_url}/checks)`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            }
