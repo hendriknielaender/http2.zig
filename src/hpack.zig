@@ -825,5 +825,4 @@ test "HPACK encoding and decoding of :status and content-length using static tab
     const decoded_content_length = decoded_headers.items[1].header;
     try std.testing.expectEqualStrings("content-length", decoded_content_length.name);
     try std.testing.expectEqualStrings("13", decoded_content_length.value);
-
 }

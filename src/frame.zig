@@ -118,7 +118,6 @@ pub const FrameHeader = struct {
         var buffer: [9]u8 = undefined;
         _ = try reader.readAll(&buffer);
 
-
         // Parse the 24-bit length from the first three bytes
         const length: u32 = (@as(u32, buffer[0]) << 16) | (@as(u32, buffer[1]) << 8) | @as(u32, buffer[2]);
 
@@ -223,7 +222,6 @@ pub const Frame = struct {
         // Write the frame header first
         try self.header.write(writer);
 
-
         // Write the payload only if it's not empty
         if (self.payload.len > 0) {
             try writer.writeAll(self.payload[0..self.header.length]);
@@ -258,7 +256,6 @@ test "frame header read and write" {
 
     // Write to the buffer
     try header.write(&writer);
-
 
     // Recreate the FixedBufferStream to reset the read position
     stream = std.io.fixedBufferStream(&buffer);
@@ -300,7 +297,6 @@ test "frame read and write" {
 
     try frame.write(&writer);
 
-
     // Copy the data from buffer to read_buffer
     var read_buffer: [4096]u8 = undefined;
     for (buffer, 0..) |byte, i| {
@@ -314,7 +310,6 @@ test "frame read and write" {
     // Read the frame back from the buffer
     const read_frame = try Frame.read(&reader, &allocator);
 
-
     // Assert that the read frame matches the written frame
     assert(read_frame.header.length == frame.header.length);
     assert(read_frame.header.frame_type == frame.header.frame_type);
@@ -324,5 +319,4 @@ test "frame read and write" {
 
     // Compare payloads directly; should be the same
     assert(std.mem.eql(u8, read_frame.payload, frame.payload));
-
 }

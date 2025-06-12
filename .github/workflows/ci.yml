@@ -93,7 +93,12 @@ jobs:
         run: zig build test --summary all
 
       - name: Build example
+        if: matrix.build-mode == 'release'
         run: zig build
+
+      - name: Build example (Debug)
+        if: matrix.build-mode == 'debug'
+        run: zig build -Drelease=false
 
       # Upload test results and coverage
       - name: Upload test results

@@ -37,8 +37,10 @@ pub fn build(b: *std.Build) void {
     http2_lib.linkLibCpp();
     http2_lib.addIncludePath(boringssl_include_path);
     http2_lib.addLibraryPath(boringssl_lib_path);
-    http2_lib.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
-    http2_lib.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
+    
+    // Use LazyPath for BoringSSL libraries to avoid build-time path validation
+    http2_lib.addObjectFile(.{ .cwd_relative = "boringssl/build/ssl/libssl.a" });
+    http2_lib.addObjectFile(.{ .cwd_relative = "boringssl/build/crypto/libcrypto.a" });
 
     // Configure library
     b.installArtifact(http2_lib);
@@ -85,8 +87,8 @@ fn add_example_applications(
     hello_world_example.linkLibCpp();
     hello_world_example.addIncludePath(b.path("boringssl/include"));
     hello_world_example.addLibraryPath(b.path("boringssl/build"));
-    hello_world_example.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
-    hello_world_example.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
+    hello_world_example.addObjectFile(.{ .cwd_relative = "boringssl/build/ssl/libssl.a" });
+    hello_world_example.addObjectFile(.{ .cwd_relative = "boringssl/build/crypto/libcrypto.a" });
     b.installArtifact(hello_world_example);
 
     // Run step for hello world example
@@ -131,8 +133,8 @@ fn add_test_suite(
             module_test.linkLibCpp();
             module_test.addIncludePath(boringssl_include_path);
             module_test.addLibraryPath(boringssl_lib_path);
-            module_test.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
-            module_test.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
+            module_test.addObjectFile(.{ .cwd_relative = "boringssl/build/ssl/libssl.a" });
+            module_test.addObjectFile(.{ .cwd_relative = "boringssl/build/crypto/libcrypto.a" });
         }
 
         const run_test = b.addRunArtifact(module_test);
