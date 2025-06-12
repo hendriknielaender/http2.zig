@@ -11,13 +11,50 @@ env:
   CACHE_VERSION: "v1"
 
 jobs:
-  # Code quality checks
-  lint:
-    name: Code Quality
+  # Build BoringSSL once and cache it
+  build-boringssl:
+    name: Build BoringSSL
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache BoringSSL build
+        id: cache-boringssl
+        uses: actions/cache@v4
+        with:
+          path: boringssl/build
+          key: boringssl-${{ env.CACHE_VERSION }}-${{ hashFiles('boringssl/**/*', '!boringssl/build/**') }}
+          restore-keys: |
+            boringssl-${{ env.CACHE_VERSION }}-
+
+      - name: Install dependencies
+        if: steps.cache-boringssl.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Build BoringSSL
+        if: steps.cache-boringssl.outputs.cache-hit != 'true'
+        run: |
+          cd boringssl
+          mkdir -p build
+          cd build
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release ..
+          ninja
+
+  # Code quality checks
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    needs: build-boringssl
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
@@ -34,6 +71,14 @@ jobs:
           restore-keys: |
             linux-zig-${{ env.CACHE_VERSION }}-${{ env.ZIG_VERSION }}-
 
+      - name: Restore BoringSSL build
+        uses: actions/cache/restore@v4
+        with:
+          path: boringssl/build
+          key: boringssl-${{ env.CACHE_VERSION }}-${{ hashFiles('boringssl/**/*', '!boringssl/build/**') }}
+          restore-keys: |
+            boringssl-${{ env.CACHE_VERSION }}-
+
       - name: Check code formatting
         run: zig fmt --check src/ examples/
 
@@ -47,11 +92,12 @@ jobs:
       matrix:
         build-mode: [debug, release]
     runs-on: ubuntu-latest
+    needs: build-boringssl
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          submodules: recursive  # For BoringSSL
+          submodules: recursive
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
@@ -68,20 +114,13 @@ jobs:
           restore-keys: |
             linux-zig-${{ env.CACHE_VERSION }}-${{ env.ZIG_VERSION }}-${{ matrix.build-mode }}-
 
-      # Install dependencies
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build
-
-      # Build BoringSSL
-      - name: Build BoringSSL
-        run: |
-          cd boringssl
-          mkdir -p build
-          cd build
-          cmake -GNinja -DCMAKE_BUILD_TYPE=Release ..
-          ninja
+      - name: Restore BoringSSL build
+        uses: actions/cache/restore@v4
+        with:
+          path: boringssl/build
+          key: boringssl-${{ env.CACHE_VERSION }}-${{ hashFiles('boringssl/**/*', '!boringssl/build/**') }}
+          restore-keys: |
+            boringssl-${{ env.CACHE_VERSION }}-
 
       # Run tests
       - name: Run unit tests (Debug)
@@ -116,15 +155,26 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
+    needs: build-boringssl
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+
+      - name: Restore BoringSSL build
+        uses: actions/cache/restore@v4
+        with:
+          path: boringssl/build
+          key: boringssl-${{ env.CACHE_VERSION }}-${{ hashFiles('boringssl/**/*', '!boringssl/build/**') }}
+          restore-keys: |
+            boringssl-${{ env.CACHE_VERSION }}-
 
       - name: Generate documentation
         run: zig build docs

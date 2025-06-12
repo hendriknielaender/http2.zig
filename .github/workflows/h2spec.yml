@@ -13,9 +13,44 @@ env:
   TIMEOUT_DURATION: 300  # 5 minutes
 
 jobs:
+  # Build BoringSSL once and cache it
+  build-boringssl:
+    name: Build BoringSSL
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache BoringSSL build
+        id: cache-boringssl
+        uses: actions/cache@v4
+        with:
+          path: boringssl/build
+          key: boringssl-h2spec-${{ hashFiles('boringssl/**/*', '!boringssl/build/**') }}
+          restore-keys: |
+            boringssl-h2spec-
+
+      - name: Install dependencies
+        if: steps.cache-boringssl.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Build BoringSSL
+        if: steps.cache-boringssl.outputs.cache-hit != 'true'
+        run: |
+          cd boringssl
+          mkdir -p build
+          cd build
+          cmake -GNinja -DCMAKE_BUILD_TYPE=Release ..
+          ninja
+
   h2spec-conformance:
     name: HTTP/2 Conformance Tests
     runs-on: ubuntu-latest
+    needs: build-boringssl
     strategy:
       matrix:
         protocol: [tls, plaintext]
@@ -37,12 +72,20 @@ jobs:
           path: |
             ~/.cache/zig
             .zig-cache
-          key: ${{ runner.os }}-zig-h2spec-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+          key: linux-zig-h2spec-${{ env.ZIG_VERSION }}-${{ hashFiles('build.zig', 'build.zig.zon') }}
+
+      - name: Restore BoringSSL build
+        uses: actions/cache/restore@v4
+        with:
+          path: boringssl/build
+          key: boringssl-h2spec-${{ hashFiles('boringssl/**/*', '!boringssl/build/**') }}
+          restore-keys: |
+            boringssl-h2spec-
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build openssl curl jq
+          sudo apt-get install -y openssl curl jq bc
 
       - name: Install h2spec
         run: |
@@ -50,15 +93,6 @@ jobs:
           tar -xzf h2spec_linux_amd64.tar.gz
           sudo mv h2spec /usr/local/bin/
           h2spec --version
-
-      - name: Build BoringSSL
-        run: |
-          cd boringssl
-          mkdir -p build
-          cd build
-          cmake -GNinja -DCMAKE_BUILD_TYPE=Release ..
-          ninja
-          cd ../..
 
       - name: Generate test certificates
         if: matrix.protocol == 'tls'
