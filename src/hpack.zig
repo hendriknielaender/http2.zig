@@ -261,16 +261,16 @@ pub const Hpack = struct {
             try Hpack.encodeInt(idx, 7, buffer, prefix_value);
         } else {
             // Literal Header Field with Incremental Indexing (Section 6.2.1)
-            const prefix_value: u8 = 0x40; // '01' pattern in the first two bits
-            try buffer.append(prefix_value);
-
             // Check if name is in the static table
             const name_index = Hpack.StaticTable.getNameIndex(field.name);
             if (name_index) |idx| {
-                // Name is indexed
-                try Hpack.encodeInt(idx, 6, buffer, 0);
+                // Name is indexed - encode with 01 prefix pattern
+                const prefix_value: u8 = 0x40; // '01' pattern in the first two bits
+                try Hpack.encodeInt(idx, 6, buffer, prefix_value);
             } else {
                 // Name is a literal string
+                const prefix_value: u8 = 0x40; // '01' pattern in the first two bits
+                try buffer.append(prefix_value); // Index 0 for literal name
                 // Encode length and string
                 try Hpack.encodeString(field.name, buffer);
             }

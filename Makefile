@@ -6,72 +6,90 @@ SERVER_KEY_FILE=key.pem
 CLIENT_CERT_FILE=client_cert.pem
 CLIENT_KEY_FILE=client_key.pem
 DH_PARAMS_FILE=dhparam.pem
-PORT=4433
+PORT=9001
 LOG_FILE=server.log
 
 # Default target
-all: test
+all: build
 
-# Target to generate a self-signed certificate
+# Generate self-signed certificate for localhost
+cert: $(SERVER_CERT_FILE) $(SERVER_KEY_FILE)
+
 $(SERVER_CERT_FILE) $(SERVER_KEY_FILE):
-	openssl req -x509 -newkey rsa:4096 -keyout $(SERVER_KEY_FILE) -out $(SERVER_CERT_FILE) -days 365 -nodes \
-	-subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=www.example.com"
+	@echo "Generating self-signed certificate for localhost..."
+	@openssl req -x509 -newkey rsa:4096 -keyout $(SERVER_KEY_FILE) -out $(SERVER_CERT_FILE) \
+		-days 365 -nodes -subj "/CN=localhost" \
+		-addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+	@echo "Certificate generated: $(SERVER_CERT_FILE), $(SERVER_KEY_FILE)"
 
-# Target to generate a client certificate
+# Generate client certificate
 $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE):
 	openssl req -x509 -newkey rsa:4096 -keyout $(CLIENT_KEY_FILE) -out $(CLIENT_CERT_FILE) -days 365 -nodes \
 	-subj "/C=US/ST=Denial/L=Springfield/O=Dis/CN=client.example.com"
 
-# Target to generate DH parameters
+# Generate DH parameters
 $(DH_PARAMS_FILE):
 	openssl dhparam -out $(DH_PARAMS_FILE) 2048
 
-# Target to start the OpenSSL server in the background
-start_server: $(SERVER_CERT_FILE) $(SERVER_KEY_FILE) $(DH_PARAMS_FILE)
-	@echo "Starting OpenSSL server..."
-	@openssl s_server -accept $(PORT) -cert $(SERVER_CERT_FILE) -key $(SERVER_KEY_FILE) -CAfile $(SERVER_CERT_FILE) -dhparam $(DH_PARAMS_FILE) -cipher "AES128-GCM-SHA256" -Verify 1 -www -debug > $(LOG_FILE) 2>&1 &
-	@sleep 2 # Wait a moment for the server to start
+# Build the HTTP/2 library and examples
+build:
+	@echo "Building HTTP/2 library and examples..."
+	@$(ZIG) build
 
-# Target to stop the OpenSSL server
-stop_server:
-	@echo "Stopping OpenSSL server..."
-	@pkill -f "openssl s_server"
-	@sleep 2 # Ensure the server has stopped
+# Run the TLS HTTP/2 server
+run: cert build
+	@echo "Starting HTTP/2 TLS server on https://localhost:$(PORT)"
+	@./zig-out/bin/hello_world_server
 
-# Target to run Zig tests
-test: $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE) start_server
-	@echo "Running Zig tests..."
-	zig test http2/tls.zig -I./boringssl/include -L./boringssl/build/ssl -L./boringssl/build/crypto -lssl -lcrypto -lc++
-	$(MAKE) stop_server
-	@echo "Checking OpenSSL server log..."
-	@cat $(LOG_FILE)
+# Test with h2spec
+test-h2spec: cert build
+	@echo "Running h2spec tests against TLS server..."
+	@./zig-out/bin/hello_world_server &
+	@SERVER_PID=$$!; \
+	sleep 2; \
+	h2spec -h localhost -p $(PORT) -t -k || true; \
+	kill $$SERVER_PID 2>/dev/null || true
 
-# Target to clean up generated files
+# Run unit tests
+test: build
+	@echo "Running unit tests..."
+	@$(ZIG) build test
+
+# Test TLS module specifically
+test-tls: build-boringssl
+	@echo "Testing TLS module..."
+	@$(ZIG) test src/tls.zig -I./boringssl/include -L./boringssl/build/ssl -L./boringssl/build/crypto -lssl -lcrypto -lc++
+
+# Format code
+fmt:
+	@echo "Formatting code..."
+	@$(ZIG) fmt src/ examples/
+
+# Clean generated files
 clean:
-	rm -f $(SERVER_CERT_FILE) $(SERVER_KEY_FILE) $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE) $(DH_PARAMS_FILE) $(LOG_FILE)
+	@echo "Cleaning generated files..."
+	@rm -f $(SERVER_CERT_FILE) $(SERVER_KEY_FILE) $(CLIENT_CERT_FILE) $(CLIENT_KEY_FILE) $(DH_PARAMS_FILE) $(LOG_FILE)
+	@rm -rf zig-out/
+	@echo "Clean complete"
 
-.PHONY: all start_server test clean stop_server
-
+# Initialize git submodules
 update:
 	git submodule update --init --recursive
 
-test-tls:
-	zig test http2/tls.zig -I./boringssl/include -L./boringssl/build/ssl -L./boringssl/build/crypto -lssl -lcrypto -lc++
-
-build:
-	$(ZIG) build -freference-trace
-
+# Build BoringSSL library
 build-boringssl:
-	cd boringssl && cmake -DCMAKE_BUILD_TYPE=Release -B build && make -C build
+	@echo "Building BoringSSL..."
+	@cd boringssl && cmake -DCMAKE_BUILD_TYPE=Release -B build && make -C build
 
+# Build BoringSSL unoptimized
 build-boringssl-unoptimized:
-	cd boringssl && cmake -B build && make -C build
+	@echo "Building BoringSSL (unoptimized)..."
+	@cd boringssl && cmake -B build && make -C build
 
-create-bindings:
-	zig translate-c -I boringssl/include boringssl/include/openssl/ssl.h > http2/boringssl/boringssl-bindings.zig
+# Create BoringSSL bindings
+create-bindings: build-boringssl
+	@echo "Creating BoringSSL bindings..."
+	@mkdir -p boringssl
+	@$(ZIG) translate-c -I boringssl/include boringssl/include/openssl/ssl.h > src/bindings/boringssl-bindings.zig
 
-build-lib:
-	$(ZIG) build-lib http2/connection.zig -lc -Iboringssl/include
-
-init-export:
-	export LDFLAGS="-L/usr/local/opt/zlib/lib"
+.PHONY: all build run test test-h2spec test-tls fmt clean cert update build-boringssl build-boringssl-unoptimized create-bindings

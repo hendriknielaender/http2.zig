@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const http2_module = b.addModule("http2", .{
-        .root_source_file = b.path("../../http2/connection.zig"),
+        .root_source_file = b.path("../../src/http2.zig"),
     });
 
     const exe = b.addExecutable(.{
@@ -16,11 +16,6 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.linkLibC();
-    exe.linkSystemLibrary("ssl");
-    exe.linkSystemLibrary("crypto");
-
-    exe.addIncludePath(b.path("../../boringssl/include/openssl"));
-    exe.addLibraryPath(b.path("../../boringssl/build"));
 
     exe.root_module.addImport("http2", http2_module);
 

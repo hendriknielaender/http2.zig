@@ -11,7 +11,7 @@ pub const Hpack = @import("hpack.zig").Hpack;
 const log = std.log.scoped(.connection);
 const assert = std.debug.assert;
 
-const http2_preface: []const u8 = "\x50\x52\x49\x20\x2A\x20\x48\x54\x54\x50\x2F\x32\x2E\x30\x0D\x0A\x0D\x0A\x53\x4D\x0D\x0A\x0D\x0A";
+const http2_preface: []const u8 = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
     return struct {
@@ -28,6 +28,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         expecting_continuation_stream_id: ?u32 = null,
         last_stream_id: u32 = 0,
         client_settings_received: bool = false,
+        closed_stream_ids: std.AutoHashMap(u32, void),
 
         pub fn init(allocator: *std.mem.Allocator, reader: ReaderType, writer: WriterType, comptime is_server: bool) !@This() {
             var self = @This(){
@@ -39,6 +40,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 .send_window_size = 65535,
                 .streams = std.AutoHashMap(u32, *Stream).init(allocator.*),
                 .hpack_dynamic_table = try Hpack.DynamicTable.init(allocator, 4096),
+                .closed_stream_ids = std.AutoHashMap(u32, void).init(allocator.*),
             };
 
             if (is_server) {
@@ -52,11 +54,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         fn check_server_preface(self: *@This()) !void {
-            const preface_len = 24;
+            const preface_len = http2_preface.len;
             var preface_buf: [preface_len]u8 = undefined;
             _ = try self.reader.readAll(&preface_buf);
 
             if (!std.mem.eql(u8, &preface_buf, http2_preface)) {
+                log.err("Invalid preface received. Expected: {any}, Got: {any}\n", .{ http2_preface, preface_buf });
                 try self.send_goaway(0, 0x1, "Invalid preface: PROTOCOL_ERROR");
                 return error.InvalidPreface;
             }
@@ -70,9 +73,17 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 entry.value_ptr.*.deinit();
             }
             @constCast(&self.streams).deinit();
+            @constCast(&self.closed_stream_ids).deinit();
 
             self.hpack_dynamic_table.table.deinit();
             log.debug("Resources deinitialized for connection\n", .{});
+        }
+
+        /// Mark a stream as closed and track it in the closed set
+        /// Note: The stream will be cleaned up later by process_pending_streams
+        pub fn mark_stream_closed(self: *@This(), stream_id: u32) !void {
+            try self.closed_stream_ids.put(stream_id, {});
+            log.debug("Marked stream {d} as closed\n", .{stream_id});
         }
 
         fn send_preface(self: @This()) !void {
@@ -136,13 +147,20 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
                 // Classify frame based on stream_id
                 if (frame.header.stream_id == 0) {
-                    try handle_connection_level_frame(self, frame);
+                    handle_connection_level_frame(self, frame) catch |err| {
+                        log.err("Error handling connection-level frame in phase 1: {s}\n", .{@errorName(err)});
+                        if (!self.goaway_sent) {
+                            try self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error");
+                            self.goaway_sent = true;
+                        }
+                        // Continue processing frames instead of returning error immediately
+                    };
                 } else {
                     try handle_stream_level_frame(self, frame);
                 }
 
-                // Check if SETTINGS frame with ACK flag was received (if client is acknowledging server's SETTINGS)
-                if (frame.header.frame_type == FrameTypes.FRAME_TYPE_SETTINGS and (frame.header.flags.value & FrameFlags.ACK) != 0) {
+                // Check if SETTINGS frame without ACK flag was received (client's initial SETTINGS)
+                if (frame.header.frame_type == FrameTypes.FRAME_TYPE_SETTINGS and (frame.header.flags.value & FrameFlags.ACK) == 0) {
                     self.client_settings_received = true;
                 }
             }
@@ -174,14 +192,20 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
                 log.debug("Received frame of type: {d}, stream ID: {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
 
-                const is_conn_level = is_connection_level_frame(frame.header.frame_type);
+                // Classify frame routing: connection-level vs stream-level.
+                // WINDOW_UPDATE can be either depending on stream_id value.
+                const is_conn_level = is_connection_level_frame(frame.header.frame_type) or
+                    (frame.header.frame_type == FrameTypes.FRAME_TYPE_WINDOW_UPDATE and frame.header.stream_id == 0);
 
                 if (is_conn_level) {
                     handle_connection_level_frame(self, frame) catch |err| {
-                        // **Send GOAWAY on error and close the connection**
+                        // **Send GOAWAY on error but continue processing**
                         log.err("Error handling connection-level frame: {s}\n", .{@errorName(err)});
-                        try self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error");
-                        return err;
+                        if (!self.goaway_sent) {
+                            try self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error");
+                            self.goaway_sent = true;
+                        }
+                        // Continue processing frames instead of returning error immediately
                     };
                 } else {
                     if (self.goaway_received and frame.header.stream_id > self.last_stream_id) {
@@ -255,6 +279,25 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 try self.send_goaway(self.last_stream_id, 0x1, "Client sent PUSH_PROMISE: PROTOCOL_ERROR");
                 self.goaway_sent = true;
                 return error.ProtocolError;
+            }
+
+            // Check if this is a frame sent to a closed stream
+            if (self.closed_stream_ids.contains(frame.header.stream_id)) {
+                // Only PRIORITY and RST_STREAM frames are allowed on closed streams (RFC 7540 Section 5.1)
+                if (frame.header.frame_type != FrameTypes.FRAME_TYPE_PRIORITY and
+                    frame.header.frame_type != FrameTypes.FRAME_TYPE_RST_STREAM)
+                {
+                    log.err("Received frame type {d} on closed stream {d}: STREAM_CLOSED\n", .{ frame.header.frame_type, frame.header.stream_id });
+
+                    // Send GOAWAY with STREAM_CLOSED error code (RFC 7540 Section 5.1)
+                    try self.send_goaway(self.highest_stream_id(), 0x5, "Frame received on closed stream: STREAM_CLOSED");
+                    self.goaway_sent = true;
+                    return error.StreamClosed;
+                }
+
+                // For PRIORITY and RST_STREAM on closed streams, just ignore
+                log.debug("Ignoring frame type {d} on closed stream {d}\n", .{ frame.header.frame_type, frame.header.stream_id });
+                return;
             }
 
             // Retrieve the corresponding stream
@@ -347,9 +390,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 }
             }
 
-            // Remove the closed streams from the map
+            // Remove the closed streams from the map and track them as closed
             for (to_remove.items) |stream_id| {
                 _ = self.streams.remove(stream_id);
+                try self.closed_stream_ids.put(stream_id, {});
+                log.debug("Marked stream {d} as closed\n", .{stream_id});
             }
         }
 
@@ -360,8 +405,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 return;
             }
 
-            // Validate that connection-level frames have stream ID 0
-            if (frame.header.stream_id != 0) {
+            // Enforce stream_id == 0 for true connection-level frames.
+            // WINDOW_UPDATE frames reach here only when stream_id == 0 due to routing logic.
+            if (frame.header.stream_id != 0 and frame.header.frame_type != FrameTypes.FRAME_TYPE_WINDOW_UPDATE) {
                 log.err("Received {d} frame with non-zero stream ID {d}: PROTOCOL_ERROR\n", .{ frame.header.frame_type, frame.header.stream_id });
                 try self.send_goaway(self.last_stream_id, 0x1, "Frame with invalid stream ID: PROTOCOL_ERROR");
                 return error.ProtocolError;
@@ -395,9 +441,24 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         }
 
         fn handle_ping_frame(self: *@This(), frame: Frame) !void {
+            // PING frames must have stream identifier 0x0
+            if (frame.header.stream_id != 0) {
+                log.err("PING frame with non-zero stream identifier {d}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
+                if (!self.goaway_sent) {
+                    try self.send_goaway(0, 0x1, "PING frame with non-zero stream identifier: PROTOCOL_ERROR");
+                    self.goaway_sent = true;
+                }
+                return; // Don't return error to avoid duplicate GOAWAY
+            }
+
+            // PING frame payload must be exactly 8 bytes
             if (frame.payload.len != 8) {
-                log.debug("Invalid PING frame size, expected 8 bytes.\n", .{});
-                return error.InvalidPingPayloadSize;
+                log.err("PING frame with invalid payload length {d} (expected 8): FRAME_SIZE_ERROR\n", .{frame.payload.len});
+                if (!self.goaway_sent) {
+                    try self.send_goaway(0, 0x6, "PING frame with invalid payload length: FRAME_SIZE_ERROR");
+                    self.goaway_sent = true;
+                }
+                return; // Don't return error to avoid duplicate GOAWAY
             }
 
             // Only respond if ACK flag is not set
@@ -519,11 +580,13 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             if (stream.state == .Open) {
                 stream.state = .HalfClosedLocal;
             } else if (stream.state == .HalfClosedRemote) {
-                stream.state = .Closed;
+                // Keep stream in HalfClosedRemote state to allow RST_STREAM frames
+                // Stream will transition to Closed when explicitly reset or connection closes
+                log.debug("Stream {d}: Keeping in HalfClosedRemote state after response\n", .{stream.id});
             }
         }
 
-        pub fn send_settings(self: @This()) !void {
+        pub fn send_settings(self: *@This()) !void {
             const settings = [_][2]u32{
                 .{ 1, self.settings.header_table_size }, // HEADER_TABLE_SIZE
                 .{ 3, self.settings.max_concurrent_streams }, // MAX_CONCURRENT_STREAMS
@@ -582,7 +645,8 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             // Validate the length against the max_frame_size
             if (length > self.settings.max_frame_size) {
                 log.err("Received frame size {d} exceeds SETTINGS_MAX_FRAME_SIZE {d}, sending GOAWAY\n", .{ length, self.settings.max_frame_size });
-                return error.FrameSizeError; // Send FRAME_SIZE_ERROR and close the connection
+                try self.send_goaway(self.highest_stream_id(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
+                return error.FrameSizeError;
             }
 
             const frame_type: u8 = header_buf[3];
@@ -630,13 +694,21 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             if (frame.header.stream_id != 0) {
                 log.err("SETTINGS frame received on a non-zero stream ID: {any}\n", .{frame.header.stream_id});
-                return error.InvalidStreamId;
+                if (!self.goaway_sent) {
+                    try self.send_goaway(0, 0x1, "SETTINGS frame with non-zero stream ID: PROTOCOL_ERROR");
+                    self.goaway_sent = true;
+                }
+                return; // Don't return error to avoid duplicate GOAWAY
             }
 
             if ((frame.header.flags.value & FrameFlags.ACK) != 0) {
                 if (frame.payload.len != 0) {
                     log.err("SETTINGS frame with ACK flag and non-zero payload length\n", .{});
-                    return error.FrameSizeError;
+                    if (!self.goaway_sent) {
+                        try self.send_goaway(0, 0x6, "SETTINGS ACK with payload: FRAME_SIZE_ERROR");
+                        self.goaway_sent = true;
+                    }
+                    return; // Don't return error to avoid duplicate GOAWAY
                 }
                 // Do not apply settings when ACK flag is set
                 log.debug("Received SETTINGS ACK, no settings to apply.\n", .{});
@@ -645,7 +717,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
             if (frame.payload.len % 6 != 0) {
                 log.err("Invalid SETTINGS frame size: {any}\n", .{frame.payload.len});
-                return error.InvalidSettingsFrameSize;
+                if (!self.goaway_sent) {
+                    try self.send_goaway(0, 0x6, "Invalid SETTINGS frame size: FRAME_SIZE_ERROR");
+                    self.goaway_sent = true;
+                }
+                return; // Don't return error to avoid duplicate GOAWAY
             }
 
             const buffer = frame.payload;
@@ -663,6 +739,9 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
                 log.debug("Setting ID: {d}, Value: {d}\n", .{ id, value });
 
+                // Per RFC 7540: "the value of a SETTINGS parameter is the last value that is seen by a receiver"
+                // Duplicate parameters are allowed and processed in order
+
                 switch (id) {
                     1 => { // SETTINGS_HEADER_TABLE_SIZE
                         self.settings.header_table_size = value;
@@ -671,7 +750,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     },
                     2 => { // SETTINGS_ENABLE_PUSH
                         if (value != 0 and value != 1) {
-                            return error.ProtocolError; // Invalid value for ENABLE_PUSH
+                            log.err("Invalid SETTINGS_ENABLE_PUSH value {d}: PROTOCOL_ERROR\n", .{value});
+                            if (!self.goaway_sent) {
+                                try self.send_goaway(0, 0x1, "Invalid SETTINGS_ENABLE_PUSH value: PROTOCOL_ERROR");
+                                self.goaway_sent = true;
+                            }
+                            return; // Don't return error to avoid duplicate GOAWAY
                         }
                         self.settings.enable_push = (value == 1);
                         log.debug("Updated SETTINGS_ENABLE_PUSH to {any}\n", .{self.settings.enable_push});
@@ -682,7 +766,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     },
                     4 => { // SETTINGS_INITIAL_WINDOW_SIZE
                         if (value > 2147483647) {
-                            return error.FlowControlError; // Initial window size too large
+                            log.err("SETTINGS_INITIAL_WINDOW_SIZE too large {d}: FLOW_CONTROL_ERROR\n", .{value});
+                            if (!self.goaway_sent) {
+                                try self.send_goaway(0, 0x3, "SETTINGS_INITIAL_WINDOW_SIZE too large: FLOW_CONTROL_ERROR");
+                                self.goaway_sent = true;
+                            }
+                            return; // Don't return error to avoid duplicate GOAWAY
                         }
 
                         const old_initial_window_size = self.settings.initial_window_size;
@@ -699,13 +788,23 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                             stream.recv_window_size += delta;
                             if (stream.recv_window_size > 2147483647 or stream.recv_window_size < 0) {
                                 // The value MUST be treated as a connection error of type FLOW_CONTROL_ERROR.
-                                return error.FlowControlError;
+                                log.err("Stream window size overflow on stream {d}: FLOW_CONTROL_ERROR\n", .{stream.id});
+                                if (!self.goaway_sent) {
+                                    try self.send_goaway(0, 0x3, "Stream window size overflow: FLOW_CONTROL_ERROR");
+                                    self.goaway_sent = true;
+                                }
+                                return; // Don't return error to avoid duplicate GOAWAY
                             }
                         }
                     },
                     5 => { // SETTINGS_MAX_FRAME_SIZE
                         if (value < 16384 or value > 16777215) {
-                            return error.ProtocolError; // Invalid MAX_FRAME_SIZE
+                            log.err("Invalid SETTINGS_MAX_FRAME_SIZE value {d}: PROTOCOL_ERROR\n", .{value});
+                            if (!self.goaway_sent) {
+                                try self.send_goaway(0, 0x1, "Invalid SETTINGS_MAX_FRAME_SIZE value: PROTOCOL_ERROR");
+                                self.goaway_sent = true;
+                            }
+                            return; // Don't return error to avoid duplicate GOAWAY
                         }
                         self.settings.max_frame_size = value;
                         log.debug("Updated SETTINGS_MAX_FRAME_SIZE to {d}\n", .{value});
@@ -726,7 +825,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             log.debug("Settings applied successfully.\n", .{});
         }
 
-        pub fn send_settings_ack(self: @This()) !void {
+        pub fn send_settings_ack(self: *@This()) !void {
             if (self.goaway_sent) return;
 
             var frame_header = FrameHeader{
@@ -891,8 +990,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             const ov = @addWithOverflow(self.send_window_size, increment);
             if (ov[0] > 2147483647 or ov[0] < 0) {
                 log.err("Flow control window overflow detected. Sending GOAWAY with FLOW_CONTROL_ERROR.\n", .{});
-                try self.send_goaway(self.highest_stream_id(), 0x3, "Flow control window exceeded limits: FLOW_CONTROL_ERROR");
-                return error.FlowControlError;
+                if (!self.goaway_sent) {
+                    try self.send_goaway(self.highest_stream_id(), 0x3, "Flow control window exceeded limits: FLOW_CONTROL_ERROR");
+                    self.goaway_sent = true;
+                }
+                return error.FlowControlError; // Still return error since this is a helper function
             }
             self.send_window_size = ov[0];
         }
@@ -901,8 +1003,11 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             const ov = @addWithOverflow(self.recv_window_size, delta);
             if (ov[0] > 2147483647 or ov[0] < 0) {
                 log.err("Receive window overflow detected. Sending GOAWAY with FLOW_CONTROL_ERROR.\n", .{});
-                try self.send_goaway(self.highest_stream_id(), 0x3, "Receive window exceeded limits: FLOW_CONTROL_ERROR");
-                return error.FlowControlError;
+                if (!self.goaway_sent) {
+                    try self.send_goaway(self.highest_stream_id(), 0x3, "Receive window exceeded limits: FLOW_CONTROL_ERROR");
+                    self.goaway_sent = true;
+                }
+                return error.FlowControlError; // Still return error since this is a helper function
             }
             self.recv_window_size = ov[0];
         }
@@ -925,7 +1030,12 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
         pub fn handle_window_update(self: *@This(), frame: Frame) !void {
             if (frame.payload.len != 4) {
-                return error.InvalidFrameSize;
+                log.err("WINDOW_UPDATE frame with invalid payload length {d} (expected 4): FRAME_SIZE_ERROR\n", .{frame.payload.len});
+                if (!self.goaway_sent) {
+                    try self.send_goaway(self.highest_stream_id(), 0x6, "WINDOW_UPDATE frame with invalid payload length: FRAME_SIZE_ERROR");
+                    self.goaway_sent = true;
+                }
+                return; // Don't return error to avoid duplicate GOAWAY
             }
 
             const increment = std.mem.readInt(u32, frame.payload[0..4], .big);
@@ -933,22 +1043,47 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             // **Check if increment is zero**
             if (increment == 0) {
                 log.err("Received WINDOW_UPDATE with increment 0, sending GOAWAY: PROTOCOL_ERROR.\n", .{});
-                try self.send_goaway(self.highest_stream_id(), 0x1, "WINDOW_UPDATE with increment 0: PROTOCOL_ERROR");
-                return error.ProtocolError;
+                if (!self.goaway_sent) {
+                    try self.send_goaway(self.highest_stream_id(), 0x1, "WINDOW_UPDATE with increment 0: PROTOCOL_ERROR");
+                    self.goaway_sent = true;
+                }
+                return; // Don't return error to avoid duplicate GOAWAY
             }
 
             if (increment > 0x7FFFFFFF) { // Maximum allowed value
                 log.err("Received WINDOW_UPDATE with increment exceeding maximum value, sending GOAWAY: FLOW_CONTROL_ERROR.\n", .{});
-                try self.send_goaway(self.highest_stream_id(), 0x3, "WINDOW_UPDATE increment too large: FLOW_CONTROL_ERROR");
-                return error.FlowControlError;
+                if (!self.goaway_sent) {
+                    try self.send_goaway(self.highest_stream_id(), 0x3, "WINDOW_UPDATE increment too large: FLOW_CONTROL_ERROR");
+                    self.goaway_sent = true;
+                }
+                return; // Don't return error to avoid duplicate GOAWAY
             }
 
             if (frame.header.stream_id == 0) {
-                try self.update_send_window(@intCast(increment));
+                self.update_send_window(@intCast(increment)) catch |err| {
+                    if (err == error.FlowControlError) {
+                        // GOAWAY already sent by update_send_window
+                        return;
+                    }
+                    return err;
+                };
             } else {
                 // Forward to the appropriate stream for handling
-                var stream = try self.get_stream(frame.header.stream_id);
-                try stream.updateSendWindow(@intCast(increment));
+                var stream = self.get_stream(frame.header.stream_id) catch {
+                    // get_stream may send GOAWAY, so just return
+                    return;
+                };
+                stream.updateSendWindow(@intCast(increment)) catch |err| {
+                    if (err == error.FlowControlError) {
+                        // Send GOAWAY for stream-level flow control error
+                        if (!self.goaway_sent) {
+                            try self.send_goaway(self.highest_stream_id(), 0x3, "Stream flow control error: FLOW_CONTROL_ERROR");
+                            self.goaway_sent = true;
+                        }
+                        return;
+                    }
+                    return err;
+                };
             }
         }
 
@@ -994,10 +1129,11 @@ const Settings = struct {
     }
 };
 
-/// Determines if a frame type is connection-level.
+/// Determines if a frame type is always connection-level (stream ID must be 0).
+/// Note: WINDOW_UPDATE can be both connection-level and stream-level depending on stream ID.
 fn is_connection_level_frame(frame_type: u8) bool {
     return switch (frame_type) {
-        FrameTypes.FRAME_TYPE_SETTINGS, FrameTypes.FRAME_TYPE_PING, FrameTypes.FRAME_TYPE_GOAWAY, FrameTypes.FRAME_TYPE_WINDOW_UPDATE => true,
+        FrameTypes.FRAME_TYPE_SETTINGS, FrameTypes.FRAME_TYPE_PING, FrameTypes.FRAME_TYPE_GOAWAY => true,
         else => false,
     };
 }
@@ -1046,7 +1182,7 @@ test "HTTP/2 connection initialization and flow control" {
 
     const ConnectionType = Connection(@TypeOf(reader), @TypeOf(writer));
     var allocator = arena.allocator();
-    var connection = try ConnectionType.init(&allocator, reader, writer, false);
+    var connection = try ConnectionType.init(&allocator, reader, writer, false); // Use client mode to avoid preface reading
 
     // Initialize stream
     var stream = try Stream.init(&allocator, &connection, 1);
@@ -1054,16 +1190,18 @@ test "HTTP/2 connection initialization and flow control" {
     const preface_written_data = buffer_stream.getWritten();
     std.debug.print("Preface written data length: {d}\n", .{preface_written_data.len});
 
-    // Encode headers using Hpack.encodeHeaderField
-    const response_headers = [_]Hpack.HeaderField{
-        .{ .name = ":status", .value = "200" },
-        .{ .name = "content-length", .value = "13" },
+    // Encode headers using Hpack.encodeHeaderField (request headers for client)
+    const request_headers = [_]Hpack.HeaderField{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = ":path", .value = "/" },
+        .{ .name = ":scheme", .value = "http" },
+        .{ .name = ":authority", .value = "example.com" },
     };
 
     var encoded_headers = std.ArrayList(u8).init(allocator);
     defer encoded_headers.deinit();
 
-    for (response_headers) |header| {
+    for (request_headers) |header| {
         try Hpack.encodeHeaderField(header, &connection.hpack_dynamic_table, &encoded_headers);
     }
 
@@ -1211,8 +1349,8 @@ test "send HEADERS and DATA frames with proper flow" {
 
     var stream = try Stream.init(&allocator, &connection, 1);
 
-    // Send a HEADERS frame
-    const headers_payload: [16]u8 = undefined;
+    // Send a HEADERS frame with valid header block
+    const headers_payload = [_]u8{ 0x82, 0x86, 0x84, 0x81 }; // :method GET, :scheme http, :path /, :authority
     const headers_frame = Frame{
         .header = FrameHeader{
             .length = headers_payload.len,
@@ -1257,11 +1395,15 @@ test "send RST_STREAM frame with correct frame_type" {
 
     var stream = try Stream.init(&allocator, &connection, 1);
 
+    // Get initial buffer position (after preface and settings)
+    const initial_pos = buffer_stream.getWritten().len;
+
     // Send RST_STREAM
     try stream.sendRstStream(0x1); // PROTOCOL_ERROR
 
     // Check the buffer to ensure frame_type is 3
     const written_data = buffer_stream.getWritten();
     // Frame header is 9 bytes: length (3), type (1), flags (1), stream_id (4)
-    try std.testing.expectEqual(written_data[3], 3); // frame_type = 3 for RST_STREAM
+    // RST_STREAM frame starts at initial_pos, so frame type is at initial_pos + 3
+    try std.testing.expectEqual(written_data[initial_pos + 3], 3); // frame_type = 3 for RST_STREAM
 }
