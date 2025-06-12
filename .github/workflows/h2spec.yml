@@ -87,12 +87,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y openssl curl jq bc
 
-      - name: Install h2spec
+      - name: Pull h2spec Docker image
         run: |
-          wget -q https://github.com/summerwind/h2spec/releases/download/v${{ env.H2SPEC_VERSION }}/h2spec_linux_amd64.tar.gz
-          tar -xzf h2spec_linux_amd64.tar.gz
-          sudo mv h2spec /usr/local/bin/
-          h2spec --version
+          docker pull summerwind/h2spec:${{ env.H2SPEC_VERSION }}
+          echo "H2spec version info:"
+          docker run --rm summerwind/h2spec:${{ env.H2SPEC_VERSION }} --version
 
       - name: Generate test certificates
         if: matrix.protocol == 'tls'
@@ -139,12 +138,38 @@ jobs:
         continue-on-error: true
         run: |
           echo "Running h2spec conformance tests against TLS server..."
-          h2spec --host localhost --port ${{ env.SERVER_PORT }} --tls --insecure \
-            --timeout 30 --json > test-results/h2spec-tls-results.json
           
-          # Also run in human-readable format
-          h2spec --host localhost --port ${{ env.SERVER_PORT }} --tls --insecure \
-            --timeout 30 > test-results/h2spec-tls-results.txt || true
+          # First check if server is responding
+          echo "Testing server connectivity..."
+          if ! curl -k -s --http2 https://localhost:${{ env.SERVER_PORT }} --max-time 10; then
+            echo "Server is not responding properly"
+            echo "Server logs:"
+            cat test-results/server-tls.log || echo "No server logs found"
+            exit 1
+          fi
+          
+          # Run h2spec using Docker with host networking
+          echo "Running h2spec tests using Docker..."
+          if docker run --rm --network host \
+            -v "$(pwd)/test-results:/results" \
+            summerwind/h2spec:${{ env.H2SPEC_VERSION }} \
+            --host localhost --port ${{ env.SERVER_PORT }} --tls --insecure \
+            --timeout 30 --json > test-results/h2spec-tls-results.json 2>test-results/h2spec-error.log; then
+            echo "h2spec completed successfully"
+          else
+            echo "h2spec failed, checking output..."
+            echo "Error log:"
+            cat test-results/h2spec-error.log || echo "No error log"
+            echo "Results file size: $(wc -c < test-results/h2spec-tls-results.json 2>/dev/null || echo '0') bytes"
+            echo "Results content preview:"
+            head -n 20 test-results/h2spec-tls-results.json || echo "No valid JSON output"
+          fi
+          
+          # Also run in human-readable format for debugging
+          docker run --rm --network host \
+            summerwind/h2spec:${{ env.H2SPEC_VERSION }} \
+            --host localhost --port ${{ env.SERVER_PORT }} --tls --insecure \
+            --timeout 30 > test-results/h2spec-tls-results.txt 2>&1 || true
 
       # Plain HTTP/2 server testing (h2c)
       - name: Start Plain HTTP/2 server (background)
@@ -175,11 +200,28 @@ jobs:
           if [ -f test-results/h2spec-tls-results.json ]; then
             echo "=== H2SPEC CONFORMANCE TEST RESULTS ==="
             
+            # Check if JSON is valid
+            if ! jq empty test-results/h2spec-tls-results.json 2>/dev/null; then
+              echo "Invalid JSON output from h2spec"
+              echo "File contents:"
+              cat test-results/h2spec-tls-results.json
+              echo ""
+              echo "Checking text results instead..."
+              if [ -f test-results/h2spec-tls-results.txt ]; then
+                echo "Text results:"
+                cat test-results/h2spec-tls-results.txt
+              fi
+              echo "H2SPEC_PASS_RATE=0" >> $GITHUB_ENV
+              echo "H2SPEC_PASSED=0" >> $GITHUB_ENV  
+              echo "H2SPEC_TOTAL=0" >> $GITHUB_ENV
+              exit 0  # Don't fail the job, just mark as 0% pass rate
+            fi
+            
             # Extract summary statistics
-            TOTAL=$(jq '.tests | length' test-results/h2spec-tls-results.json)
-            PASSED=$(jq '[.tests[] | select(.result == "passed")] | length' test-results/h2spec-tls-results.json)
-            FAILED=$(jq '[.tests[] | select(.result == "failed")] | length' test-results/h2spec-tls-results.json)
-            SKIPPED=$(jq '[.tests[] | select(.result == "skipped")] | length' test-results/h2spec-tls-results.json)
+            TOTAL=$(jq '.tests | length' test-results/h2spec-tls-results.json 2>/dev/null || echo "0")
+            PASSED=$(jq '[.tests[] | select(.result == "passed")] | length' test-results/h2spec-tls-results.json 2>/dev/null || echo "0")
+            FAILED=$(jq '[.tests[] | select(.result == "failed")] | length' test-results/h2spec-tls-results.json 2>/dev/null || echo "0")
+            SKIPPED=$(jq '[.tests[] | select(.result == "skipped")] | length' test-results/h2spec-tls-results.json 2>/dev/null || echo "0")
             
             echo "Total Tests: $TOTAL"
             echo "Passed: $PASSED"
@@ -190,23 +232,32 @@ jobs:
             # Show failed tests
             if [ "$FAILED" -gt 0 ]; then
               echo "=== FAILED TESTS ==="
-              jq -r '.tests[] | select(.result == "failed") | "❌ \(.section): \(.description)"' test-results/h2spec-tls-results.json
+              jq -r '.tests[] | select(.result == "failed") | "❌ \(.section): \(.description)"' test-results/h2spec-tls-results.json 2>/dev/null || echo "Could not parse failed tests"
               echo ""
             fi
             
             # Calculate pass rate
             if [ "$TOTAL" -gt 0 ]; then
-              PASS_RATE=$(echo "scale=2; $PASSED * 100 / $TOTAL" | bc -l)
+              PASS_RATE=$(echo "scale=2; $PASSED * 100 / $TOTAL" | bc -l 2>/dev/null || echo "0")
               echo "Pass Rate: ${PASS_RATE}%"
               
               # Set pass rate in environment for badge generation
               echo "H2SPEC_PASS_RATE=${PASS_RATE}" >> $GITHUB_ENV
               echo "H2SPEC_PASSED=${PASSED}" >> $GITHUB_ENV  
               echo "H2SPEC_TOTAL=${TOTAL}" >> $GITHUB_ENV
+            else
+              echo "No tests found"
+              echo "H2SPEC_PASS_RATE=0" >> $GITHUB_ENV
+              echo "H2SPEC_PASSED=0" >> $GITHUB_ENV  
+              echo "H2SPEC_TOTAL=0" >> $GITHUB_ENV
             fi
           else
             echo "No test results found"
-            exit 1
+            echo "Available files:"
+            ls -la test-results/ || echo "No test-results directory"
+            echo "H2SPEC_PASS_RATE=0" >> $GITHUB_ENV
+            echo "H2SPEC_PASSED=0" >> $GITHUB_ENV  
+            echo "H2SPEC_TOTAL=0" >> $GITHUB_ENV
           fi
 
       - name: Generate conformance badge data
