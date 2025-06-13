@@ -150,16 +150,6 @@ switch (frame.header.frame_type) {
 }
 ```
 
-## Performance
-
-http2.zig is designed for **maximum performance** with minimal overhead:
-
-- **Zero-copy frame processing** - Direct buffer manipulation
-- **Allocation-efficient** - Minimal allocations in hot paths  
-- **HPACK optimization** - Efficient header compression/decompression
-- **Flow control** - Prevents memory exhaustion under load
-- **Concurrent streams** - Handle thousands of multiplexed streams
-
 ### Benchmarks
 
 TBD
@@ -177,21 +167,6 @@ http2.zig implements the complete HTTP/2 specification:
 - **HPACK Header Compression** (RFC 7541)
 - **Server Push** (RFC 7540 §8.2) - API ready
 - **Error Handling** with proper GOAWAY frames
-
-### Frame Types
-
-| Frame Type | Status | Description |
-|------------|--------|-------------|
-| DATA | ✅ | Stream data with flow control |
-| HEADERS | ✅ | HTTP headers with HPACK compression |
-| PRIORITY | ✅ | Stream dependency and priority |
-| RST_STREAM | ✅ | Stream termination |
-| SETTINGS | ✅ | Connection configuration |
-| PUSH_PROMISE | ✅ | Server push announcement |
-| PING | ✅ | Connection liveness |
-| GOAWAY | ✅ | Graceful connection shutdown |
-| WINDOW_UPDATE | ✅ | Flow control window management |
-| CONTINUATION | ✅ | Header block continuation |
 
 ### h2spec Conformance
 
@@ -278,7 +253,6 @@ zig build test
 zig build test-integration
 
 # Conformance tests (requires h2spec)
-./example/hello-world/enhanced_h2spec.sh
 ```
 
 ### Contributing
