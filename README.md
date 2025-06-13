@@ -1,3 +1,6 @@
+> [!WARNING]  
+> Still work in progress.
+
 <h1 align="center">
    <img src="docs/images/logo.png" width="40%" height="40%" alt="http2.zig logo" title="http2.zig logo">
 </h1>
@@ -16,23 +19,6 @@ RFC 7540 compliant • Zero dependencies
 </div>
 
 ---
-
-## Features
-
-**Core HTTP/2 Protocol**
-- 🚀 **Full HTTP/2 implementation** per RFC 7540
-- ⚡ **Zero-copy frame processing** for maximum performance
-- 🧮 **Memory-efficient** HPACK header compression (RFC 7541)
-- 🌊 **Flow control** with connection and stream-level windowing
-- 🎯 **Stream multiplexing** with priority handling
-- 🛡️ **Robust error handling** with proper GOAWAY frames
-
-**Framework & Patterns**
-- 📦 **Modular design** - Use only what you need
-- 🔧 **Generic I/O** - Works with any Reader/Writer implementation
-- 🎨 **Type-safe APIs** - Leverage Zig's compile-time safety
-- 📊 **Comprehensive logging** - Debug and monitor connection state
-- 🧪 **Test-driven** - Validated against h2spec conformance suite
 
 ## Quick Start
 
