@@ -21,7 +21,7 @@ fn runServer(allocator: std.mem.Allocator, port: u16) !void {
     defer worker_pool.stop();
     // Set up network listener
     const address = try std.net.Address.resolveIp("127.0.0.1", port);
-    var listener = try address.listen(.{ 
+    var listener = try address.listen(.{
         .reuse_address = true,
         .reuse_port = true,
     });
@@ -41,31 +41,16 @@ fn runServer(allocator: std.mem.Allocator, port: u16) !void {
             continue;
         }
         active_connections += 1;
-        const reader = conn.stream.reader().any();
-        const writer = conn.stream.writer().any();
-        // Use a limited-scope allocator to prevent memory growth
-        var connection_arena = std.heap.ArenaAllocator.init(allocator);
-        defer {
-            connection_arena.deinit(); // Always clean up the arena
-            active_connections -= 1;   // Always decrement counter
-        }
-        const connection_allocator = connection_arena.allocator();
-        const http2_conn = connection_allocator.create(http2.Connection(std.io.AnyReader, std.io.AnyWriter)) catch |err| {
-            std.debug.print("Failed to allocate connection: {any}\n", .{err});
+        
+        // Submit connection to async worker pool  
+        worker_pool.submitAsyncConnection(conn.stream.handle, true) catch |err| {
+            std.debug.print("Failed to submit async connection: {s}\n", .{@errorName(err)});
             conn.stream.close();
+            active_connections -= 1;
             continue;
         };
-        http2_conn.* = http2.Connection(std.io.AnyReader, std.io.AnyWriter).init(connection_allocator, reader, writer, true) catch |err| {
-            std.debug.print("Connection init failed: {any}\n", .{err});
-            conn.stream.close();
-            continue;
-        };
-        // Process connection synchronously to ensure cleanup happens
-        worker_pool.submitConnectionWork(http2_conn) catch |err| {
-            std.debug.print("Failed to submit work to pool: {any}\n", .{err});
-            http2_conn.deinit();
-            conn.stream.close();
-        };
+        
+        std.debug.print("Submitted connection to async worker pool (active: {})\n", .{active_connections});
     }
 }
 pub const ConnectionContext = struct {
