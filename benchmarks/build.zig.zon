@@ -14,5 +14,6 @@
         "build.zig",
         "build.zig.zon",
         "server.zig",
+        "async_server.zig",
     },
 }

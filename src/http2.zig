@@ -5,15 +5,24 @@
 //! - Static memory pools with pre-allocated resources
 //! - Zero runtime OOM guarantees
 //! - Lock-free operations where possible
+//! - Async I/O with libxev event loops (NEW)
 //! - Worker thread pool for scalable processing
 const std = @import("std");
 pub const memory_budget = @import("memory_budget.zig");
 pub const budget_assertions = @import("budget_assertions.zig");
 pub const worker_pool = @import("worker_pool.zig");
+
 // Core HTTP/2 Implementation
 pub const Connection = @import("connection.zig").Connection;
 pub const Stream = @import("stream.zig").Stream;
 pub const DefaultStream = @import("stream.zig").DefaultStream;
+
+// Async I/O Implementation (New)
+pub const async_io = @import("async_io.zig");
+pub const async_connection = @import("async_connection.zig");
+pub const AsyncHTTP2IO = async_io.AsyncHTTP2IO;
+pub const AsyncConnection = async_connection.AsyncConnection;
+pub const AsyncWorkerPool = worker_pool.AsyncWorkerPool;
 // Original HTTP/2 modules (for compatibility)
 // Core HTTP/2 modules
 pub const Frame = @import("frame.zig").Frame;
