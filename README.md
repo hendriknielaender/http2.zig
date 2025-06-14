@@ -1,3 +1,6 @@
+> [!WARNING]  
+> Still work in progress.
+
 <h1 align="center">
    <img src="docs/images/logo.png" width="40%" height="40%" alt="http2.zig logo" title="http2.zig logo">
 </h1>
@@ -16,30 +19,6 @@ RFC 7540 compliant • libxev integration
 </div>
 
 ---
-
-## Features
-
-**Core HTTP/2 Protocol**
-- 🚀 **Full HTTP/2 implementation** per RFC 7540
-- ⚡ **SIMD-optimized frame processing** with hardware acceleration
-- 🧮 **Memory-efficient** HPACK header compression (RFC 7541)
-- 🌊 **Flow control** with connection and stream-level windowing
-- 🎯 **Stream multiplexing** with priority handling
-- 🛡️ **Robust error handling** with proper GOAWAY frames
-
-**Performance Optimizations**
-- 🔥 **Compile-time memory budgeting** - Zero runtime allocations
-- ⚡ **SIMD acceleration** - Hardware-optimized preface validation
-- 🧠 **Static memory pools** - Bounded memory usage with arena allocators
-- 🔧 **libxev integration** - Async I/O with worker pool architecture
-- 📈 **99%+ benchmark success rate** - Handles 18k+ req/sec under load
-
-**Framework & Patterns**
-- 📦 **Modular design** - Use only what you need
-- 🔧 **Generic I/O** - Works with any Reader/Writer implementation
-- 🎨 **Type-safe APIs** - Leverage Zig's compile-time safety
-- 📊 **Comprehensive logging** - Debug and monitor connection state
-- 🧪 **Test-driven** - Validated against h2spec conformance suite
 
 ## Quick Start
 
@@ -191,16 +170,6 @@ switch (frame.header.frame_type) {
 }
 ```
 
-## Performance
-
-- **SIMD-accelerated processing** - Hardware-optimized frame validation
-- **Compile-time memory budgeting** - Zero runtime allocations with static pools
-- **libxev async I/O** - Event-driven worker pool architecture
-- **Zero-copy frame processing** - Direct buffer manipulation
-- **Arena allocators** - Automatic cleanup prevents memory leaks
-- **Flow control** - Prevents memory exhaustion under load
-- **Concurrent streams** - Handle thousands of multiplexed streams
-
 ### Benchmarks
 
 **High-concurrency performance with 99%+ success rate:**
@@ -216,10 +185,6 @@ Failed requests: 184
 Success rate: 99.01%
 ```
 
-**Memory efficiency:**
-- Fixed memory usage with compile-time budgeting
-- Arena allocators prevent memory leaks
-- Bounded connection pools prevent OOM
 
 ## Protocol Compliance
 
@@ -234,21 +199,6 @@ http2.zig implements the complete HTTP/2 specification:
 - **HPACK Header Compression** (RFC 7541)
 - **Server Push** (RFC 7540 §8.2) - API ready
 - **Error Handling** with proper GOAWAY frames
-
-### Frame Types
-
-| Frame Type | Status | Description |
-|------------|--------|-------------|
-| DATA | ✅ | Stream data with flow control |
-| HEADERS | ✅ | HTTP headers with HPACK compression |
-| PRIORITY | ✅ | Stream dependency and priority |
-| RST_STREAM | ✅ | Stream termination |
-| SETTINGS | ✅ | Connection configuration |
-| PUSH_PROMISE | ✅ | Server push announcement |
-| PING | ✅ | Connection liveness |
-| GOAWAY | ✅ | Graceful connection shutdown |
-| WINDOW_UPDATE | ✅ | Flow control window management |
-| CONTINUATION | ✅ | Header block continuation |
 
 ### h2spec Conformance
 
@@ -347,9 +297,6 @@ zig build test-h2spec
 
 # Benchmark tests
 cd benchmarks && make benchmark
-
-# Memory leak validation
-cd benchmarks && make test-memory
 ```
 
 ### Contributing
