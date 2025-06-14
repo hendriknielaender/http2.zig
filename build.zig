@@ -21,6 +21,12 @@ pub fn build(b: *std.Build) void {
     const boringssl_include_path = b.path("boringssl/include");
     const boringssl_lib_path = b.path("boringssl/build");
 
+    // Add libxev dependency
+    const libxev = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Core HTTP/2 library
     const http2_lib = b.addStaticLibrary(.{
         .name = project_name,
@@ -45,6 +51,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    
+    // Add libxev to the http2 module
+    http2_module.addImport("xev", libxev.module("xev"));
 
     // Example applications
     add_example_applications(b, target, optimize, http2_module);
@@ -98,13 +107,23 @@ fn add_test_suite(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 ) void {
+    // Add libxev dependency for tests
+    const libxev = b.dependency("libxev", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Unit tests for all modules
     const test_modules = [_][]const u8{
-        "src/http2.zig",
-        "src/connection.zig",
         "src/frame.zig",
-        "src/stream.zig",
+        "src/stream.zig", 
+        "src/budget_assertions.zig",
+        "src/connection.zig",
         "src/hpack.zig",
+        "src/huffman.zig",
+        "src/worker_pool.zig",
+        "src/http2.zig",
+        "src/memory_budget.zig",
     };
 
     var all_tests_step = b.step("test", "Run all unit tests");
@@ -115,6 +134,9 @@ fn add_test_suite(
             .target = target,
             .optimize = optimize,
         });
+        
+        // Add libxev dependency to tests that need it
+        module_test.root_module.addImport("xev", libxev.module("xev"));
 
         const run_test = b.addRunArtifact(module_test);
         all_tests_step.dependOn(&run_test.step);

@@ -1,0 +1,18 @@
+.{
+    .name = .http2_benchmark,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.13.0",
+    .fingerprint = 0x9ebc52735a287b8b,
+    .dependencies = .{
+        .http2 = .{ .path = "../" },
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/main.tar.gz",
+            .hash = "libxev-0.0.0-86vtc87kEgBxgbJ1RI1R6Elynb7zydCgNR8dt3uw01My",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "server.zig",
+    },
+}

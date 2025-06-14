@@ -51,9 +51,9 @@ fn handle_tls_connection(
     const reader = tls_conn.reader().any();
     const writer = tls_conn.writer().any();
 
-    var allocator_mut = allocator;
+    const allocator_mut = allocator;
 
-    var server_conn = http2.Connection(std.io.AnyReader, std.io.AnyWriter).init(&allocator_mut, reader, writer, true) catch |err| switch (err) {
+    var server_conn = http2.Connection(std.io.AnyReader, std.io.AnyWriter).init(allocator_mut, reader, writer, true) catch |err| switch (err) {
         error.BrokenPipe, error.ConnectionResetByPeer => {
             return;
         },

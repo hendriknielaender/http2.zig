@@ -1,5 +1,8 @@
 .DS_Store
 
+libhttp2.a
+libhttp2.a.o
+
 zig-out/
 .zig-cache/
 
