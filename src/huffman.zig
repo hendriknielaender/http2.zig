@@ -269,10 +269,10 @@ pub const Huffman = struct {
         .{ .symbol = .{ .eos = {} }, .code = 0x3fffffff, .bits = 30 }, // EOS symbol
     };
 
-    pub fn encode(input: []const u8, allocator: *std.mem.Allocator) ![]u8 {
+    pub fn encode(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
         var bit_buffer: u64 = 0;
         var bit_count: u6 = 0;
-        var encoded = std.ArrayList(u8).init(allocator.*);
+        var encoded = std.ArrayList(u8).init(allocator);
         defer encoded.deinit();
 
         for (input) |byte| {
@@ -303,8 +303,8 @@ pub const Huffman = struct {
         return encoded.toOwnedSlice();
     }
 
-    pub fn decode(input: []const u8, allocator: *std.mem.Allocator) ![]u8 {
-        var decoded = std.ArrayList(u8).init(allocator.*);
+    pub fn decode(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
+        var decoded = std.ArrayList(u8).init(allocator);
         defer decoded.deinit();
 
         var bit_buffer: u64 = 0;
@@ -391,10 +391,10 @@ test "Huffman encoding and decoding" {
     var allocator = std.testing.allocator;
 
     const input = "Hello, Huffman!";
-    const encoded = try Huffman.encode(input, &allocator);
+    const encoded = try Huffman.encode(input, allocator);
     defer allocator.free(encoded);
 
-    const decoded = try Huffman.decode(encoded, &allocator);
+    const decoded = try Huffman.decode(encoded, allocator);
     defer allocator.free(decoded);
 
     try std.testing.expect(std.mem.eql(u8, decoded, input));
@@ -411,10 +411,10 @@ test "Huffman encode decode consistency" {
     };
 
     for (inputs) |input| {
-        const encoded = try Huffman.encode(input, &allocator);
+        const encoded = try Huffman.encode(input, allocator);
         defer allocator.free(encoded);
 
-        const decoded = try Huffman.decode(encoded, &allocator);
+        const decoded = try Huffman.decode(encoded, allocator);
         defer allocator.free(decoded);
 
         try std.testing.expect(std.mem.eql(u8, decoded, input));
@@ -437,10 +437,10 @@ test "Huffman encoding and decoding compliance with RFC 7541" {
 
     for (test_cases) |input| {
         // Since Huffman coding in HPACK operates on bytes, ensure the input is valid UTF-8
-        const encoded = try Huffman.encode(input, &allocator);
+        const encoded = try Huffman.encode(input, allocator);
         defer allocator.free(encoded);
 
-        const decoded = try Huffman.decode(encoded, &allocator);
+        const decoded = try Huffman.decode(encoded, allocator);
         defer allocator.free(decoded);
 
         try std.testing.expectEqualStrings(input, decoded);
