@@ -6,7 +6,7 @@ SERVER_KEY_FILE=key.pem
 CLIENT_CERT_FILE=client_cert.pem
 CLIENT_KEY_FILE=client_key.pem
 DH_PARAMS_FILE=dhparam.pem
-PORT=9001
+PORT=3000
 LOG_FILE=server.log
 
 # Default target

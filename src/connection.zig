@@ -10,25 +10,33 @@ const has_sse42 = blk: {
     }
     break :blk false;
 };
-fn validatePrefaceSIMD(preface: []const u8, expected: []const u8) bool {
-    if (comptime has_sse42 and preface.len == 24 and expected.len == 24) {
-        // Use SIMD for 24-byte preface comparison
-        const preface_ptr: *const [24]u8 = @ptrCast(preface.ptr);
-        const expected_ptr: *const [24]u8 = @ptrCast(expected.ptr);
-        // Compare in 16-byte chunks using SIMD
-        const preface_v1 = @as(@Vector(16, u8), preface_ptr[0..16].*);
-        const expected_v1 = @as(@Vector(16, u8), expected_ptr[0..16].*);
-        const eq1 = @reduce(.And, preface_v1 == expected_v1);
-        // Compare remaining 8 bytes
-        const preface_v2 = @as(@Vector(8, u8), preface_ptr[16..24].*);
-        const expected_v2 = @as(@Vector(8, u8), expected_ptr[16..24].*);
-        const eq2 = @reduce(.And, preface_v2 == expected_v2);
-        return eq1 and eq2;
+fn validate_preface_simd(preface: []const u8, expected: []const u8) bool {
+    if (comptime has_sse42) {
+        if (preface.len == 24) {
+            if (expected.len == 24) {
+                // Use SIMD for 24-byte preface comparison.
+                const preface_ptr: *const [24]u8 = @ptrCast(preface.ptr);
+                const expected_ptr: *const [24]u8 = @ptrCast(expected.ptr);
+
+                // Compare in 16-byte chunks using SIMD.
+                const preface_v1 = @as(@Vector(16, u8), preface_ptr[0..16].*);
+                const expected_v1 = @as(@Vector(16, u8), expected_ptr[0..16].*);
+                const eq1 = @reduce(.And, preface_v1 == expected_v1);
+
+                // Compare remaining 8 bytes.
+                const preface_v2 = @as(@Vector(8, u8), preface_ptr[16..24].*);
+                const expected_v2 = @as(@Vector(8, u8), expected_ptr[16..24].*);
+                const eq2 = @reduce(.And, preface_v2 == expected_v2);
+
+                return eq1 and eq2;
+            }
+        }
     }
-    // Fallback to standard comparison
+
+    // Fallback to standard comparison.
     return std.mem.eql(u8, preface, expected);
 }
-fn compareHeaderNameSIMD(a: []const u8, b: []const u8) bool {
+fn compare_header_name_simd(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     if (comptime has_sse42 and a.len >= 16) {
         // Process 16-byte chunks with SIMD
@@ -54,6 +62,7 @@ pub const Frame = @import("frame.zig").Frame;
 pub const FrameHeader = @import("frame.zig").FrameHeader;
 pub const FrameFlags = @import("frame.zig").FrameFlags;
 pub const FrameType = @import("frame.zig").FrameType;
+const SIMDFrameParser = @import("simd_frame_parser.zig").SIMDFrameParser;
 pub const FrameTypes = @import("frame.zig");
 pub const FrameArena = @import("frame.zig").FrameArena;
 pub const FrameMeta = @import("frame.zig").FrameMeta;
@@ -179,6 +188,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
         connection_closed: bool = false,
         frame_arena_buffer: [MAX_IN_FLIGHT_FRAMES * (max_frame_size_default + @sizeOf(FrameMeta))]u8,
         frame_arena: FrameArena,
+
         pub fn init(allocator: std.mem.Allocator, reader: ReaderType, writer: WriterType, comptime is_server: bool) !@This() {
             var self = @This(){
                 .allocator = allocator,
@@ -220,7 +230,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 }
                 bytes_read += read_result;
             }
-            if (!validatePrefaceSIMD(&preface_buf, http2_preface)) {
+            if (!SIMDFrameParser.validate_preface_simd(&preface_buf)) {
                 log.err("Invalid preface received. Expected: {any}, Got: {any}", .{ http2_preface, preface_buf });
                 try self.send_goaway(0, 0x1, "Invalid preface: PROTOCOL_ERROR");
                 return error.InvalidPreface;
@@ -302,32 +312,32 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 }
                 header_read += bytes_read;
             }
-            const length: u32 = if (comptime has_sse42) blk: {
-                // Hardware-accelerated 24-bit length extraction
-                const header_u32 = std.mem.readInt(u32, header_bytes[0..4], .big);
-                break :blk (header_u32 >> 8) & 0xFFFFFF;
-            } else blk: {
-                // Standard bit manipulation
-                break :blk (@as(u32, header_bytes[0]) << 16) |
-                    (@as(u32, header_bytes[1]) << 8) |
-                    @as(u32, header_bytes[2]);
+
+            // Use SIMD-optimized frame header parsing
+            const frame_header = SIMDFrameParser.parseFrameHeader(header_bytes) catch |err| switch (err) {
+                error.InvalidFrameLength => {
+                    log.err("Invalid frame length detected by SIMD parser, sending GOAWAY", .{});
+                    try self.send_goaway(0, 0x6, "Frame size error: FRAME_SIZE_ERROR");
+                    return error.FrameSizeError;
+                },
+                error.InvalidFrameType => {
+                    log.err("Invalid frame type detected by SIMD parser", .{});
+                    return error.InvalidFrameType;
+                },
+                else => return err,
             };
-            if (length > self.settings.max_frame_size) {
-                log.err("Received frame size {} exceeds SETTINGS_MAX_FRAME_SIZE {}, sending GOAWAY", .{ length, self.settings.max_frame_size });
+
+            if (frame_header.length > self.settings.max_frame_size) {
+                log.err("Received frame size {} exceeds SETTINGS_MAX_FRAME_SIZE {}, sending GOAWAY", .{ frame_header.length, self.settings.max_frame_size });
                 try self.send_goaway(0, 0x6, "Frame size exceeded, sending GOAWAY: FRAME_SIZE_ERROR.");
                 return error.FrameSizeError;
             }
-            // Additional sanity check for obviously corrupted frame sizes
-            if (length > 16_777_215) { // Maximum theoretical HTTP/2 frame size (24-bit field)
-                log.err("Frame size {} exceeds theoretical maximum, connection corrupted", .{length});
-                try self.send_goaway(0, 0x2, "Connection corruption detected: INTERNAL_ERROR");
-                return error.FrameSizeError;
-            }
-            if (length + 9 > buffer.len) return error.BufferTooSmall;
-            if (length > 0) {
-                const payload_buffer = buffer[9 .. 9 + length];
+            if (frame_header.length + 9 > buffer.len) return error.BufferTooSmall;
+
+            if (frame_header.length > 0) {
+                const payload_buffer = buffer[9 .. 9 + frame_header.length];
                 var payload_read: usize = 0;
-                while (payload_read < length) {
+                while (payload_read < frame_header.length) {
                     const bytes_read = try self.reader.read(payload_buffer[payload_read..]);
                     if (bytes_read == 0) {
                         // Connection closed while reading payload
@@ -336,28 +346,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     payload_read += bytes_read;
                 }
             }
-            const frame_header = if (comptime has_sse42) blk: {
-                // Hardware-accelerated stream ID extraction
-                const stream_id_raw = std.mem.readInt(u32, header_bytes[5..9], .big);
-                break :blk FrameHeader{
-                    .length = length,
-                    .frame_type = header_bytes[3],
-                    .flags = FrameFlags{ .value = header_bytes[4] },
-                    .reserved = false,
-                    .stream_id = stream_id_raw & 0x7FFFFFFF,
-                };
-            } else blk: {
-                break :blk FrameHeader{
-                    .length = length,
-                    .frame_type = header_bytes[3],
-                    .flags = FrameFlags{ .value = header_bytes[4] },
-                    .reserved = false,
-                    .stream_id = std.mem.readInt(u32, header_bytes[5..9], .big) & 0x7FFFFFFF,
-                };
-            };
+
             return Frame{
                 .header = frame_header,
-                .payload = if (length > 0) buffer[9 .. 9 + length] else &[_]u8{},
+                .payload = if (frame_header.length > 0) buffer[9 .. 9 + frame_header.length] else &[_]u8{},
             };
         }
 
@@ -387,6 +379,14 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             const stream = self.streams.get(frame.header.stream_id) orelse {
                 return self.send_rst_stream(frame.header.stream_id, 0x5); // STREAM_CLOSED
             };
+            
+            // Update connection-level flow control and send WINDOW_UPDATE
+            if (frame.header.length > 0) {
+                // Send connection-level WINDOW_UPDATE (stream_id = 0)
+                try self.send_window_update(0, @intCast(frame.header.length));
+                log.debug("Sent connection-level WINDOW_UPDATE with increment {}", .{frame.header.length});
+            }
+            
             try stream.handleFrame(frame);
         }
         fn handleHeadersFrameOptimized(self: *@This(), frame: Frame) !void {
@@ -478,57 +478,89 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 
         pub fn handle_connection_optimized(self: *@This()) !void {
             // Static frame buffer - no allocations on hot path
-            var frame_buffer: [Config.StaticSizes.frame_buffer_size]u8 = undefined;
-            // Phase 1: Exchange SETTINGS frames
+            var frame_buffer: [64 * 1024]u8 = undefined; // 64KB static buffer
+
+            // Phase 1: Exchange SETTINGS frames with SIMD optimization
             while (!self.client_settings_received) {
-                const frame = self.receiveFrameStatic(&frame_buffer) catch {
-                    // Fall back to original implementation for initial setup
-                    var frame_orig = self.receive_frame() catch |handle_err| {
-                        self.handle_receive_frame_error(handle_err) catch |final_err| {
-                            return final_err;
-                        };
-                        return;
+                const frame = self.receiveFrameStatic(&frame_buffer) catch |err| {
+                    self.handle_receive_frame_error(err) catch |handle_err| {
+                        return handle_err;
                     };
-                    defer frame_orig.deinit(self.allocator);
-                    // Process with optimized dispatch
-                    try self.dispatchFrameOptimized(frame_orig);
-                    if (frame_orig.header.frame_type == FrameType.SETTINGS and (frame_orig.header.flags.value & FrameFlags.ACK) == 0) {
+                    return;
+                };
+
+                // Process with optimized dispatch (SIMD-parsed frame)
+                try self.dispatchFrameOptimized(frame);
+                if (frame.header.frame_type == FrameType.SETTINGS) {
+                    if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
                         self.client_settings_received = true;
                     }
-                    continue;
-                };
-                // Process with optimized dispatch
-                try self.dispatchFrameOptimized(frame);
-                if (frame.header.frame_type == FrameType.SETTINGS and (frame.header.flags.value & FrameFlags.ACK) == 0) {
-                    self.client_settings_received = true;
                 }
             }
-            // Phase 2: Main connection loop with zero-allocation hot path
-            while (!self.goaway_received) {
+
+            // Phase 2: Main connection loop with SIMD-optimized frame parsing
+            while (!self.goaway_sent) {
+                if (self.connection_closed) {
+                    break;
+                }
                 const frame = self.receiveFrameStatic(&frame_buffer) catch |err| switch (err) {
-                    error.WouldBlock => continue, // No data available, try again
+                    error.BufferTooSmall => {
+                        log.err("Frame too large for static buffer, connection corrupted", .{});
+                        try self.send_goaway(0, 0x2, "Frame size exceeds buffer: INTERNAL_ERROR");
+                        break;
+                    },
                     error.UnexpectedEOF => {
-                        log.debug("Connection read error: UnexpectedEOF\n", .{});
+                        log.debug("Connection read error: UnexpectedEOF", .{});
+                        break;
+                    },
+                    error.FrameSizeError => {
+                        // Already handled by receiveFrameStatic (GOAWAY sent)
                         break;
                     },
                     else => {
-                        log.debug("Connection read error: {s}\n", .{@errorName(err)});
+                        log.debug("Connection read error: {s}", .{@errorName(err)});
                         break;
                     },
                 };
+
+                // Handle CONTINUATION frame validation
+                if (self.expecting_continuation_stream_id) |stream_id| {
+                    if (frame.header.stream_id != stream_id or frame.header.frame_type != FrameType.CONTINUATION) {
+                        log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id, stream_id });
+                        try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
+                        return error.ProtocolError;
+                    }
+                }
+
+                // Process frame with SIMD-optimized dispatch
                 try self.dispatchFrameOptimized(frame);
                 try self.process_pending_streams();
-                // Only exit if both sides sent GOAWAY
-                if (self.goaway_sent and self.goaway_received) {
-                    log.debug("Both GOAWAY sent and received, gracefully closing connection.\n", .{});
-                    break;
+
+                // Exit if both sides sent GOAWAY
+                if (self.goaway_sent) {
+                    if (self.goaway_received) {
+                        log.debug("Both GOAWAY sent and received, gracefully closing connection.", .{});
+                        break;
+                    }
                 }
             }
-            log.debug("Optimized connection handler terminated gracefully.\n", .{});
+            log.debug("SIMD-optimized connection handler terminated gracefully.", .{});
         }
         /// Adjust frame handling and validation per RFC 9113.
         pub fn handle_connection(self: *@This()) !void {
-            // Phase 1: Exchange SETTINGS frames
+            // Use optimized connection handler with SIMD frame parsing
+            return self.handle_connection_optimized();
+        }
+
+        /// Original frame handling method (kept for compatibility)
+        pub fn handle_connection_original(self: *@This()) !void {
+            try self.handle_connection_original_phase_settings();
+            try self.handle_connection_original_phase_frames();
+            log.debug("Connection terminated gracefully after GOAWAY.\n", .{});
+        }
+
+        /// Phase 1: Exchange SETTINGS frames
+        fn handle_connection_original_phase_settings(self: *@This()) !void {
             while (!self.client_settings_received) {
                 var frame = self.receive_frame() catch |err| {
                     self.handle_receive_frame_error(err) catch |handle_err| {
@@ -537,25 +569,34 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     return;
                 };
                 defer frame.deinit(self.allocator);
-                // Classify frame based on stream_id
+
                 if (frame.header.stream_id == 0) {
-                    handle_connection_level_frame(self, frame) catch |err| {
-                        log.err("Error handling connection-level frame in phase 1: {s}\n", .{@errorName(err)});
-                        if (!self.goaway_sent) {
-                            try self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error");
-                            self.goaway_sent = true;
-                        }
-                        // Continue processing frames instead of returning error immediately
-                    };
+                    self.handle_connection_original_phase_settings_connection_frame(frame);
                 } else {
                     try handle_stream_level_frame(self, frame);
                 }
-                // Check if SETTINGS frame without ACK flag was received (client's initial SETTINGS)
-                if (frame.header.frame_type == FrameType.SETTINGS and (frame.header.flags.value & FrameFlags.ACK) == 0) {
-                    self.client_settings_received = true;
+
+                if (frame.header.frame_type == FrameType.SETTINGS) {
+                    if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
+                        self.client_settings_received = true;
+                    }
                 }
             }
-            // Phase 2: Handle other frames
+        }
+
+        /// Handle connection-level frame during settings phase
+        fn handle_connection_original_phase_settings_connection_frame(self: *@This(), frame: Frame) void {
+            handle_connection_level_frame(self, frame) catch |err| {
+                log.err("Error handling connection-level frame in phase 1: {s}\n", .{@errorName(err)});
+                if (!self.goaway_sent) {
+                    self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error") catch {};
+                    self.goaway_sent = true;
+                }
+            };
+        }
+
+        /// Phase 2: Handle other frames
+        fn handle_connection_original_phase_frames(self: *@This()) !void {
             while (!self.goaway_sent and !self.connection_closed) {
                 var frame = self.receive_frame() catch |err| {
                     self.handle_receive_frame_error(err) catch |handle_err| {
@@ -564,58 +605,79 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                     return;
                 };
                 defer frame.deinit(self.allocator);
-                if (self.expecting_continuation_stream_id) |stream_id| {
-                    if (frame.header.stream_id != stream_id or frame.header.frame_type != FrameType.CONTINUATION) {
-                        // Received a frame other than CONTINUATION while expecting CONTINUATION
-                        log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id, stream_id });
-                        try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
-                        return error.ProtocolError;
-                    }
-                }
+
+                try self.handle_connection_original_phase_frames_validate_continuation(frame);
+
                 if (!is_valid_frame_type(@intFromEnum(frame.header.frame_type))) {
-                    // Unknown frame type, ignore it as per RFC 7540 Section 5.5
                     log.debug("Ignoring unknown frame type {d}\n", .{@intFromEnum(frame.header.frame_type)});
-                    continue; // Ignore this frame and continue processing
+                    continue;
                 }
+
                 log.debug("Received frame of type: {d}, stream ID: {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
-                // Classify frame routing: connection-level vs stream-level.
-                // WINDOW_UPDATE can be either depending on stream_id value.
-                const is_conn_level = is_connection_level_frame(@intFromEnum(frame.header.frame_type)) or
-                    (frame.header.frame_type == FrameType.WINDOW_UPDATE and frame.header.stream_id == 0);
-                if (is_conn_level) {
-                    handle_connection_level_frame(self, frame) catch |err| switch (err) {
-                        error.BrokenPipe, error.ConnectionResetByPeer, error.ConnectionReset => {
-                            log.debug("Error handling connection-level frame in phase 1: {s}\n", .{@errorName(err)});
-                            return err; // Exit immediately on connection errors
-                        },
-                        error.UnexpectedEOF => {
-                            log.debug("Client closed connection during frame processing\n", .{});
-                            return err;
-                        },
-                        else => {
-                            // Protocol or other errors - send GOAWAY and exit
-                            log.err("Error handling connection-level frame: {s}\n", .{@errorName(err)});
-                            if (!self.goaway_sent) {
-                                self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error") catch {};
-                                self.goaway_sent = true;
-                            }
-                            return err;
-                        },
-                    };
+
+                const is_connection_level = is_connection_level_frame(@intFromEnum(frame.header.frame_type));
+                const is_connection_window_update = (frame.header.frame_type == FrameType.WINDOW_UPDATE and frame.header.stream_id == 0);
+
+                if (is_connection_level or is_connection_window_update) {
+                    try self.handle_connection_original_phase_frames_connection_level(frame);
                 } else {
-                    if (self.goaway_received and frame.header.stream_id > self.last_stream_id) {
-                        // Ignore frames with stream IDs higher than the last stream ID in GOAWAY
-                        log.debug("Ignoring frame on stream {d} as it exceeds last_stream_id {d}\n", .{ frame.header.stream_id, self.last_stream_id });
-                        continue;
-                    }
-                    try handle_stream_level_frame(self, frame);
+                    try self.handle_connection_original_phase_frames_stream_level(frame);
                 }
+
                 if (self.goaway_sent and self.goaway_received) {
                     log.debug("Both GOAWAY sent and received, stopping frame processing.\n", .{});
                     break;
                 }
             }
-            log.debug("Connection terminated gracefully after GOAWAY.\n", .{});
+        }
+
+        /// Validate CONTINUATION frame expectations
+        fn handle_connection_original_phase_frames_validate_continuation(self: *@This(), frame: Frame) !void {
+            if (self.expecting_continuation_stream_id) |stream_id| {
+                if (frame.header.stream_id != stream_id) {
+                    log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id, stream_id });
+                    try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
+                    return error.ProtocolError;
+                }
+                if (frame.header.frame_type != FrameType.CONTINUATION) {
+                    log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id, stream_id });
+                    try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
+                    return error.ProtocolError;
+                }
+            }
+        }
+
+        /// Handle connection-level frame during main processing
+        fn handle_connection_original_phase_frames_connection_level(self: *@This(), frame: Frame) !void {
+            handle_connection_level_frame(self, frame) catch |err| switch (err) {
+                error.BrokenPipe, error.ConnectionResetByPeer, error.ConnectionReset => {
+                    log.debug("Error handling connection-level frame in phase 1: {s}\n", .{@errorName(err)});
+                    return err;
+                },
+                error.UnexpectedEOF => {
+                    log.debug("Client closed connection during frame processing\n", .{});
+                    return err;
+                },
+                else => {
+                    log.err("Error handling connection-level frame: {s}\n", .{@errorName(err)});
+                    if (!self.goaway_sent) {
+                        self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error") catch {};
+                        self.goaway_sent = true;
+                    }
+                    return err;
+                },
+            };
+        }
+
+        /// Handle stream-level frame during main processing
+        fn handle_connection_original_phase_frames_stream_level(self: *@This(), frame: Frame) !void {
+            if (self.goaway_received) {
+                if (frame.header.stream_id > self.last_stream_id) {
+                    log.debug("Ignoring frame on stream {d} as it exceeds last_stream_id {d}\n", .{ frame.header.stream_id, self.last_stream_id });
+                    return;
+                }
+            }
+            try handle_stream_level_frame(self, frame);
         }
         fn handle_goaway_frame(self: *@This(), frame: Frame) !void {
             if (frame.payload.len < 8) {
@@ -636,117 +698,153 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             self.goaway_received = true;
             // Update the highest stream ID we can process
             self.last_stream_id = last_stream_id;
+            
+            // If we've also sent GOAWAY, or if there are no active streams, close the connection
+            if (self.goaway_sent or self.streams.count() == 0) {
+                self.connection_closed = true;
+                log.debug("Connection marked for closure after GOAWAY (goaway_sent: {}, active_streams: {})\n", 
+                         .{ self.goaway_sent, self.streams.count() });
+            }
+            
             return;
         }
         fn handle_stream_level_frame(self: *@This(), frame: Frame) !void {
+            std.debug.assert(frame.header.stream_id > 0);
+
+            try self.handle_stream_level_frame_validate(frame);
+            try self.handle_stream_level_frame_check_closed_stream(frame);
+
+            const stream = try self.handle_stream_level_frame_get_stream(frame);
+            try self.handle_stream_level_frame_process(stream, frame);
+            self.handle_stream_level_frame_update_continuation_state(frame);
+        }
+
+        /// Validate stream-level frame basic properties
+        fn handle_stream_level_frame_validate(self: *@This(), frame: Frame) !void {
             if (!is_valid_frame_type(@intFromEnum(frame.header.frame_type))) {
-                // Unknown frame type, ignore as per RFC 7540 Section 5.5
                 log.debug("Ignoring unknown stream-level frame type {d}\n", .{@intFromEnum(frame.header.frame_type)});
                 return;
             }
-            // Validate that stream-level frames do not have stream ID 0
+
             if (frame.header.stream_id == 0) {
                 log.err("Received stream-level frame {d} with stream ID 0: PROTOCOL_ERROR\n", .{@intFromEnum(frame.header.frame_type)});
                 try self.send_goaway(self.last_stream_id, 0x1, "Stream-level frame with stream ID 0: PROTOCOL_ERROR");
                 return error.ProtocolError;
             }
-            if (self.goaway_received and frame.header.stream_id > self.last_stream_id) {
-                // Ignore frames with stream IDs higher than the last stream ID in GOAWAY
-                log.debug("Ignoring frame on stream {d} as it exceeds peer_last_stream_id {d}\n", .{ frame.header.stream_id, self.last_stream_id });
-                return;
+
+            if (self.goaway_received) {
+                if (frame.header.stream_id > self.last_stream_id) {
+                    log.debug("Ignoring frame on stream {d} as it exceeds peer_last_stream_id {d}\n", .{ frame.header.stream_id, self.last_stream_id });
+                    return;
+                }
             }
-            // Check if the frame is a PUSH_PROMISE frame
+
             if (frame.header.frame_type == FrameType.PUSH_PROMISE) {
-                // Clients must not send PUSH_PROMISE frames
                 log.err("Received PUSH_PROMISE frame from client on stream {d}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
                 try self.send_goaway(self.last_stream_id, 0x1, "Client sent PUSH_PROMISE: PROTOCOL_ERROR");
                 self.goaway_sent = true;
                 return error.ProtocolError;
             }
-            // Check if this is a frame sent to a closed stream
-            if (self.closed_stream_ids.contains(frame.header.stream_id)) {
-                // Only PRIORITY and RST_STREAM frames are allowed on closed streams (RFC 7540 Section 5.1)
-                if (frame.header.frame_type != FrameType.PRIORITY and
-                    frame.header.frame_type != FrameType.RST_STREAM)
-                {
-                    log.err("Received frame type {d} on closed stream {d}: STREAM_CLOSED\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
-                    // Send GOAWAY with STREAM_CLOSED error code (RFC 7540 Section 5.1)
-                    try self.send_goaway(self.highest_stream_id(), 0x5, "Frame received on closed stream: STREAM_CLOSED");
-                    self.goaway_sent = true;
-                    return error.StreamClosed;
-                }
-                // For PRIORITY and RST_STREAM on closed streams, just ignore
+        }
+
+        /// Check if frame is being sent to a closed stream
+        fn handle_stream_level_frame_check_closed_stream(self: *@This(), frame: Frame) !void {
+            if (!self.closed_stream_ids.contains(frame.header.stream_id)) {
+                return;
+            }
+
+            const is_priority_frame = (frame.header.frame_type == FrameType.PRIORITY);
+            const is_rst_stream_frame = (frame.header.frame_type == FrameType.RST_STREAM);
+
+            if (is_priority_frame or is_rst_stream_frame) {
                 log.debug("Ignoring frame type {d} on closed stream {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
                 return;
             }
-            // Retrieve the corresponding stream
-            var stream = self.get_stream(frame.header.stream_id) catch |err| {
+
+            log.err("Received frame type {d} on closed stream {d}: STREAM_CLOSED\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
+            try self.send_goaway(self.highest_stream_id(), 0x5, "Frame received on closed stream: STREAM_CLOSED");
+            self.goaway_sent = true;
+            return error.StreamClosed;
+        }
+
+        /// Retrieve stream for frame processing
+        fn handle_stream_level_frame_get_stream(self: *@This(), frame: Frame) !*Stream {
+            return self.get_stream(frame.header.stream_id) catch |err| {
                 if (err == error.ProtocolError) {
-                    // Protocol error has been handled in get_stream
-                    return;
-                } else if (err == error.MaxConcurrentStreamsExceeded) {
-                    // Handle exceeding concurrent streams by sending RST_STREAM directly
-                    log.err("Cannot create stream {d}: Max concurrent streams exceeded.\n", .{frame.header.stream_id});
-                    // **Send RST_STREAM with REFUSED_STREAM (0x7) without creating a temporary stream**
-                    try self.send_rst_stream(frame.header.stream_id, 0x7); // REFUSED_STREAM
-                    log.debug("Sent RST_STREAM with REFUSED_STREAM (0x7) for stream ID {d}\n", .{frame.header.stream_id});
-                    return;
-                } else {
                     return err;
                 }
+                if (err == error.MaxConcurrentStreamsExceeded) {
+                    log.err("Cannot create stream {d}: Max concurrent streams exceeded.\n", .{frame.header.stream_id});
+                    try self.send_rst_stream(frame.header.stream_id, 0x7);
+                    log.debug("Sent RST_STREAM with REFUSED_STREAM (0x7) for stream ID {d}\n", .{frame.header.stream_id});
+                    return err;
+                }
+                return err;
             };
-            // Handle the frame within the stream
+        }
+
+        /// Process frame within the stream and handle errors
+        fn handle_stream_level_frame_process(self: *@This(), stream: *Stream, frame: Frame) !void {
             stream.handleFrame(frame) catch |err| {
                 log.err("Error handling frame in stream {d}: {s}\n", .{ frame.header.stream_id, @errorName(err) });
-                // If a GOAWAY has been sent, do not send additional frames
+
                 if (self.goaway_sent) {
                     return;
                 }
-                // Handle specific errors accordingly
-                switch (err) {
-                    error.FrameSizeError => {
-                        log.err("Frame size error on stream {d}: FRAME_SIZE_ERROR\n", .{frame.header.stream_id});
-                        try self.send_goaway(self.last_stream_id, 0x6, "Frame size error: FRAME_SIZE_ERROR");
-                        return;
-                    },
-                    error.CompressionError => {
-                        try self.send_goaway(0, 0x9, "Compression error: COMPRESSION_ERROR");
-                        return;
-                    },
-                    error.StreamClosed => {
-                        // Do not send RST_STREAM if GOAWAY has been sent
-                        if (!self.goaway_sent) {
-                            log.debug("Stream {d}: Detected StreamClosed error, sending RST_STREAM with STREAM_CLOSED (0x5)\n", .{frame.header.stream_id});
-                            try self.send_rst_stream(frame.header.stream_id, 0x5); // STREAM_CLOSED
-                        }
-                        return;
-                    },
-                    error.ProtocolError => {
-                        try self.send_goaway(self.last_stream_id, 0x1, "Protocol error: PROTOCOL_ERROR");
-                        return err;
-                    },
-                    error.InvalidStreamState, error.IdleStreamError => {
-                        try self.send_goaway(0, 0x1, "Invalid stream state: PROTOCOL_ERROR");
-                        return;
-                    },
-                    else => {
-                        // Handle other errors if necessary
-                    },
-                }
+
+                try self.handle_stream_level_frame_process_error(frame.header.stream_id, err);
             };
-            // If the frame is a HEADERS or PUSH_PROMISE frame without END_HEADERS, set expecting_continuation_stream_id
-            if (frame.header.frame_type == FrameType.HEADERS or frame.header.frame_type == FrameType.PUSH_PROMISE) {
-                if ((frame.header.flags.value & FrameFlags.END_HEADERS) == 0) {
+        }
+
+        /// Handle specific stream processing errors
+        fn handle_stream_level_frame_process_error(self: *@This(), stream_id: u32, err: anyerror) !void {
+            switch (err) {
+                error.FrameSizeError => {
+                    log.err("Frame size error on stream {d}: FRAME_SIZE_ERROR\n", .{stream_id});
+                    try self.send_goaway(self.last_stream_id, 0x6, "Frame size error: FRAME_SIZE_ERROR");
+                    return;
+                },
+                error.CompressionError => {
+                    try self.send_goaway(0, 0x9, "Compression error: COMPRESSION_ERROR");
+                    return;
+                },
+                error.StreamClosed => {
+                    if (!self.goaway_sent) {
+                        log.debug("Stream {d}: Detected StreamClosed error, sending RST_STREAM with STREAM_CLOSED (0x5)\n", .{stream_id});
+                        try self.send_rst_stream(stream_id, 0x5);
+                    }
+                    return;
+                },
+                error.ProtocolError => {
+                    try self.send_goaway(self.last_stream_id, 0x1, "Protocol error: PROTOCOL_ERROR");
+                    return err;
+                },
+                error.InvalidStreamState, error.IdleStreamError => {
+                    try self.send_goaway(0, 0x1, "Invalid stream state: PROTOCOL_ERROR");
+                    return;
+                },
+                else => {},
+            }
+        }
+
+        /// Update CONTINUATION frame expectations based on frame type and flags
+        fn handle_stream_level_frame_update_continuation_state(self: *@This(), frame: Frame) void {
+            const is_headers_frame = (frame.header.frame_type == FrameType.HEADERS);
+            const is_push_promise_frame = (frame.header.frame_type == FrameType.PUSH_PROMISE);
+            const is_continuation_frame = (frame.header.frame_type == FrameType.CONTINUATION);
+            const has_end_headers_flag = ((frame.header.flags.value & FrameFlags.END_HEADERS) != 0);
+
+            if (is_headers_frame or is_push_promise_frame) {
+                if (!has_end_headers_flag) {
                     self.expecting_continuation_stream_id = frame.header.stream_id;
                 }
             }
-            // If the frame is a CONTINUATION frame with END_HEADERS, clear expecting_continuation_stream_id
-            if (frame.header.frame_type == FrameType.CONTINUATION) {
-                if ((frame.header.flags.value & FrameFlags.END_HEADERS) != 0) {
+
+            if (is_continuation_frame) {
+                if (has_end_headers_flag) {
                     self.expecting_continuation_stream_id = null;
                 }
             }
-            // If the stream was closed, it will be removed in process_pending_streams
         }
         fn process_pending_streams(self: *@This()) !void {
             var to_remove = std.ArrayList(u32).init(self.allocator);
@@ -873,8 +971,10 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try self.writer.writeAll(opaque_data);
             log.debug("Sent PING frame (flags: {d}, opaque_data: {any})\n", .{ frame_header.flags.value, opaque_data });
         }
+
         pub fn process_request(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
             log.debug("Processing request for stream ID: {d}, state: {s}", .{ stream.id, @tagName(stream.state) });
+
             // Prepare a basic response: "Hello, World!"
             const response_body =
                 \\<!DOCTYPE html>
@@ -888,15 +988,19 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
                 .{ .name = ":status", .value = "200" },
                 .{ .name = "content-type", .value = "text/html" },
             };
-            var buffer = std.ArrayList(u8).init(self.allocator);
-            defer buffer.deinit();
-            // Encode headers and write them to the buffer
+
+            // Use static buffer instead of dynamic allocation for HPACK encoding
+            var header_buffer: [256]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&header_buffer);
+            var buffer = std.ArrayList(u8).init(fba.allocator());
+
+            // Encode headers into static buffer
             for (response_headers) |header| {
                 try Hpack.encodeHeaderField(header, &self.hpack_dynamic_table, &buffer);
             }
             const encoded_headers = buffer.items;
             log.debug("Encoded {} header bytes for stream {}", .{ encoded_headers.len, stream.id });
-            // Send HEADERS frame
+            // Send HEADERS frame with pre-encoded static headers
             var headers_frame = Frame{
                 .header = FrameHeader{
                     .length = @intCast(encoded_headers.len),
@@ -929,13 +1033,20 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             try data_frame.write(self.writer);
             log.debug("DATA frame sent successfully for stream {}", .{stream.id});
             log.debug("Sent 200 OK response with body: \"Hello, World!\" for stream {}", .{stream.id});
+            // Mark stream as closed after sending complete response
+            // This allows the stream to be garbage collected properly
             if (stream.state == .Open) {
-                stream.state = .HalfClosedLocal;
+                stream.state = .Closed;
+                log.debug("Stream {d}: Transitioned to Closed state after sending complete response", .{stream.id});
             } else if (stream.state == .HalfClosedRemote) {
-                // Keep stream in HalfClosedRemote state to allow RST_STREAM frames
-                // Stream will transition to Closed when explicitly reset or connection closes
-                log.debug("Stream {d}: Keeping in HalfClosedRemote state after response\n", .{stream.id});
+                stream.state = .Closed;
+                log.debug("Stream {d}: Transitioned to Closed state after sending complete response", .{stream.id});
             }
+            
+            // Immediately clean up completed streams to prevent accumulation
+            self.process_pending_streams() catch |err| {
+                log.err("Failed to clean up pending streams: {}", .{err});
+            };
         }
         pub fn send_settings(self: *@This()) !void {
             const settings = [_][2]u32{
@@ -1067,119 +1178,192 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             return std.meta.int_to_enum(FrameType, val) catch undefined;
         }
         pub fn apply_frame_settings(self: *@This(), frame: Frame) !void {
+            std.debug.assert(frame.header.frame_type == FrameType.SETTINGS);
+            std.debug.assert(frame.header.stream_id == 0);
+
+            try self.apply_frame_settings_validate(frame);
+
+            if (self.apply_frame_settings_is_ack(frame)) {
+                try self.apply_frame_settings_handle_ack(frame);
+                return;
+            }
+
+            try self.apply_frame_settings_validate_payload(frame);
+            try self.apply_frame_settings_process_parameters(frame);
+        }
+
+        /// Validate SETTINGS frame basic properties
+        fn apply_frame_settings_validate(self: *@This(), frame: Frame) !void {
             if (frame.header.frame_type != FrameType.SETTINGS) {
                 log.err("Received frame with invalid frame type: {any}\n", .{frame.header.frame_type});
                 return error.InvalidFrameType;
             }
+
             if (frame.header.stream_id != 0) {
                 log.err("SETTINGS frame received on a non-zero stream ID: {any}\n", .{frame.header.stream_id});
                 if (!self.goaway_sent) {
                     try self.send_goaway(0, 0x1, "SETTINGS frame with non-zero stream ID: PROTOCOL_ERROR");
                     self.goaway_sent = true;
                 }
-                return; // Don't return error to avoid duplicate GOAWAY
-            }
-            if ((frame.header.flags.value & FrameFlags.ACK) != 0) {
-                if (frame.payload.len != 0) {
-                    log.err("SETTINGS frame with ACK flag and non-zero payload length\n", .{});
-                    if (!self.goaway_sent) {
-                        try self.send_goaway(0, 0x6, "SETTINGS ACK with payload: FRAME_SIZE_ERROR");
-                        self.goaway_sent = true;
-                    }
-                    return; // Don't return error to avoid duplicate GOAWAY
-                }
-                // Do not apply settings when ACK flag is set
                 return;
             }
+        }
+
+        /// Check if SETTINGS frame has ACK flag
+        fn apply_frame_settings_is_ack(self: *@This(), frame: Frame) bool {
+            _ = self;
+            return (frame.header.flags.value & FrameFlags.ACK) != 0;
+        }
+
+        /// Handle SETTINGS ACK frame
+        fn apply_frame_settings_handle_ack(self: *@This(), frame: Frame) !void {
+            if (frame.payload.len != 0) {
+                log.err("SETTINGS frame with ACK flag and non-zero payload length\n", .{});
+                if (!self.goaway_sent) {
+                    try self.send_goaway(0, 0x6, "SETTINGS ACK with payload: FRAME_SIZE_ERROR");
+                    self.goaway_sent = true;
+                }
+                return;
+            }
+        }
+
+        /// Validate SETTINGS frame payload format
+        fn apply_frame_settings_validate_payload(self: *@This(), frame: Frame) !void {
             if (frame.payload.len % 6 != 0) {
                 log.err("Invalid SETTINGS frame size: {any}\n", .{frame.payload.len});
                 if (!self.goaway_sent) {
                     try self.send_goaway(0, 0x6, "Invalid SETTINGS frame size: FRAME_SIZE_ERROR");
                     self.goaway_sent = true;
                 }
-                return; // Don't return error to avoid duplicate GOAWAY
+                return;
             }
+        }
+
+        /// Process all SETTINGS parameters in frame payload
+        fn apply_frame_settings_process_parameters(self: *@This(), frame: Frame) !void {
             const buffer = frame.payload;
-            const buffer_size: usize = buffer.len;
-            var i: usize = 0;
-            while (i + 6 <= buffer_size) {
-                // Read the setting ID (2 bytes)
-                const id_ptr: *const [2]u8 = @ptrCast(&buffer[i]);
-                const id = std.mem.readInt(u16, id_ptr, .big);
-                // Read the setting value (4 bytes)
-                const value_ptr: *const [4]u8 = @ptrCast(&buffer[i + 2]);
-                const value = std.mem.readInt(u32, value_ptr, .big);
-                // Per RFC 7540: "the value of a SETTINGS parameter is the last value that is seen by a receiver"
-                // Duplicate parameters are allowed and processed in order
-                switch (id) {
-                    1 => { // SETTINGS_HEADER_TABLE_SIZE
-                        self.settings.header_table_size = value;
-                        try self.hpack_dynamic_table.updateMaxSize(value);
-                    },
-                    2 => { // SETTINGS_ENABLE_PUSH
-                        if (value != 0 and value != 1) {
-                            log.err("Invalid SETTINGS_ENABLE_PUSH value {d}: PROTOCOL_ERROR\n", .{value});
-                            if (!self.goaway_sent) {
-                                try self.send_goaway(0, 0x1, "Invalid SETTINGS_ENABLE_PUSH value: PROTOCOL_ERROR");
-                                self.goaway_sent = true;
-                            }
-                            return; // Don't return error to avoid duplicate GOAWAY
-                        }
-                        self.settings.enable_push = (value == 1);
-                    },
-                    3 => { // SETTINGS_MAX_CONCURRENT_STREAMS
-                        self.settings.max_concurrent_streams = value;
-                    },
-                    4 => { // SETTINGS_INITIAL_WINDOW_SIZE
-                        if (value > 2147483647) {
-                            log.err("SETTINGS_INITIAL_WINDOW_SIZE too large {d}: FLOW_CONTROL_ERROR\n", .{value});
-                            if (!self.goaway_sent) {
-                                try self.send_goaway(0, 0x3, "SETTINGS_INITIAL_WINDOW_SIZE too large: FLOW_CONTROL_ERROR");
-                                self.goaway_sent = true;
-                            }
-                            return; // Don't return error to avoid duplicate GOAWAY
-                        }
-                        const old_initial_window_size = self.settings.initial_window_size;
-                        self.settings.initial_window_size = value;
-                        const value_i32: i32 = @intCast(value);
-                        const old_iw_i32: i32 = @intCast(old_initial_window_size);
-                        const delta: i32 = value_i32 - old_iw_i32;
-                        // Adjust window sizes of all open streams
-                        var it = self.streams.iterator();
-                        while (it.next()) |entry| {
-                            const stream = entry.value_ptr.*;
-                            stream.recv_window_size += delta;
-                            if (stream.recv_window_size > 2147483647 or stream.recv_window_size < 0) {
-                                // The value MUST be treated as a connection error of type FLOW_CONTROL_ERROR.
-                                log.err("Stream window size overflow on stream {d}: FLOW_CONTROL_ERROR\n", .{stream.id});
-                                if (!self.goaway_sent) {
-                                    try self.send_goaway(0, 0x3, "Stream window size overflow: FLOW_CONTROL_ERROR");
-                                    self.goaway_sent = true;
-                                }
-                                return; // Don't return error to avoid duplicate GOAWAY
-                            }
-                        }
-                    },
-                    5 => { // SETTINGS_MAX_FRAME_SIZE
-                        if (value < 16384 or value > 16777215) {
-                            log.err("Invalid SETTINGS_MAX_FRAME_SIZE value {d}: PROTOCOL_ERROR\n", .{value});
-                            if (!self.goaway_sent) {
-                                try self.send_goaway(0, 0x1, "Invalid SETTINGS_MAX_FRAME_SIZE value: PROTOCOL_ERROR");
-                                self.goaway_sent = true;
-                            }
-                            return; // Don't return error to avoid duplicate GOAWAY
-                        }
-                        self.settings.max_frame_size = value;
-                    },
-                    6 => { // SETTINGS_MAX_HEADER_LIST_SIZE
-                        self.settings.max_header_list_size = value;
-                    },
-                    else => {
-                        // Unknown settings should be ignored
-                    },
-                }
-                i += 6; // Move to the next setting (6 bytes per setting)
+            const buffer_size_u32: u32 = @intCast(buffer.len);
+            var index: u32 = 0;
+
+            while (index + 6 <= buffer_size_u32) {
+                const setting_id_ptr: *const [2]u8 = @ptrCast(&buffer[index]);
+                const setting_id = std.mem.readInt(u16, setting_id_ptr, .big);
+
+                const setting_value_ptr: *const [4]u8 = @ptrCast(&buffer[index + 2]);
+                const setting_value = std.mem.readInt(u32, setting_value_ptr, .big);
+
+                try self.apply_frame_settings_process_single_parameter(setting_id, setting_value);
+                index += 6;
             }
+        }
+
+        /// Process a single SETTINGS parameter
+        fn apply_frame_settings_process_single_parameter(self: *@This(), setting_id: u16, setting_value: u32) !void {
+            switch (setting_id) {
+                1 => try self.apply_frame_settings_header_table_size(setting_value),
+                2 => try self.apply_frame_settings_enable_push(setting_value),
+                3 => self.apply_frame_settings_max_concurrent_streams(setting_value),
+                4 => try self.apply_frame_settings_initial_window_size(setting_value),
+                5 => try self.apply_frame_settings_max_frame_size(setting_value),
+                6 => self.apply_frame_settings_max_header_list_size(setting_value),
+                else => {},
+            }
+        }
+
+        /// Handle SETTINGS_HEADER_TABLE_SIZE
+        fn apply_frame_settings_header_table_size(self: *@This(), value: u32) !void {
+            self.settings.header_table_size = value;
+            try self.hpack_dynamic_table.updateMaxSize(value);
+        }
+
+        /// Handle SETTINGS_ENABLE_PUSH
+        fn apply_frame_settings_enable_push(self: *@This(), value: u32) !void {
+            if (value != 0 and value != 1) {
+                log.err("Invalid SETTINGS_ENABLE_PUSH value {d}: PROTOCOL_ERROR\n", .{value});
+                if (!self.goaway_sent) {
+                    try self.send_goaway(0, 0x1, "Invalid SETTINGS_ENABLE_PUSH value: PROTOCOL_ERROR");
+                    self.goaway_sent = true;
+                }
+                return;
+            }
+            self.settings.enable_push = (value == 1);
+        }
+
+        /// Handle SETTINGS_MAX_CONCURRENT_STREAMS
+        fn apply_frame_settings_max_concurrent_streams(self: *@This(), value: u32) void {
+            self.settings.max_concurrent_streams = value;
+        }
+
+        /// Handle SETTINGS_INITIAL_WINDOW_SIZE
+        fn apply_frame_settings_initial_window_size(self: *@This(), value: u32) !void {
+            const max_window_size: u32 = 2147483647;
+            if (value > max_window_size) {
+                log.err("SETTINGS_INITIAL_WINDOW_SIZE too large {d}: FLOW_CONTROL_ERROR\n", .{value});
+                if (!self.goaway_sent) {
+                    try self.send_goaway(0, 0x3, "SETTINGS_INITIAL_WINDOW_SIZE too large: FLOW_CONTROL_ERROR");
+                    self.goaway_sent = true;
+                }
+                return;
+            }
+
+            const old_window_size = self.settings.initial_window_size;
+            self.settings.initial_window_size = value;
+
+            const new_size_i32: i32 = @intCast(value);
+            const old_size_i32: i32 = @intCast(old_window_size);
+            const window_delta: i32 = new_size_i32 - old_size_i32;
+
+            try self.apply_frame_settings_update_stream_windows(window_delta);
+        }
+
+        /// Update all stream window sizes when initial window size changes
+        fn apply_frame_settings_update_stream_windows(self: *@This(), window_delta: i32) !void {
+            const max_window_size: i32 = 2147483647;
+            const min_window_size: i32 = 0;
+
+            var streams_iterator = self.streams.iterator();
+            while (streams_iterator.next()) |entry| {
+                const stream = entry.value_ptr.*;
+                stream.recv_window_size += window_delta;
+
+                if (stream.recv_window_size > max_window_size) {
+                    log.err("Stream window size overflow on stream {d}: FLOW_CONTROL_ERROR\n", .{stream.id});
+                    if (!self.goaway_sent) {
+                        try self.send_goaway(0, 0x3, "Stream window size overflow: FLOW_CONTROL_ERROR");
+                        self.goaway_sent = true;
+                    }
+                    return;
+                }
+                if (stream.recv_window_size < min_window_size) {
+                    log.err("Stream window size underflow on stream {d}: FLOW_CONTROL_ERROR\n", .{stream.id});
+                    if (!self.goaway_sent) {
+                        try self.send_goaway(0, 0x3, "Stream window size underflow: FLOW_CONTROL_ERROR");
+                        self.goaway_sent = true;
+                    }
+                    return;
+                }
+            }
+        }
+
+        /// Handle SETTINGS_MAX_FRAME_SIZE
+        fn apply_frame_settings_max_frame_size(self: *@This(), value: u32) !void {
+            const min_frame_size: u32 = 16384;
+            const max_frame_size: u32 = 16777215;
+
+            if (value < min_frame_size or value > max_frame_size) {
+                log.err("Invalid SETTINGS_MAX_FRAME_SIZE value {d}: PROTOCOL_ERROR\n", .{value});
+                if (!self.goaway_sent) {
+                    try self.send_goaway(0, 0x1, "Invalid SETTINGS_MAX_FRAME_SIZE value: PROTOCOL_ERROR");
+                    self.goaway_sent = true;
+                }
+                return;
+            }
+            self.settings.max_frame_size = value;
+        }
+
+        /// Handle SETTINGS_MAX_HEADER_LIST_SIZE
+        fn apply_frame_settings_max_header_list_size(self: *@This(), value: u32) void {
+            self.settings.max_header_list_size = value;
         }
         pub fn send_settings_ack(self: *@This()) !void {
             if (self.goaway_sent) return;
@@ -1332,7 +1516,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
             }
             self.recv_window_size = ov[0];
         }
-        fn send_window_update(self: *@This(), stream_id: u32, increment: i32) !void {
+        pub fn send_window_update(self: *@This(), stream_id: u32, increment: i32) !void {
             var frame_header = FrameHeader{
                 .length = 4,
                 .frame_type = FrameType.WINDOW_UPDATE,
@@ -1426,7 +1610,7 @@ pub fn Connection(comptime ReaderType: type, comptime WriterType: type) type {
 const Settings = struct {
     header_table_size: u32 = 4096,
     enable_push: bool = true,
-    max_concurrent_streams: u32 = 100,
+    max_concurrent_streams: u32 = 50,
     initial_window_size: u32 = 65535,
     max_frame_size: u32 = 16384,
     max_header_list_size: u32 = 8192,

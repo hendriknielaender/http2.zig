@@ -1,112 +1,111 @@
-# HTTP/2 Benchmark Suite
+# HTTP/2 Benchmarks
 
-This benchmark suite uses [oha](https://github.com/hatoo/oha) to test the performance of the http2.zig implementation. Oha is a modern HTTP load testing tool written in Rust with excellent HTTP/2 support.
+## Overview
 
-## Prerequisites
+High-performance benchmarks for testing HTTP/2 server performance with both HTTP and HTTPS support.
 
-1. **Install oha:**
-   ```bash
-   cargo install oha
-   ```
-   Or use the Makefile:
-   ```bash
-   make install-oha
-   ```
+## Features
 
-## Quick Start
+- **HTTP/2 over HTTPS**: TLS with ALPN h2 negotiation (default)
+- **HTTP/2 cleartext**: Optional fallback mode
+- **Event-driven**: libxev-based async I/O for maximum performance
+- **Cross-platform**: Supports Linux, macOS, and Windows
 
-1. **Build the benchmark server:**
-   ```bash
-   make build
-   ```
+## Building
 
-2. **Start the server** (in one terminal):
-   ```bash
-   make run-server
-   ```
+```bash
+# Build benchmark server
+zig build
 
-3. **Run benchmarks** (in another terminal):
-   ```bash
-   make benchmark
-   ```
+# Build with optimizations
+zig build -Doptimize=ReleaseFast
+```
 
-## Available Commands
+## Running
 
-- `make build` - Build the benchmark server
-- `make run-server` - Start the HTTP/2 benchmark server on port 8080
-- `make benchmark` - Run standard benchmark (30s, 100 connections, 1000 req/s)
-- `make quick-benchmark` - Run quick benchmark (10s, 50 connections, 500 req/s)
-- `make stress-test` - Run stress test (60s, 1000 connections, 5000 req/s)
-- `make full-benchmark` - Run complete benchmark suite
-- `make install-oha` - Install oha tool
-- `make clean` - Clean build artifacts
+```bash
+# Run HTTPS benchmark server (default)
+zig build run
+
+# Run with custom port
+PORT=9443 zig build run
+
+# Run HTTP cleartext server
+TLS=false PORT=3000 zig build run
+```
+
+## Benchmarking
+
+### HTTPS Benchmarking
+```bash
+# Start HTTPS server
+./zig-out/bin/http2-benchmark &
+
+# Test with curl
+curl -k --http2 https://127.0.0.1:8443
+
+# Benchmark with h2load (requires nghttp2-client)
+h2load -n 10000 -c 100 -m 10 https://127.0.0.1:8443/
+```
+
+### HTTP Benchmarking
+```bash
+# Start HTTP server
+TLS=false ./zig-out/bin/http2-benchmark &
+
+# Test with curl
+curl --http2-prior-knowledge http://127.0.0.1:3000
+
+# Benchmark with h2load
+h2load -n 10000 -c 100 -m 10 http://127.0.0.1:3000/
+```
 
 ## Configuration
 
-You can customize benchmark parameters using environment variables:
+- `PORT`: Server port (default: 8443 for HTTPS, 3000 for HTTP)
+- `TLS`: Enable TLS mode (default: true)
 
 ```bash
-PORT=8080 DURATION=30s CONNECTIONS=100 RATE=1000 make benchmark
+# HTTPS on custom port
+PORT=9443 TLS=true ./zig-out/bin/http2-benchmark
+
+# HTTP cleartext on custom port  
+PORT=8080 TLS=false ./zig-out/bin/http2-benchmark
 ```
 
-Available variables:
-- `PORT` - Server port (default: 8080)
-- `DURATION` - Benchmark duration (default: 30s)
-- `CONNECTIONS` - Concurrent connections (default: 100)
-- `RATE` - Requests per second (default: 1000)
+## Output
 
-## Manual Usage
+### Server Performance Monitoring
+```
+HTTP/2 over HTTPS benchmark server ready on port 8443
+TLS with ALPN h2 negotiation enabled for performance testing
+Event-driven architecture with libxev (cross-platform)
 
-You can also run oha directly:
+[HTTP/2] 23 active | 2850 req/s (42 conn/s) | 142500 total reqs | Peak: 3100 req/s
+[HTTP/2] 45 active | 3120 req/s (38 conn/s) | 185620 total reqs | Peak: 3120 req/s
+```
 
+### h2load Benchmark Results
 ```bash
-# Basic HTTP/2 benchmark
-oha --http2 -c 100 -z 30s -q 1000 http://127.0.0.1:8080
-
-# With latency correction
-oha --http2 -c 100 -z 30s -q 1000 --latency-correction http://127.0.0.1:8080
-
-# JSON output for analysis
-oha --http2 -c 100 -z 30s -q 1000 --json http://127.0.0.1:8080
+# Example HTTPS benchmark
+$ h2load -n 10000 -c 100 -m 10 https://127.0.0.1:8443/
+finished in 2.45s, 4081.63 req/s, 1.52MB/s
+requests: 10000 total, 10000 started, 10000 done, 10000 succeeded
 ```
 
-## Benchmark Types
+## Requirements
 
-The suite includes several benchmark scenarios:
+- **TLS certificates**: `cert.pem` and `key.pem` (provided for testing)
+- **BoringSSL**: Linked automatically during build
+- **h2load**: For HTTP/2 benchmarking (optional)
 
-1. **Basic Benchmark** - Standard load test with configurable parameters
-2. **Latency Benchmark** - Focus on response time distribution
-3. **High Concurrency** - 500 connections, 2000 req/s for 10s
-4. **Low Latency** - 10 connections, 100 req/s for 10s with detailed latency stats
+## Files
 
-## Server Implementation
-
-The benchmark server (`server.zig`) is a minimal HTTP/2 server implementation that:
-- Listens on the specified port (default: 8080)
-- Uses plain HTTP/2 (no TLS) for better benchmark performance
-- Handles connections using the http2.zig library
-- Provides basic error handling and graceful connection management
-
-## Results Interpretation
-
-Oha provides comprehensive metrics:
-
-- **Requests/sec** - Throughput (total and average)
-- **Latency** - Response time statistics (min, max, mean, percentiles)
-- **Status codes** - HTTP response code distribution
-- **Transfer rate** - Data transfer statistics
-- **Connection stats** - Connection establishment metrics
-
-Key metrics to focus on:
-- **Average RPS** for overall throughput
-- **Latency percentiles** (50th, 95th, 99th) for response time analysis
-- **Success rate** to ensure stability
-- **Slowest/Fastest** requests for range analysis
-
-## Oha Advantages
-
-- **Modern HTTP/2 support** with proper multiplexing
-- **JSON output** for programmatic analysis
-- **Latency correction** for more accurate measurements
-- **Built-in statistics** with percentile calculations
-- **Fast and efficient** implementation in Rust
+```
+benchmarks/
+├── benchmark.zig       # HTTP/2 benchmark server
+├── build.zig          # Build configuration with TLS support
+├── cert.pem           # TLS certificate (testing only)
+├── key.pem            # TLS private key (testing only)
+└── README.md          # This file
+```

@@ -321,7 +321,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
                 // Process completed requests immediately
                 if (self.request_complete) {
-                    log.debug("Request complete for stream {}, processing response", .{self.id});
+                    log.debug("Request complete for stream {}, processing response immediately but yielding", .{self.id});
+                    // Process the request immediately but in a way that yields control quickly
                     try self.conn.process_request(self);
                     log.debug("Response processing finished for stream {}", .{self.id});
                 }
@@ -572,6 +573,13 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 self.recv_window_size -= @intCast(frame.header.length);
                 if (self.recv_window_size < 0) {
                     return error.FlowControlError;
+                }
+
+                // Send WINDOW_UPDATE to allow client to send more data
+                // This is critical for HTTP/2 flow control
+                if (frame.header.length > 0) {
+                    try self.conn.send_window_update(self.id, @intCast(frame.header.length));
+                    log.debug("Sent WINDOW_UPDATE for stream {} with increment {}", .{self.id, frame.header.length});
                 }
 
                 if (frame.header.flags.isEndStream()) {
@@ -920,4 +928,3 @@ test "state machine transitions" {
     try std.testing.expectEqual(StreamState.HalfClosedRemote, transitionState(.Open, .RecvEndStream));
     try std.testing.expectEqual(StreamState.Closed, transitionState(.HalfClosedLocal, .RecvEndStream));
 }
-

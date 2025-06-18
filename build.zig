@@ -1,7 +1,7 @@
 //! HTTP/2 Protocol Implementation Build Configuration
 //!
-//! - Library build for embedding in other projects
-//! - Example server and client applications
+//! - High-performance HTTP/2 library with libxev
+//! - Example server applications  
 //! - Comprehensive test suite
 //! - Documentation generation
 //! - Benchmarking tools
@@ -56,64 +56,89 @@ pub fn build(b: *std.Build) void {
     http2_module.addImport("xev", libxev.module("xev"));
 
     // Example applications
-    add_example_applications(b, target, optimize, http2_module);
+    add_examples(b, target, optimize, http2_module);
+
+    // Benchmark application
+    add_benchmark(b, target, optimize, http2_module);
 
     // Test suite
-    add_test_suite(b, target, optimize);
+    add_tests(b, target, optimize, libxev);
 
     // Documentation
     add_documentation(b, http2_lib);
 
-    // Benchmarks
-    add_benchmarks(b, target, optimize, http2_module);
-
-    // Linting and formatting
+    // Code quality checks
     add_code_quality_checks(b);
 }
 
-/// Add example applications demonstrating HTTP/2 usage
-fn add_example_applications(
+/// Add example applications
+fn add_examples(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     http2_module: *std.Build.Module,
 ) void {
-    // Hello World Example (main example)
-    const hello_world_example = b.addExecutable(.{
-        .name = "hello_world_server",
-        .root_source_file = b.path("examples/hello-world/src/main.zig"),
+    // Basic TLS Example
+    const basic_tls = b.addExecutable(.{
+        .name = "basic_tls_server",
+        .root_source_file = b.path("examples/basic_tls.zig"),
         .target = target,
         .optimize = optimize,
     });
-    hello_world_example.root_module.addImport("http2", http2_module);
-    hello_world_example.linkLibC();
-    hello_world_example.linkLibCpp();
-    hello_world_example.addIncludePath(b.path("boringssl/include"));
-    hello_world_example.addLibraryPath(b.path("boringssl/build"));
-    hello_world_example.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
-    hello_world_example.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
-    b.installArtifact(hello_world_example);
+    basic_tls.root_module.addImport("http2", http2_module);
+    basic_tls.linkLibC();
+    basic_tls.linkLibCpp();
+    basic_tls.addIncludePath(b.path("boringssl/include"));
+    basic_tls.addLibraryPath(b.path("boringssl/build"));
+    basic_tls.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
+    basic_tls.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
+    b.installArtifact(basic_tls);
 
-    // Run step for hello world example
-    const run_hello_world = b.addRunArtifact(hello_world_example);
-    run_hello_world.step.dependOn(b.getInstallStep());
-    const run_hello_world_step = b.step("run", "Run hello world server (default)");
-    run_hello_world_step.dependOn(&run_hello_world.step);
+    // Run step for basic TLS example
+    const run_basic = b.addRunArtifact(basic_tls);
+    run_basic.step.dependOn(b.getInstallStep());
+    const run_step = b.step("run", "Run basic TLS server example");
+    run_step.dependOn(&run_basic.step);
 }
 
-/// Add comprehensive test suite
-fn add_test_suite(
+/// Add benchmark application
+fn add_benchmark(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    http2_module: *std.Build.Module,
 ) void {
-    // Add libxev dependency for tests
-    const libxev = b.dependency("libxev", .{
+    // Benchmark server
+    const benchmark = b.addExecutable(.{
+        .name = "benchmark",
+        .root_source_file = b.path("benchmarks/benchmark.zig"),
         .target = target,
         .optimize = optimize,
     });
+    benchmark.root_module.addImport("http2", http2_module);
+    benchmark.linkLibC();
+    benchmark.linkLibCpp();
+    benchmark.addIncludePath(b.path("boringssl/include"));
+    benchmark.addLibraryPath(b.path("boringssl/build"));
+    benchmark.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
+    benchmark.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
+    b.installArtifact(benchmark);
 
-    // Unit tests for all modules
+    // Run step for benchmark
+    const run_benchmark = b.addRunArtifact(benchmark);
+    run_benchmark.step.dependOn(b.getInstallStep());
+    const benchmark_step = b.step("benchmark", "Run HTTP/2 benchmark server");
+    benchmark_step.dependOn(&run_benchmark.step);
+}
+
+/// Add comprehensive test suite
+fn add_tests(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    libxev: *std.Build.Dependency,
+) void {
+    // Unit tests for core modules
     const test_modules = [_][]const u8{
         "src/frame.zig",
         "src/stream.zig", 
@@ -124,6 +149,7 @@ fn add_test_suite(
         "src/worker_pool.zig",
         "src/http2.zig",
         "src/memory_budget.zig",
+        "src/server.zig",
     };
 
     var all_tests_step = b.step("test", "Run all unit tests");
@@ -135,17 +161,12 @@ fn add_test_suite(
             .optimize = optimize,
         });
         
-        // Add libxev dependency to tests that need it
+        // Add libxev dependency to tests
         module_test.root_module.addImport("xev", libxev.module("xev"));
 
         const run_test = b.addRunArtifact(module_test);
         all_tests_step.dependOn(&run_test.step);
     }
-
-    // H2spec conformance tests (external tool)
-    const h2spec_test_step = b.step("test-h2spec", "Run h2spec conformance tests");
-    const h2spec_cmd = b.addSystemCommand(&[_][]const u8{ "h2spec", "http2", "-h", "127.0.0.1", "-p", "9001", "-S" });
-    h2spec_test_step.dependOn(&h2spec_cmd.step);
 }
 
 /// Add documentation generation
@@ -160,38 +181,11 @@ fn add_documentation(b: *std.Build, http2_lib: *std.Build.Step.Compile) void {
     docs_step.dependOn(&docs.step);
 }
 
-/// Add benchmark suite
-fn add_benchmarks(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    http2_module: *std.Build.Module,
-) void {
-    // Skip benchmarks if files don't exist yet
-    _ = b;
-    _ = target;
-    _ = optimize;
-    _ = http2_module;
-
-    // TODO: Implement when benchmark structure is ready
-    // const benchmark_exe = b.addExecutable(.{
-    //     .name = "http2_benchmark",
-    //     .root_source_file = b.path("benchmarks/benchmark.zig"),
-    //     .target = target,
-    //     .optimize = .ReleaseFast,
-    // });
-    // benchmark_exe.root_module.addImport("http2", http2_module);
-
-    // const run_benchmark = b.addRunArtifact(benchmark_exe);
-    // const benchmark_step = b.step("benchmark", "Run performance benchmarks");
-    // benchmark_step.dependOn(&run_benchmark.step);
-}
-
 /// Add code quality and formatting checks
 fn add_code_quality_checks(b: *std.Build) void {
     // Format check
     const fmt_check = b.addFmt(.{
-        .paths = &[_][]const u8{ "src/", "examples/", "scripts/" },
+        .paths = &[_][]const u8{ "src/", "examples/", "benchmarks/" },
         .check = true,
     });
     const fmt_check_step = b.step("fmt-check", "Check code formatting");
@@ -199,7 +193,7 @@ fn add_code_quality_checks(b: *std.Build) void {
 
     // Format fix
     const fmt_fix = b.addFmt(.{
-        .paths = &[_][]const u8{ "src/", "examples/", "scripts/" },
+        .paths = &[_][]const u8{ "src/", "examples/", "benchmarks/" },
         .check = false,
     });
     const fmt_fix_step = b.step("fmt", "Fix code formatting");

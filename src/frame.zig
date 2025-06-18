@@ -35,8 +35,7 @@ pub const FrameType = enum(u8) {
     CONTINUATION = 0x9,
     pub fn isValid(self: FrameType) bool {
         return switch (self) {
-            .DATA, .HEADERS, .PRIORITY, .RST_STREAM, .SETTINGS,
-            .PUSH_PROMISE, .PING, .GOAWAY, .WINDOW_UPDATE, .CONTINUATION => true,
+            .DATA, .HEADERS, .PRIORITY, .RST_STREAM, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .WINDOW_UPDATE, .CONTINUATION => true,
         };
     }
     pub fn fromU8(value: u8) ?FrameType {

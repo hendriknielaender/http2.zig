@@ -219,4 +219,3 @@ test "Pool operation performance" {
     try std.testing.expect(ns_per_op < 1000);
     std.log.debug("Pool operations: {d}ns per acquire/release cycle", .{ns_per_op});
 }
-

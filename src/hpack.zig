@@ -331,6 +331,10 @@ pub const Hpack = struct {
     // HPACK integer encoding based on RFC 7541 (Section 5.1)
 
     pub fn encodeInt(value: usize, prefix_size: u8, buffer: *std.ArrayList(u8), prefix_value: u8) !void {
+        assert(prefix_size >= 1);
+        assert(prefix_size <= 8);
+        assert(@intFromPtr(buffer) != 0);
+
         if (prefix_size < 1 or prefix_size > 8) return error.InvalidPrefixSize;
         const max_prefix_value = (@as(usize, 1) << @intCast(prefix_size)) - 1;
         if (value < max_prefix_value) {
@@ -349,6 +353,9 @@ pub const Hpack = struct {
     }
 
     pub fn encodeString(str: []const u8, buffer: *std.ArrayList(u8)) !void {
+        assert(str.len <= MAX_HEADER_LIST_SIZE);
+        assert(@intFromPtr(buffer) != 0);
+
         const use_huffman = str.len > 16; // Threshold for Huffman benefit
         const huffman_bit: u8 = if (use_huffman) 0x80 else 0;
         if (use_huffman) {
@@ -367,6 +374,11 @@ pub const Hpack = struct {
         dynamic_table: *DynamicTable,
         buffer: *std.ArrayList(u8),
     ) !void {
+        assert(field.name.len > 0);
+        assert(field.name.len <= MAX_HEADER_LIST_SIZE);
+        assert(@intFromPtr(dynamic_table) != 0);
+        assert(@intFromPtr(buffer) != 0);
+
         const static_index = Hpack.StaticTable.getStaticIndex(field.name, field.value);
         if (static_index) |idx| {
             // Indexed Header Field Representation (Section 6.1)

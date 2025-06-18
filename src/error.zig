@@ -1,3 +1,4 @@
+/// HTTP/2 error codes as defined in RFC 7540.
 pub const ErrorCode = enum(u32) {
     NO_ERROR = 0x0,
     PROTOCOL_ERROR = 0x1,
@@ -13,4 +14,28 @@ pub const ErrorCode = enum(u32) {
     ENHANCE_YOUR_CALM = 0xb,
     INADEQUATE_SECURITY = 0xc,
     HTTP_1_1_REQUIRED = 0xd,
+};
+
+/// HTTP/2 protocol errors.
+pub const Http2Error = error{
+    /// Invalid frame format or content.
+    InvalidFrame,
+    /// Frame size exceeds maximum allowed.
+    FrameTooLarge,
+    /// Connection protocol error.
+    ProtocolError,
+    /// Stream state error.
+    StreamError,
+    /// Flow control error.
+    FlowControlError,
+    /// Settings timeout.
+    SettingsTimeout,
+    /// Connection closed.
+    ConnectionClosed,
+    /// Insufficient buffer space.
+    InsufficientBuffer,
+    /// Invalid stream state.
+    InvalidStreamState,
+    /// Compression error.
+    CompressionError,
 };

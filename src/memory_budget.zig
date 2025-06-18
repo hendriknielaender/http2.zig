@@ -12,7 +12,7 @@ pub const MiB = 1024 * KiB;
 pub const GiB = 1024 * MiB;
 /// Compile-time Memory Budget Calculator
 pub const MemBudget = struct {
-    pub const max_conns = 10; // Reduced for testing
+    pub const max_conns = 10; // Back to working configuration
     pub const max_streams_per_conn = 5; // Reduced for testing
     // HTTP/2 protocol limits (balanced for constraints)
     pub const bytes_per_conn = 64 * KiB; // Per-connection flow-control window
@@ -59,12 +59,12 @@ pub const MemBudget = struct {
 };
 /// Static Memory Pool for Zero-Allocation Operations
 pub const StaticMemoryPool = struct {
-    // Pre-allocated connection pool
-    connection_pool: [MemBudget.max_conns]?ConnectionSlot,
-    connection_free_list: std.DoublyLinkedList(*ConnectionSlot),
-    // Pre-allocated stream pools (per connection)
-    stream_pools: [MemBudget.max_conns][MemBudget.max_streams_per_conn]?StreamSlot,
-    stream_free_lists: [MemBudget.max_conns]std.DoublyLinkedList(*StreamSlot),
+    // Pre-allocated connection pool - simplified without linked lists for now
+    connection_pool: [MemBudget.max_conns]ConnectionSlot,
+    connection_next_free: std.atomic.Value(u32),
+    // Pre-allocated stream pools (per connection) - simplified
+    stream_pools: [MemBudget.max_conns][MemBudget.max_streams_per_conn]StreamSlot,
+    stream_next_free: [MemBudget.max_conns]std.atomic.Value(u32),
     // Pre-allocated data buffers
     data_buffer_pool: [MemBudget.max_conns * MemBudget.max_streams_per_conn][MemBudget.max_data_buffer]u8,
     header_buffer_pool: [MemBudget.max_conns * MemBudget.max_streams_per_conn][MemBudget.max_header_size]u8,
@@ -75,44 +75,56 @@ pub const StaticMemoryPool = struct {
     const Self = @This();
     pub fn init(backing_allocator: std.mem.Allocator) !Self {
         var self = Self{
-            .connection_pool = [_]?ConnectionSlot{null} ** MemBudget.max_conns,
-            .connection_free_list = .{},
-            .stream_pools = [_][MemBudget.max_streams_per_conn]?StreamSlot{[_]?StreamSlot{null} ** MemBudget.max_streams_per_conn} ** MemBudget.max_conns,
-            .stream_free_lists = [_]std.DoublyLinkedList(*StreamSlot){.{}} ** MemBudget.max_conns,
+            .connection_pool = undefined,
+            .connection_next_free = std.atomic.Value(u32).init(0),
+            .stream_pools = undefined,
+            .stream_next_free = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** MemBudget.max_conns,
             .data_buffer_pool = undefined,
             .header_buffer_pool = undefined,
             .arena = std.heap.ArenaAllocator.init(backing_allocator),
         };
-        // Initialize connection free list
-        for (&self.connection_pool, 0..) |*slot, i| {
-            slot.* = ConnectionSlot{
-                .id = i,
+
+        // Initialize connection pool
+        for (&self.connection_pool, 0..) |*connection_slot, connection_index| {
+            // Assert connection index is within bounds
+            std.debug.assert(connection_index < MemBudget.max_conns);
+            connection_slot.* = ConnectionSlot{
+                .id = @intCast(connection_index),
                 .in_use = std.atomic.Value(bool).init(false),
-                .data = undefined,
-                .node = undefined,
+                .data = .{
+                    .settings = .{},
+                    .recv_window_size = 65535,
+                    .send_window_size = 65535,
+                    .last_stream_id = 0,
+                    .goaway_sent = false,
+                    .goaway_received = false,
+                },
             };
-            if (slot.*) |*conn_slot| {
-                conn_slot.node.data = conn_slot;
-                self.connection_free_list.prepend(&conn_slot.node);
-            }
         }
-        // Initialize stream free lists for each connection
-        for (&self.stream_pools, &self.stream_free_lists, 0..) |*pool, *free_list, conn_id| {
-            for (pool, 0..) |*slot, stream_id| {
-                slot.* = StreamSlot{
-                    .id = stream_id,
-                    .connection_id = conn_id,
+
+        // Initialize stream pools
+        for (&self.stream_pools, 0..) |*stream_pool, connection_index| {
+            // Assert connection index is within bounds
+            std.debug.assert(connection_index < MemBudget.max_conns);
+
+            for (stream_pool, 0..) |*stream_slot, stream_index| {
+                // Assert stream index is within bounds
+                std.debug.assert(stream_index < MemBudget.max_streams_per_conn);
+                stream_slot.* = StreamSlot{
+                    .id = @intCast(stream_index),
+                    .connection_id = @intCast(connection_index),
                     .in_use = std.atomic.Value(bool).init(false),
-                    .data = undefined,
-                    .node = undefined,
+                    .data = .{
+                        .state = .Idle,
+                        .recv_window_size = 65535,
+                        .send_window_size = 65535,
+                        .headers_received = false,
+                        .data_received = 0,
+                    },
                 };
-                if (slot.*) |*stream_slot| {
-                    stream_slot.node.data = stream_slot;
-                    free_list.prepend(&stream_slot.node);
-                }
             }
         }
-        // Worker pool will be initialized separately by WorkerPool module
+
         return self;
     }
     pub fn deinit(self: *Self) void {
@@ -121,49 +133,82 @@ pub const StaticMemoryPool = struct {
     }
 
     pub fn acquireConnection(self: *Self) ?*ConnectionSlot {
-        if (self.connection_free_list.popFirst()) |node| {
-            const slot = node.data;
-            if (slot.in_use.cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
-                return slot;
+        // Assert pool is initialized
+        std.debug.assert(self.connection_pool.len == MemBudget.max_conns);
+
+        // Simple round-robin allocation with bound checking
+        var attempt_count: u32 = 0;
+        while (attempt_count < MemBudget.max_conns) : (attempt_count += 1) {
+            const current_index = self.connection_next_free.load(.acquire);
+            // Assert current index is within bounds
+            std.debug.assert(current_index < MemBudget.max_conns);
+
+            const next_index = (current_index + 1) % MemBudget.max_conns;
+
+            if (self.connection_next_free.cmpxchgWeak(current_index, next_index, .acq_rel, .acquire) == null) {
+                const connection_slot = &self.connection_pool[current_index];
+                if (connection_slot.in_use.cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
+                    return connection_slot;
+                }
             }
-            // If CAS failed, put it back and try again
-            self.connection_free_list.prepend(node);
         }
         return null; // No available connections
     }
     /// Release a connection slot
-    pub fn releaseConnection(self: *Self, slot: *ConnectionSlot) void {
-        slot.in_use.store(false, .release);
-        self.connection_free_list.prepend(&slot.node);
+    pub fn releaseConnection(self: *Self, connection_slot: *ConnectionSlot) void {
+        // Assert slot is valid
+        std.debug.assert(connection_slot.id < MemBudget.max_conns);
+        _ = self;
+        connection_slot.in_use.store(false, .release);
     }
     /// Acquire a stream slot for a specific connection
-    pub fn acquireStream(self: *Self, connection_id: usize) ?*StreamSlot {
+    pub fn acquireStream(self: *Self, connection_id: u32) ?*StreamSlot {
+        // Assert connection ID is within bounds
+        std.debug.assert(connection_id < MemBudget.max_conns);
         if (connection_id >= MemBudget.max_conns) return null;
-        if (self.stream_free_lists[connection_id].popFirst()) |node| {
-            const slot = node.data;
-            if (slot.in_use.cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
-                return slot;
+
+        // Simple round-robin allocation for streams with bounds checking
+        var attempt_count: u32 = 0;
+        while (attempt_count < MemBudget.max_streams_per_conn) : (attempt_count += 1) {
+            const current_stream_index = self.stream_next_free[connection_id].load(.acquire);
+            // Assert stream index is within bounds
+            std.debug.assert(current_stream_index < MemBudget.max_streams_per_conn);
+
+            const next_stream_index = (current_stream_index + 1) % MemBudget.max_streams_per_conn;
+
+            if (self.stream_next_free[connection_id].cmpxchgWeak(current_stream_index, next_stream_index, .acq_rel, .acquire) == null) {
+                const stream_slot = &self.stream_pools[connection_id][current_stream_index];
+                if (stream_slot.in_use.cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
+                    return stream_slot;
+                }
             }
-            // If CAS failed, put it back
-            self.stream_free_lists[connection_id].prepend(node);
         }
         return null; // No available streams for this connection
     }
     /// Release a stream slot
-    pub fn releaseStream(self: *Self, slot: *StreamSlot) void {
-        slot.in_use.store(false, .release);
-        if (slot.connection_id < MemBudget.max_conns) {
-            self.stream_free_lists[slot.connection_id].prepend(&slot.node);
-        }
+    pub fn releaseStream(self: *Self, stream_slot: *StreamSlot) void {
+        // Assert slot is valid
+        std.debug.assert(stream_slot.id < MemBudget.max_streams_per_conn);
+        std.debug.assert(stream_slot.connection_id < MemBudget.max_conns);
+        _ = self;
+        stream_slot.in_use.store(false, .release);
     }
     /// Get pre-allocated data buffer for a stream
-    pub fn getDataBuffer(self: *Self, connection_id: usize, stream_id: usize) ?[]u8 {
+    pub fn getDataBuffer(self: *Self, connection_id: u32, stream_id: u32) ?[]u8 {
+        // Assert IDs are within bounds
+        std.debug.assert(connection_id < MemBudget.max_conns);
+        std.debug.assert(stream_id < MemBudget.max_streams_per_conn);
+
         const buffer_index = connection_id * MemBudget.max_streams_per_conn + stream_id;
         if (buffer_index >= self.data_buffer_pool.len) return null;
         return &self.data_buffer_pool[buffer_index];
     }
     /// Get pre-allocated header buffer for a stream
-    pub fn getHeaderBuffer(self: *Self, connection_id: usize, stream_id: usize) ?[]u8 {
+    pub fn getHeaderBuffer(self: *Self, connection_id: u32, stream_id: u32) ?[]u8 {
+        // Assert IDs are within bounds
+        std.debug.assert(connection_id < MemBudget.max_conns);
+        std.debug.assert(stream_id < MemBudget.max_streams_per_conn);
+
         const buffer_index = connection_id * MemBudget.max_streams_per_conn + stream_id;
         if (buffer_index >= self.header_buffer_pool.len) return null;
         return &self.header_buffer_pool[buffer_index];
@@ -175,10 +220,9 @@ pub const StaticMemoryPool = struct {
 };
 /// Connection Slot in the static pool
 pub const ConnectionSlot = struct {
-    id: usize,
+    id: u32,
     in_use: std.atomic.Value(bool),
     data: ConnectionData,
-    node: std.DoublyLinkedList(*ConnectionSlot).Node,
     pub const ConnectionData = struct {
         // Connection-specific data will be defined when integrating with Connection
         settings: ConnectionSettings,
@@ -191,23 +235,22 @@ pub const ConnectionSlot = struct {
 };
 /// Stream Slot in the static pool
 pub const StreamSlot = struct {
-    id: usize,
-    connection_id: usize,
+    id: u32,
+    connection_id: u32,
     in_use: std.atomic.Value(bool),
     data: StreamData,
-    node: std.DoublyLinkedList(*StreamSlot).Node,
     pub const StreamData = struct {
         // Stream-specific data will be defined when integrating with Stream
         state: StreamState,
         recv_window_size: i32,
         send_window_size: i32,
         headers_received: bool,
-        data_received: usize,
+        data_received: u32,
     };
 };
 /// Worker Thread for handling HTTP/2 processing
 pub const WorkerThread = struct {
-    id: usize,
+    id: u32,
     work_queue: std.atomic.Queue(WorkItem),
     running: std.atomic.Value(bool),
     thread: std.Thread,
@@ -356,4 +399,3 @@ test "Static memory pool initialization" {
     if (conn2) |c| pool.releaseConnection(c);
     if (stream1) |s| pool.releaseStream(s);
 }
-

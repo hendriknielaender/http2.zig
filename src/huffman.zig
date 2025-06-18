@@ -270,6 +270,9 @@ pub const Huffman = struct {
     };
 
     pub fn encode(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
+        std.debug.assert(input.len <= 16384); // Reasonable input size limit
+        std.debug.assert(@intFromPtr(&allocator) != 0);
+
         var bit_buffer: u64 = 0;
         var bit_count: u6 = 0;
         var encoded = std.ArrayList(u8).init(allocator);
@@ -304,6 +307,9 @@ pub const Huffman = struct {
     }
 
     pub fn decode(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
+        std.debug.assert(input.len <= 16384); // Reasonable input size limit
+        std.debug.assert(@intFromPtr(&allocator) != 0);
+
         var decoded = std.ArrayList(u8).init(allocator);
         defer decoded.deinit();
 
