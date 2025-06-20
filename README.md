@@ -9,7 +9,7 @@
 
 **A high-performance HTTP/2 protocol implementation in Zig**
 
-190k+ req/s • Cross-platform • Zero allocations
+Cross-platform • Zero allocations
 
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
 [![Zig 0.14.0](https://img.shields.io/badge/zig-0.14.0-orange.svg)](https://ziglang.org)
