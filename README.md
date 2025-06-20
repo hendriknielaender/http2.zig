@@ -1,3 +1,6 @@
+> [!WARNING]  
+> Still work in progress.
+
 <h1 align="center">
    <img src="docs/images/logo.png" width="40%" height="40%" alt="http2.zig logo" title="http2.zig logo">
 </h1>
@@ -18,7 +21,6 @@
 
 ## Features
 
-- 🚀 **190k+ requests/second** performance
 - 🌍 **Cross-platform** support via libxev (io_uring, kqueue, epoll)
 - 💾 **Zero runtime allocations** - all memory allocated at compile time
 - 🔒 **Lock-free** atomic operations for maximum concurrency
@@ -88,32 +90,7 @@ pub fn main() !void {
 
 ## Performance
 
-Benchmarked on M4 MacBook with 50 concurrent connections:
-
-```
-🚀  Benchmarking http://127.0.0.1:3000
-Summary:
-  Success rate: 100.00%
-  Total:        2.6361 secs
-  Slowest:      0.0043 secs
-  Fastest:      0.0000 secs
-  Average:      0.0003 secs
-  Requests/sec: 189674.4426
-
-  Total data:   32.42 MiB
-  Size/request: 68 B
-  Size/sec:     12.30 MiB
-```
-
-## Architecture
-
-The implementation uses an event-driven architecture with these key components:
-
-- **libxev** - Cross-platform async I/O (io_uring on Linux, kqueue on macOS/BSD)
-- **Static memory pools** - All memory allocated at compile time
-- **Lock-free data structures** - Atomic operations for connection management
-- **Zero-copy parsing** - Direct buffer processing without allocations
-- **SIMD optimizations** - Hardware-accelerated frame parsing
+TBD
 
 ## API Reference
 
@@ -218,7 +195,6 @@ Contributions are welcome! Please ensure:
 1. All tests pass
 2. No runtime allocations are introduced
 3. Performance benchmarks show no regression
-4. Code follows Zig style guidelines
 
 Areas for contribution:
 - Additional frame type implementations
