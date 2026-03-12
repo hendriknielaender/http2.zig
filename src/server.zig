@@ -345,6 +345,7 @@ pub const Server = struct {
             .active_streams = std.AutoHashMap(u32, StreamState).init(self.allocator),
             .read_completions = [2]xev.Completion{ .{}, .{} },
             .write_completions = [2]xev.Completion{ .{}, .{} },
+            .shutdown_completion = .{},
             .close_completion = .{},
             .current_read_completion = std.atomic.Value(u8).init(0),
             .current_write_completion = std.atomic.Value(u8).init(0),
@@ -353,6 +354,8 @@ pub const Server = struct {
             .tls_plaintext_buffer = conn.tls_plaintext_buffer,
             .tls_plaintext_read_pos = 0,
             .tls_plaintext_write_pos = 0,
+            .write_side_shutdown = false,
+            .awaiting_peer_close = false,
         };
 
         conn.h2_reader = Connection.IoAdapters.Reader.init(conn);
@@ -505,6 +508,7 @@ const Connection = struct {
     // libxev completions with ping-pong pattern for safety
     read_completions: [2]xev.Completion,
     write_completions: [2]xev.Completion,
+    shutdown_completion: xev.Completion,
     close_completion: xev.Completion,
     current_read_completion: std.atomic.Value(u8),
     current_write_completion: std.atomic.Value(u8),
@@ -517,6 +521,8 @@ const Connection = struct {
     tls_plaintext_buffer: []u8,
     tls_plaintext_read_pos: u32,
     tls_plaintext_write_pos: u32,
+    write_side_shutdown: bool,
+    awaiting_peer_close: bool,
 
     const Self = @This();
     const IoAdapters = io_adapters.createStdIoAdapters(Self);
@@ -562,6 +568,97 @@ const Connection = struct {
         std.mem.copyForwards(u8, self.write_buffer[0..len], self.write_buffer[start..end]);
         self.write_start = 0;
         self.write_pos = buffered_bytes;
+    }
+
+    fn discardBufferedInput(self: *Self) void {
+        if (self.readBytesAvailable() == 0) {
+            return;
+        }
+
+        std.log.debug("Discarding {} buffered bytes while awaiting peer close", .{
+            self.readBytesAvailable(),
+        });
+        self.read_start = 0;
+        self.read_pos = 0;
+    }
+
+    fn shouldShutdownWriteSideAfterGoaway(self: *const Self) bool {
+        if (self.awaiting_peer_close or self.write_side_shutdown) {
+            return false;
+        }
+
+        if (self.h2_conn) |h2_conn| {
+            return h2_conn.goaway_sent;
+        }
+
+        return false;
+    }
+
+    fn beginGracefulCloseAfterWrite(self: *Self) void {
+        if (!self.active) {
+            return;
+        }
+
+        if (self.awaiting_peer_close or self.write_side_shutdown) {
+            return;
+        }
+
+        if (self.write_active.load(.acquire) or self.tlsHasBufferedWrites()) {
+            self.close_after_write = true;
+            return;
+        }
+
+        if (!self.shouldShutdownWriteSideAfterGoaway()) {
+            self.server.closeConnection(self);
+            return;
+        }
+
+        self.close_after_write = false;
+        self.awaiting_peer_close = true;
+        self.shutdown_completion = .{};
+
+        std.log.debug("All GOAWAY bytes flushed; shutting down writer side and waiting for peer close", .{});
+        self.tcp.shutdown(
+            self.server.loop,
+            &self.shutdown_completion,
+            Connection,
+            self,
+            shutdownCallback,
+        );
+    }
+
+    fn shutdownCallback(
+        self_opt: ?*Connection,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        tcp: xev.TCP,
+        result: xev.ShutdownError!void,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+        _ = tcp;
+
+        const self = self_opt.?;
+
+        result catch |err| {
+            std.log.warn("Write-side shutdown failed: {}", .{err});
+            self.server.closeConnection(self);
+            return .disarm;
+        };
+
+        self.write_side_shutdown = true;
+        std.log.debug("Write side shutdown complete; waiting for peer to close", .{});
+
+        if (!self.active) {
+            self.server.closeConnection(self);
+            return .disarm;
+        }
+
+        if (!self.read_active.load(.acquire)) {
+            self.startReading();
+        }
+
+        return .disarm;
     }
 
     /// Initialize HTTP/2 protocol connection asynchronously
@@ -1613,7 +1710,7 @@ const Connection = struct {
         }
 
         if (self.close_after_write and !self.tlsHasBufferedWrites()) {
-            self.server.closeConnection(self);
+            self.beginGracefulCloseAfterWrite();
         }
     }
 
@@ -1678,13 +1775,17 @@ const Connection = struct {
             },
         };
 
-        // Process through simplified HTTP/2 protocol handling
-        self.processHttp2() catch |err| {
-            std.log.err("HTTP/2 protocol error: {}", .{err});
-            self.active = false;
-            self.server.closeConnection(self);
-            return .disarm;
-        };
+        if (self.awaiting_peer_close) {
+            self.discardBufferedInput();
+        } else {
+            // Process through simplified HTTP/2 protocol handling
+            self.processHttp2() catch |err| {
+                std.log.err("HTTP/2 protocol error: {}", .{err});
+                self.active = false;
+                self.server.closeConnection(self);
+                return .disarm;
+            };
+        }
 
         if (self.close_after_write) {
             self.scheduleAsyncClose();
@@ -1932,6 +2033,9 @@ const Connection = struct {
 
                 // Process any available data in the read buffer (either newly read or previously buffered)
                 if (self.readBytesAvailable() > 0) {
+                    if (self.awaiting_peer_close) {
+                        self.discardBufferedInput();
+                    } else {
                     std.log.debug("Processing {} bytes of available data", .{self.readBytesAvailable()});
 
                     // Handle based on negotiated protocol
@@ -1981,6 +2085,7 @@ const Connection = struct {
                         self.readBytesAvailable(),
                         self.active,
                     });
+                    }
                 }
             }
         }
@@ -1999,6 +2104,10 @@ const Connection = struct {
 
     /// Schedule async close to avoid blocking other connections
     fn scheduleAsyncClose(self: *Self) void {
+        if (self.awaiting_peer_close) {
+            return;
+        }
+
         const has_pending_writes = self.write_active.load(.acquire) or
             self.tlsHasBufferedWrites();
 
@@ -2009,6 +2118,11 @@ const Connection = struct {
                 self.tlsPlaintextBytesPending(),
             });
             self.close_after_write = true;
+            return;
+        }
+
+        if (self.shouldShutdownWriteSideAfterGoaway()) {
+            self.beginGracefulCloseAfterWrite();
             return;
         }
 
@@ -2136,8 +2250,8 @@ const Connection = struct {
             self.write_pos = 0;
 
             if (self.close_after_write and !self.tlsHasBufferedWrites()) {
-                std.log.debug("Closing connection after write completed", .{});
-                self.server.closeConnection(self);
+                std.log.debug("Write completed with deferred close pending", .{});
+                self.beginGracefulCloseAfterWrite();
                 return .disarm;
             }
         }
@@ -2215,6 +2329,7 @@ const ConnectionPool = struct {
                 .active_streams = std.AutoHashMap(u32, StreamState).init(allocator),
                 .read_completions = [2]xev.Completion{ .{}, .{} },
                 .write_completions = [2]xev.Completion{ .{}, .{} },
+                .shutdown_completion = .{},
                 .close_completion = .{},
                 .current_read_completion = std.atomic.Value(u8).init(0),
                 .current_write_completion = std.atomic.Value(u8).init(0),
@@ -2222,6 +2337,8 @@ const ConnectionPool = struct {
                 .write_active = std.atomic.Value(bool).init(false),
                 .tls_plaintext_read_pos = 0,
                 .tls_plaintext_write_pos = 0,
+                .write_side_shutdown = false,
+                .awaiting_peer_close = false,
             };
 
             connection_slot.h2_reader = Connection.IoAdapters.Reader.init(connection_slot);
@@ -2290,6 +2407,8 @@ const ConnectionPool = struct {
         released_connection.active = false;
         released_connection.http2_initialized = false;
         released_connection.close_after_write = false;
+        released_connection.write_side_shutdown = false;
+        released_connection.awaiting_peer_close = false;
         released_connection.read_start = 0;
         released_connection.read_pos = 0;
         released_connection.write_start = 0;
