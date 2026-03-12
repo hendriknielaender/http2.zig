@@ -12,14 +12,17 @@ pub const MiB = 1024 * KiB;
 pub const GiB = 1024 * MiB;
 /// Compile-time Memory Budget Calculator
 pub const MemBudget = struct {
-    pub const max_conns = 10; // Back to working configuration
-    pub const max_streams_per_conn = 5; // Reduced for testing
+    // The benchmark suite drives up to 100 concurrent connections with 10
+    // concurrent streams per connection. Keep modest headroom so probes and
+    // warmup traffic do not hit the fixed pool limit.
+    pub const max_conns = 128;
+    pub const max_streams_per_conn = 16;
     // HTTP/2 protocol limits (balanced for constraints)
     pub const bytes_per_conn = 64 * KiB; // Per-connection flow-control window
     pub const max_frame_size = 16 * KiB; // Standard HTTP/2 frame size
     pub const max_header_size = 8 * KiB; // Maximum header block size (needs 6KB minimum)
     pub const max_data_buffer = 16 * KiB; // Per-stream data buffer (needs 16KB minimum)
-    pub const worker_count = 2; // Reduced for testing to avoid race conditions
+    pub const worker_count = 2;
     pub const stack_per_thread = 128 * KiB;
     pub const global_reserve = 256 * KiB;
     pub const emergency_reserve = 256 * KiB;
@@ -72,9 +75,11 @@ pub const StaticMemoryPool = struct {
     // worker_pool: [MemBudget.worker_count]WorkerThread,
     // Global allocator arena
     arena: std.heap.ArenaAllocator,
+    backing_allocator: std.mem.Allocator,
     const Self = @This();
-    pub fn init(backing_allocator: std.mem.Allocator) !Self {
-        var self = Self{
+
+    pub fn init(target: *Self, backing_allocator: std.mem.Allocator) !void {
+        target.* = .{
             .connection_pool = undefined,
             .connection_next_free = std.atomic.Value(u32).init(0),
             .stream_pools = undefined,
@@ -82,7 +87,9 @@ pub const StaticMemoryPool = struct {
             .data_buffer_pool = undefined,
             .header_buffer_pool = undefined,
             .arena = std.heap.ArenaAllocator.init(backing_allocator),
+            .backing_allocator = backing_allocator,
         };
+        const self = target;
 
         // Initialize connection pool
         for (&self.connection_pool, 0..) |*connection_slot, connection_index| {
@@ -124,12 +131,23 @@ pub const StaticMemoryPool = struct {
                 };
             }
         }
+    }
 
-        return self;
+    pub fn create(backing_allocator: std.mem.Allocator) !*Self {
+        const pool = try backing_allocator.create(Self);
+        errdefer backing_allocator.destroy(pool);
+        try pool.init(backing_allocator);
+        return pool;
     }
     pub fn deinit(self: *Self) void {
         // Worker pool cleanup is handled by WorkerPool module
         self.arena.deinit();
+    }
+
+    pub fn destroy(self: *Self) void {
+        const backing_allocator = self.backing_allocator;
+        self.deinit();
+        backing_allocator.destroy(self);
     }
 
     pub fn acquireConnection(self: *Self) ?*ConnectionSlot {
@@ -330,24 +348,24 @@ fn processConnection(connection: *ConnectionSlot) void {
     // TODO: Implement connection processing
 }
 /// Global static memory pool instance
-var global_memory_pool: ?StaticMemoryPool = null;
+var global_memory_pool: ?*StaticMemoryPool = null;
 /// Initialize the global memory pool
 pub fn initGlobalMemoryPool(backing_allocator: std.mem.Allocator) !void {
     if (global_memory_pool != null) {
         return error.AlreadyInitialized;
     }
-    global_memory_pool = try StaticMemoryPool.init(backing_allocator);
+    global_memory_pool = try StaticMemoryPool.create(backing_allocator);
     // Worker pool is managed separately by worker_pool.zig
     MemBudget.printBudget();
 }
 /// Get the global memory pool
 pub fn getGlobalMemoryPool() *StaticMemoryPool {
-    return &global_memory_pool.?;
+    return global_memory_pool.?;
 }
 /// Deinitialize the global memory pool
 pub fn deinitGlobalMemoryPool() void {
-    if (global_memory_pool) |*pool| {
-        pool.deinit();
+    if (global_memory_pool) |pool| {
+        pool.destroy();
         global_memory_pool = null;
     }
 }
@@ -378,8 +396,8 @@ test "Memory budget calculations" {
 test "Static memory pool initialization" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var pool = try StaticMemoryPool.init(arena.allocator());
-    defer pool.deinit();
+    const pool = try StaticMemoryPool.create(arena.allocator());
+    defer pool.destroy();
     // Test connection acquisition
     const conn1 = pool.acquireConnection();
     try std.testing.expect(conn1 != null);

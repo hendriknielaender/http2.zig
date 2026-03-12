@@ -18,14 +18,50 @@ const stream = @import("stream.zig");
 const Frame = @import("frame.zig").Frame;
 const FrameHeader = @import("frame.zig").FrameHeader;
 const log = std.log.scoped(.worker_pool);
+
+const WorkQueue = struct {
+    items: std.ArrayList(WorkItem) = .{},
+    head: usize = 0,
+
+    fn deinit(self: *WorkQueue, allocator: std.mem.Allocator) void {
+        self.items.deinit(allocator);
+    }
+
+    fn push(self: *WorkQueue, allocator: std.mem.Allocator, item: WorkItem) !void {
+        try self.items.append(allocator, item);
+    }
+
+    fn pop(self: *WorkQueue) ?WorkItem {
+        if (self.head >= self.items.items.len) {
+            self.items.clearRetainingCapacity();
+            self.head = 0;
+            return null;
+        }
+
+        const item = self.items.items[self.head];
+        self.head += 1;
+
+        if (self.head == self.items.items.len) {
+            self.items.clearRetainingCapacity();
+            self.head = 0;
+        } else if (self.head >= 64 and self.head * 2 >= self.items.items.len) {
+            const remaining = self.items.items.len - self.head;
+            std.mem.copyForwards(WorkItem, self.items.items[0..remaining], self.items.items[self.head..]);
+            self.items.items.len = remaining;
+            self.head = 0;
+        }
+
+        return item;
+    }
+};
+
 /// Worker Pool Manager using libxev async event-driven work distribution
 /// Coordinates multiple worker event loops with async work distribution
 pub const WorkerPool = struct {
     // Simplified approach: shared event loop with work queue
     main_loop: xev.Loop,
     worker_threads: [memory_budget.MemBudget.worker_count]?std.Thread,
-    // Work queue using libxev-compatible approach
-    work_queue: std.fifo.LinearFifo(WorkItem, .Dynamic),
+    work_queue: WorkQueue,
     queue_mutex: std.Thread.Mutex,
     work_available: std.atomic.Value(bool),
     // Pool state management
@@ -42,7 +78,7 @@ pub const WorkerPool = struct {
         const self = Self{
             .main_loop = try xev.Loop.init(.{}),
             .worker_threads = [_]?std.Thread{null} ** memory_budget.MemBudget.worker_count,
-            .work_queue = std.fifo.LinearFifo(WorkItem, .Dynamic).init(allocator),
+            .work_queue = .{},
             .queue_mutex = std.Thread.Mutex{},
             .work_available = std.atomic.Value(bool).init(false),
             .running = std.atomic.Value(bool).init(false),
@@ -55,7 +91,7 @@ pub const WorkerPool = struct {
         return self;
     }
     pub fn deinit(self: *Self) void {
-        self.work_queue.deinit();
+        self.work_queue.deinit(self.allocator);
         self.main_loop.deinit();
     }
     /// Start the worker pool with simplified libxev integration
@@ -92,8 +128,8 @@ pub const WorkerPool = struct {
                 .data = .{ .connection_data = ConnectionWorkData{ .connection_ptr = undefined } },
             };
             self.queue_mutex.lock();
-            defer self.queue_mutex.unlock();
-            self.work_queue.writeItem(shutdown_item) catch {};
+            self.work_queue.push(self.allocator, shutdown_item) catch {};
+            self.queue_mutex.unlock();
         }
         self.work_available.store(true, .release);
         // Wait for all worker threads to stop
@@ -114,7 +150,7 @@ pub const WorkerPool = struct {
         {
             self.queue_mutex.lock();
             defer self.queue_mutex.unlock();
-            try self.work_queue.writeItem(work_item);
+            try self.work_queue.push(self.allocator, work_item);
         }
         // Update queue depth and signal work is available
         _ = self.work_queue_depth.fetchAdd(1, .acq_rel);
@@ -143,7 +179,7 @@ pub const WorkerPool = struct {
 
     /// Simple connection processing without complex type dispatch
     fn processConnectionSynchronously(connection: anytype) !void {
-        const conn: *Connection(std.io.AnyReader, std.io.AnyWriter) = @ptrCast(@alignCast(connection));
+        const conn: *Connection = @ptrCast(@alignCast(connection));
         defer {
             conn.deinit();
         }
@@ -231,14 +267,10 @@ fn workerMain(context: *WorkerContext) void {
 fn getWork(pool: *WorkerPool) ?WorkItem {
     pool.queue_mutex.lock();
     defer pool.queue_mutex.unlock();
-    // Check if queue has items before trying to read
-    if (pool.work_queue.count > 0) {
-        if (pool.work_queue.readItem()) |item| {
-            _ = pool.work_queue_depth.fetchSub(1, .acq_rel);
-            return item;
-        }
+    if (pool.work_queue.pop()) |item| {
+        _ = pool.work_queue_depth.fetchSub(1, .acq_rel);
+        return item;
     }
-    // No work available
     pool.work_available.store(false, .release);
     return null;
 }
@@ -269,7 +301,7 @@ fn processFrame(frame_data: FrameWorkData) !void {
 /// Process connection-level work
 fn processConnection(conn_data: ConnectionWorkData) !void {
     // Cast the pointer back to the HTTP/2 connection type
-    const connection: *Connection(std.io.AnyReader, std.io.AnyWriter) = @ptrCast(@alignCast(conn_data.connection_ptr));
+    const connection: *Connection = @ptrCast(@alignCast(conn_data.connection_ptr));
     defer {
         // Always cleanup the connection and free the allocation
         connection.deinit();
@@ -308,7 +340,7 @@ fn processConnection(conn_data: ConnectionWorkData) !void {
     };
 }
 
-fn processConnectionWithRetries(connection: *Connection(std.io.AnyReader, std.io.AnyWriter)) !void {
+fn processConnectionWithRetries(connection: *Connection) !void {
     var retry_count: u8 = 0;
     const max_retries = 3;
     while (retry_count < max_retries) {
@@ -318,7 +350,7 @@ fn processConnectionWithRetries(connection: *Connection(std.io.AnyReader, std.io
                 retry_count += 1;
                 if (retry_count < max_retries) {
                     const delay_ns = @as(u64, 1) << @intCast(retry_count * 3); // 8ns, 64ns, 512ns
-                    std.time.sleep(delay_ns);
+                    std.Thread.sleep(delay_ns);
                     continue;
                 }
                 return err;
@@ -328,7 +360,7 @@ fn processConnectionWithRetries(connection: *Connection(std.io.AnyReader, std.io
                 retry_count += 1;
                 if (retry_count < max_retries) {
                     // Small delay to allow more data to arrive
-                    std.time.sleep(1000); // 1μs
+                    std.Thread.sleep(1000); // 1μs
                     continue;
                 }
                 return err;
@@ -403,7 +435,7 @@ const BackoffStrategy = struct {
             std.atomic.spinLoopHint();
         } else {
             // Longer delay: actual sleep
-            std.time.sleep(self.current_delay_ns);
+            std.Thread.sleep(self.current_delay_ns);
         }
         // Exponential backoff
         self.current_delay_ns = @min(self.current_delay_ns * 2, self.max_delay_ns);
@@ -423,9 +455,9 @@ pub const WorkerPoolStats = struct {
 test "Worker pool initialization and basic operations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var memory_pool = try memory_budget.StaticMemoryPool.init(arena.allocator());
-    defer memory_pool.deinit();
-    var worker_pool = try WorkerPool.init(arena.allocator(), &memory_pool);
+    const memory_pool = try memory_budget.StaticMemoryPool.create(arena.allocator());
+    defer memory_pool.destroy();
+    var worker_pool = try WorkerPool.init(arena.allocator(), memory_pool);
     defer worker_pool.deinit();
     // Test initialization
     const initial_stats = worker_pool.getStats();
@@ -438,9 +470,9 @@ test "Worker pool initialization and basic operations" {
 test "libxev-enhanced worker distribution" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var memory_pool = try memory_budget.StaticMemoryPool.init(arena.allocator());
-    defer memory_pool.deinit();
-    var worker_pool = try WorkerPool.init(arena.allocator(), &memory_pool);
+    const memory_pool = try memory_budget.StaticMemoryPool.create(arena.allocator());
+    defer memory_pool.destroy();
+    var worker_pool = try WorkerPool.init(arena.allocator(), memory_pool);
     defer worker_pool.deinit();
     // Test libxev Loop initialization succeeded
     // For now, just verify the structure works without starting threads

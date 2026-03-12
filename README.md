@@ -9,7 +9,7 @@
 190k+ req/s • Cross-platform • Zero allocations
 
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
-[![Zig 0.14.0](https://img.shields.io/badge/zig-0.14.0-orange.svg)](https://ziglang.org)
+[![Zig 0.15.2](https://img.shields.io/badge/zig-0.15.2-orange.svg)](https://ziglang.org)
 [![libxev](https://img.shields.io/badge/powered%20by-libxev-brightgreen.svg)](https://github.com/mitchellh/libxev)
 
 </div>
@@ -165,7 +165,7 @@ pub const ServerStats = struct {
 
 ### Requirements
 
-- Zig 0.14.0 or later
+- Zig 0.15.2 or later
 - libxev (included as dependency)
 
 ### Build Commands

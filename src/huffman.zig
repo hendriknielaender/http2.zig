@@ -275,8 +275,8 @@ pub const Huffman = struct {
 
         var bit_buffer: u64 = 0;
         var bit_count: u6 = 0;
-        var encoded = std.ArrayList(u8).init(allocator);
-        defer encoded.deinit();
+        var encoded: std.ArrayList(u8) = .{};
+        defer encoded.deinit(allocator);
 
         for (input) |byte| {
             const huff = try findHuffmanEntry(byte);
@@ -289,7 +289,7 @@ pub const Huffman = struct {
             while (bit_count >= 8) {
                 bit_count -= 8;
                 const byte_to_append: u8 = @intCast((bit_buffer >> bit_count) & 0xFF);
-                try encoded.append(byte_to_append);
+                try encoded.append(allocator, byte_to_append);
                 bit_buffer &= (@as(u64, 1) << bit_count) - 1; // Keep remaining bits
             }
         }
@@ -300,18 +300,18 @@ pub const Huffman = struct {
             const pad_bits = (@as(u8, 1) << bits_to_pad_u3) - 1; // bits_to_pad bits of '1's
             const buff_u8: u8 = @intCast(bit_buffer);
             const remaining_byte = ((buff_u8 << bits_to_pad_u3) | pad_bits) & 0xFF;
-            try encoded.append(remaining_byte);
+            try encoded.append(allocator, remaining_byte);
         }
 
-        return encoded.toOwnedSlice();
+        return encoded.toOwnedSlice(allocator);
     }
 
     pub fn decode(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
         std.debug.assert(input.len <= 16384); // Reasonable input size limit
         std.debug.assert(@intFromPtr(&allocator) != 0);
 
-        var decoded = std.ArrayList(u8).init(allocator);
-        defer decoded.deinit();
+        var decoded: std.ArrayList(u8) = .{};
+        defer decoded.deinit(allocator);
 
         var bit_buffer: u64 = 0;
         var bit_count: u8 = 0;
@@ -337,7 +337,7 @@ pub const Huffman = struct {
                         if (entry.symbol == .eos) {
                             return error.InvalidHuffmanCode; // EOS within string is an error
                         }
-                        try decoded.append(entry.symbol.byte);
+                        try decoded.append(allocator, entry.symbol.byte);
                         code = 0;
                         code_bits = 0;
                         found = true;
@@ -358,6 +358,10 @@ pub const Huffman = struct {
 
         // After processing all bits, check for remaining bits
         if (code_bits > 0) {
+            if (code_bits > 7) {
+                return error.InvalidHuffmanCode;
+            }
+
             // The remaining bits should be a prefix of the EOS code
             const eos_code: u32 = 0x3fffffff; // 30 bits
             const eos_bits: u5 = 30;
@@ -372,7 +376,7 @@ pub const Huffman = struct {
             }
         }
 
-        return decoded.toOwnedSlice();
+        return decoded.toOwnedSlice(allocator);
     }
 
     fn findHuffmanEntry(byte: u8) !HuffmanEntry {

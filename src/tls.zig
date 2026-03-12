@@ -37,6 +37,10 @@ pub const TlsServerContext = struct {
     allocator: std.mem.Allocator,
     ctx: ?*boringssl.SSL_CTX,
 
+    pub const AsyncConnectionOptions = struct {
+        bio_capacity_bytes: usize,
+    };
+
     /// Create a new server TLS context with the given certificate and key files.
     /// We also set ALPN to "h2" for HTTP/2 usage.
     pub fn init(
@@ -68,7 +72,7 @@ pub const TlsServerContext = struct {
 
         // Let BoringSSL and LibreSSL negotiate TLS version naturally
         // Don't force specific versions
-        
+
         // Use broader cipher suite for compatibility
         const cipher_list = "ECDHE-RSA-AES128-GCM-SHA256:AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:AES256-GCM-SHA384";
         if (boringssl.SSL_CTX_set_cipher_list(ctx_ptr, cipher_list.ptr) != 1) {
@@ -94,11 +98,17 @@ pub const TlsServerContext = struct {
 
     /// Create a new TLS connection with BIO pair for proper async I/O
     /// This avoids socket FD conflicts with libxev
-    pub fn createAsyncConnection(self: *TlsServerContext, socket_fd: std.posix.fd_t) !TlsServerConnection {
+    pub fn createAsyncConnection(
+        self: *TlsServerContext,
+        socket_fd: std.posix.fd_t,
+        options: AsyncConnectionOptions,
+    ) !TlsServerConnection {
         _ = socket_fd; // We'll use BIO pairs instead
 
         // Assert valid context
         std.debug.assert(self.ctx != null);
+        std.debug.assert(options.bio_capacity_bytes > 0);
+        std.debug.assert(options.bio_capacity_bytes <= std.math.maxInt(c_int));
 
         if (self.ctx == null) {
             return TlsError.InvalidContext;
@@ -112,9 +122,14 @@ pub const TlsServerContext = struct {
         // Create BIO pair for async I/O
         var internal_bio: ?*boringssl.BIO = null;
         var network_bio: ?*boringssl.BIO = null;
-
-        // Create a BIO pair with reasonable buffer sizes
-        if (boringssl.BIO_new_bio_pair(&internal_bio, 16384, &network_bio, 16384) != 1) {
+        // Match the BIO pair to the event-loop read buffer so one socket read can always
+        // be staged before SSL_read drains decrypted bytes into the application buffer.
+        if (boringssl.BIO_new_bio_pair(
+            &internal_bio,
+            options.bio_capacity_bytes,
+            &network_bio,
+            options.bio_capacity_bytes,
+        ) != 1) {
             boringssl.SSL_free(ssl_connection);
             return TlsError.InitFailed;
         }
@@ -124,6 +139,11 @@ pub const TlsServerContext = struct {
 
         // Set SSL to server mode
         boringssl.SSL_set_accept_state(ssl_connection);
+        const ssl_mode: u32 = @intCast(
+            boringssl.SSL_MODE_ENABLE_PARTIAL_WRITE |
+                boringssl.SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER,
+        );
+        _ = boringssl.SSL_set_mode(ssl_connection, ssl_mode);
 
         return TlsServerConnection{
             .allocator = self.allocator,
@@ -131,12 +151,19 @@ pub const TlsServerContext = struct {
             .handshake_state = .need_handshake,
             .internal_bio = internal_bio,
             .network_bio = network_bio,
+            .read_status = .ok,
+            .write_status = .ok,
+            .io_reader = TlsServerConnection.initIoReader(),
+            .io_writer = TlsServerConnection.initIoWriter(),
         };
     }
 
     /// Accept a new TLS connection (legacy blocking version)
     pub fn accept(self: *TlsServerContext, socket_fd: std.posix.fd_t) !TlsServerConnection {
-        var connection = try self.createAsyncConnection(socket_fd);
+        var connection = try self.createAsyncConnection(
+            socket_fd,
+            .{ .bio_capacity_bytes = 16 * 1024 },
+        );
 
         // Perform the server‐side TLS handshake. On success, returns 1.
         const handshake_result = boringssl.SSL_accept(connection.ssl);
@@ -153,11 +180,11 @@ pub const TlsServerContext = struct {
     /// Sets the ALPN protocols on the server context to exactly the given `alpn_proto` (e.g. "h2").
     fn set_alpn(self: *TlsServerContext, alpn_proto: []const u8) !void {
         _ = alpn_proto; // Ignore single protocol parameter, we'll advertise both
-        
+
         // Advertise both h2 and http/1.1 using SSL_CTX_set_alpn_protos
         // Wire format: [2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1']
         const protocols = [_]u8{ 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
-        
+
         const rc = boringssl.SSL_CTX_set_alpn_protos(
             self.ctx,
             &protocols,
@@ -166,7 +193,7 @@ pub const TlsServerContext = struct {
         if (rc != 0) {
             return TlsError.InitFailed;
         }
-        
+
         // Also set callback for protocol selection priority (h2 preferred)
         const callback = struct {
             fn alpn_select_callback(
@@ -176,7 +203,7 @@ pub const TlsServerContext = struct {
                 input: [*c]const u8,
                 inlen: c_uint,
                 arg: ?*anyopaque,
-            ) callconv(.C) c_int {
+            ) callconv(.c) c_int {
                 _ = ssl;
                 _ = arg;
 
@@ -184,7 +211,7 @@ pub const TlsServerContext = struct {
                 var protocol_index: c_uint = 0;
                 while (protocol_index < inlen) {
                     if (protocol_index >= inlen) break;
-                    
+
                     const protocol_length = input[protocol_index];
                     if (protocol_index + 1 + protocol_length > inlen) break;
 
@@ -199,12 +226,12 @@ pub const TlsServerContext = struct {
 
                     protocol_index += 1 + protocol_length;
                 }
-                
+
                 // Search for http/1.1 (fallback)
                 protocol_index = 0;
                 while (protocol_index < inlen) {
                     if (protocol_index >= inlen) break;
-                    
+
                     const protocol_length = input[protocol_index];
                     if (protocol_index + 1 + protocol_length > inlen) break;
 
@@ -322,6 +349,17 @@ pub const TlsServerConnection = struct {
     // BIO pair for async I/O with libxev
     internal_bio: ?*boringssl.BIO,
     network_bio: ?*boringssl.BIO,
+    read_status: IoStatus,
+    write_status: IoStatus,
+    io_reader: std.Io.Reader,
+    io_writer: std.Io.Writer,
+
+    pub const IoStatus = enum {
+        ok,
+        would_block,
+        connection_closed,
+        failed,
+    };
 
     /// Initialize with handshake pending
     pub fn init(allocator: std.mem.Allocator, ssl: *boringssl.SSL) TlsServerConnection {
@@ -331,6 +369,10 @@ pub const TlsServerConnection = struct {
             .handshake_state = .need_handshake,
             .internal_bio = null,
             .network_bio = null,
+            .read_status = .ok,
+            .write_status = .ok,
+            .io_reader = initIoReader(),
+            .io_writer = initIoWriter(),
         };
     }
 
@@ -403,37 +445,46 @@ pub const TlsServerConnection = struct {
     pub fn isHandshakeComplete(self: *TlsServerConnection) bool {
         return self.handshake_state == .complete;
     }
-    
+
     /// Get the negotiated ALPN protocol
     pub fn getNegotiatedProtocol(self: *TlsServerConnection) ?[]const u8 {
         if (self.ssl == null) {
             return null;
         }
-        
+
         var data: [*c]const u8 = undefined;
         var len: c_uint = undefined;
-        
+
         boringssl.SSL_get0_alpn_selected(self.ssl, &data, &len);
-        
+
         if (len == 0 or data == null) {
             return null;
         }
-        
+
         return data[0..len];
     }
 
     /// Feed encrypted data from network to the TLS engine
     pub fn feedEncryptedData(self: *TlsServerConnection, data: []const u8) !usize {
+        std.debug.assert(data.len <= std.math.maxInt(c_int));
+
         if (self.network_bio == null) {
             return TlsError.InvalidContext;
         }
-
-        const written = boringssl.BIO_write(self.network_bio, data.ptr, @intCast(data.len));
-        if (written <= 0) {
+        if (data.len == 0) {
             return 0;
         }
 
-        return @intCast(written);
+        const written = boringssl.BIO_write(self.network_bio, data.ptr, @intCast(data.len));
+        if (written > 0) {
+            return @intCast(written);
+        }
+
+        if (boringssl.BIO_should_retry(self.network_bio) != 0) {
+            return TlsError.WouldBlock;
+        }
+
+        return TlsError.WriteFailed;
     }
 
     /// Read encrypted data from TLS engine to send to network
@@ -465,23 +516,157 @@ pub const TlsServerConnection = struct {
         return pending > 0;
     }
 
-    /// Provide a std.io.Reader interface to read from TLS.
-    pub fn reader(self: *TlsServerConnection) std.io.Reader(*TlsServerConnection, TlsError, readFn) {
-        return .{ .context = self };
+    pub fn reader(self: *TlsServerConnection) *std.Io.Reader {
+        return &self.io_reader;
     }
 
-    fn readFn(self: *TlsServerConnection, buffer: []u8) TlsError!usize {
-        return self.read_tls(buffer);
+    pub fn writer(self: *TlsServerConnection) *std.Io.Writer {
+        return &self.io_writer;
     }
 
-    /// Provide a std.io.Writer interface to write to TLS.
-    pub fn writer(self: *TlsServerConnection) std.io.Writer(*TlsServerConnection, TlsError, writeFn) {
-        return .{ .context = self };
+    /// Read at most one chunk of decrypted application data.
+    ///
+    /// We avoid `std.Io.Reader.readSliceShort()` here because it keeps reading until the
+    /// destination slice is full, while the TLS engine reports non-blocking progress via
+    /// `WouldBlock`. In the server callback we need one explicit read attempt instead.
+    pub fn readApplicationData(self: *TlsServerConnection, buffer: []u8) !usize {
+        std.debug.assert(buffer.len > 0);
+
+        const bytes_read = self.read_tls(buffer) catch |err| switch (err) {
+            error.WouldBlock => {
+                self.read_status = .would_block;
+                return 0;
+            },
+            error.ConnectionClosed => {
+                self.read_status = .connection_closed;
+                return 0;
+            },
+            else => {
+                self.read_status = .failed;
+                return TlsError.ReadFailed;
+            },
+        };
+
+        self.read_status = .ok;
+        return bytes_read;
     }
 
-    fn writeFn(self: *TlsServerConnection, data: []const u8) TlsError!usize {
-        self.write_tls(data) catch |err| return err;
-        return data.len;
+    /// Write at most one TLS application-data chunk.
+    pub fn writeApplicationData(self: *TlsServerConnection, write_data: []const u8) !usize {
+        std.debug.assert(write_data.len > 0);
+
+        const bytes_written = self.write_tls_once(write_data) catch |err| switch (err) {
+            error.WouldBlock => {
+                self.write_status = .would_block;
+                return err;
+            },
+            error.ConnectionClosed => {
+                self.write_status = .connection_closed;
+                return err;
+            },
+            else => {
+                self.write_status = .failed;
+                return TlsError.WriteFailed;
+            },
+        };
+
+        self.write_status = .ok;
+        return bytes_written;
+    }
+
+    pub fn lastReadStatus(self: *const TlsServerConnection) IoStatus {
+        return self.read_status;
+    }
+
+    pub fn lastWriteStatus(self: *const TlsServerConnection) IoStatus {
+        return self.write_status;
+    }
+
+    fn initIoReader() std.Io.Reader {
+        return .{
+            .vtable = &.{
+                .stream = ioReadStream,
+            },
+            .buffer = &.{},
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn initIoWriter() std.Io.Writer {
+        return .{
+            .vtable = &.{
+                .drain = ioWriteDrain,
+            },
+            .buffer = &.{},
+            .end = 0,
+        };
+    }
+
+    fn ioReadStream(io_reader: *std.Io.Reader, io_writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *TlsServerConnection = @fieldParentPtr("io_reader", io_reader);
+        var read_buffer: [4096]u8 = undefined;
+        const read_slice = limit.slice(read_buffer[0..]);
+        const bytes_read = self.read_tls(read_slice) catch |err| switch (err) {
+            error.WouldBlock => {
+                self.read_status = .would_block;
+                return 0;
+            },
+            error.ConnectionClosed => {
+                self.read_status = .connection_closed;
+                return error.EndOfStream;
+            },
+            else => {
+                self.read_status = .failed;
+                return error.ReadFailed;
+            },
+        };
+
+        if (bytes_read == 0) {
+            self.read_status = .would_block;
+            return 0;
+        }
+
+        self.read_status = .ok;
+        try io_writer.writeAll(read_buffer[0..bytes_read]);
+        return bytes_read;
+    }
+
+    fn ioWriteDrain(io_writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *TlsServerConnection = @fieldParentPtr("io_writer", io_writer);
+        std.debug.assert(io_writer.end == 0);
+
+        var total_written: usize = 0;
+        for (data[0 .. data.len - 1]) |chunk| {
+            try self.writeIoChunk(chunk);
+            total_written += chunk.len;
+        }
+
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| {
+            try self.writeIoChunk(pattern);
+            total_written += pattern.len;
+        }
+
+        return total_written;
+    }
+
+    fn writeIoChunk(self: *TlsServerConnection, chunk: []const u8) std.Io.Writer.Error!void {
+        self.write_tls(chunk) catch |err| switch (err) {
+            error.WouldBlock => {
+                self.write_status = .would_block;
+                return error.WriteFailed;
+            },
+            error.ConnectionClosed => {
+                self.write_status = .connection_closed;
+                return error.WriteFailed;
+            },
+            else => {
+                self.write_status = .failed;
+                return error.WriteFailed;
+            },
+        };
+        self.write_status = .ok;
     }
 
     /// A single SSL_read call. Returns bytes read, or an error.
@@ -543,38 +728,69 @@ pub const TlsServerConnection = struct {
         }
     }
 
-    /// Write all `data` through SSL_write until fully consumed or error.
+    /// Write all `data` through repeated SSL_write calls until fully consumed or error.
     fn write_tls(self: *TlsServerConnection, write_data: []const u8) !void {
-        // Assert valid SSL context and data size
+        var bytes_written_offset: u32 = 0;
+        while (bytes_written_offset < write_data.len) {
+            const bytes_written = try self.write_tls_once(
+                write_data[bytes_written_offset..],
+            );
+            std.debug.assert(bytes_written > 0);
+            bytes_written_offset += @intCast(bytes_written);
+        }
+    }
+
+    /// A single SSL_write call. Returns bytes written, or an error.
+    fn write_tls_once(self: *TlsServerConnection, write_data: []const u8) !usize {
         std.debug.assert(self.ssl != null);
         std.debug.assert(write_data.len <= std.math.maxInt(c_int));
 
         if (self.ssl == null) {
             return TlsError.InvalidContext;
         }
-        var bytes_written_offset: u32 = 0;
-        while (bytes_written_offset < write_data.len) {
-            const ssl_connection = self.ssl.?;
-            const remaining_bytes = write_data.len - bytes_written_offset;
-            const remaining_bytes_int: c_int = @intCast(remaining_bytes);
-            const bytes_written_count = boringssl.SSL_write(ssl_connection, write_data.ptr + bytes_written_offset, remaining_bytes_int);
-            if (bytes_written_count <= 0) {
-                const ssl_error_code = boringssl.SSL_get_error(ssl_connection, bytes_written_count);
-                switch (ssl_error_code) {
-                    boringssl.SSL_ERROR_WANT_READ, boringssl.SSL_ERROR_WANT_WRITE => return TlsError.WouldBlock,
-                    else => {
-                        const error_message =
-                            boringssl.ERR_error_string(@intCast(ssl_error_code), null);
-                        std.debug.print(
-                            "SSL_write error: code={d} msg={s}\n",
-                            .{ ssl_error_code, error_message },
-                        );
-                        return TlsError.WriteFailed;
-                    },
+        if (write_data.len == 0) {
+            return 0;
+        }
+
+        const ssl_connection = self.ssl.?;
+        const write_len: c_int = @intCast(write_data.len);
+        const bytes_written_count = boringssl.SSL_write(
+            ssl_connection,
+            write_data.ptr,
+            write_len,
+        );
+        if (bytes_written_count > 0) {
+            return @intCast(bytes_written_count);
+        }
+
+        const ssl_error_code = boringssl.SSL_get_error(ssl_connection, bytes_written_count);
+        switch (ssl_error_code) {
+            boringssl.SSL_ERROR_WANT_READ => {
+                return TlsError.WouldBlock;
+            },
+            boringssl.SSL_ERROR_WANT_WRITE => {
+                return TlsError.WouldBlock;
+            },
+            boringssl.SSL_ERROR_ZERO_RETURN => {
+                return TlsError.ConnectionClosed;
+            },
+            boringssl.SSL_ERROR_SYSCALL => {
+                if (bytes_written_count == 0) {
+                    return TlsError.ConnectionClosed;
                 }
-            }
-            // Increase offset by the number of bytes written, cast to u32.
-            bytes_written_offset += @intCast(bytes_written_count);
+                return TlsError.WriteFailed;
+            },
+            boringssl.SSL_ERROR_SSL => {
+                return TlsError.ConnectionClosed;
+            },
+            else => {
+                const error_message = boringssl.ERR_error_string(@intCast(ssl_error_code), null);
+                std.debug.print(
+                    "SSL_write error: code={d} msg={s}\n",
+                    .{ ssl_error_code, error_message },
+                );
+                return TlsError.WriteFailed;
+            },
         }
     }
 };

@@ -8602,7 +8602,7 @@ pub fn sk_SSL_CIPHER_call_copy_func(arg_copy_func: OPENSSL_sk_copy_func, arg_ptr
     _ = &copy_func;
     var ptr = arg_ptr;
     _ = &ptr;
-    return @as(?*anyopaque, @ptrCast(@volatileCast(@constCast(@as(sk_SSL_CIPHER_copy_func, @ptrCast(@alignCast(copy_func))).?(@as(?*const SSL_CIPHER, @ptrCast(ptr)))))));
+    return @as(?*anyopaque, @ptrCast(@constCast(@volatileCast(@as(sk_SSL_CIPHER_copy_func, @ptrCast(@alignCast(copy_func))).?(@as(?*const SSL_CIPHER, @ptrCast(ptr)))))));
 }
 pub fn sk_SSL_CIPHER_call_cmp_func(arg_cmp_func: OPENSSL_sk_cmp_func, arg_a: ?*const anyopaque, arg_b: ?*const anyopaque) callconv(.c) c_int {
     var cmp_func = arg_cmp_func;
@@ -8658,7 +8658,7 @@ pub fn sk_SSL_CIPHER_set(arg_sk: ?*struct_stack_st_SSL_CIPHER, arg_i: usize, arg
     _ = &i;
     var p = arg_p;
     _ = &p;
-    return @as(?*const SSL_CIPHER, @ptrCast(OPENSSL_sk_set(@as(?*OPENSSL_STACK, @ptrCast(sk)), i, @as(?*anyopaque, @ptrCast(@volatileCast(@constCast(p)))))));
+    return @as(?*const SSL_CIPHER, @ptrCast(OPENSSL_sk_set(@as(?*OPENSSL_STACK, @ptrCast(sk)), i, @as(?*anyopaque, @ptrCast(@constCast(@volatileCast(p)))))));
 }
 pub fn sk_SSL_CIPHER_free(arg_sk: ?*struct_stack_st_SSL_CIPHER) callconv(.c) void {
     var sk = arg_sk;
@@ -8679,7 +8679,7 @@ pub fn sk_SSL_CIPHER_insert(arg_sk: ?*struct_stack_st_SSL_CIPHER, arg_p: ?*const
     _ = &p;
     var where = arg_where;
     _ = &where;
-    return OPENSSL_sk_insert(@as(?*OPENSSL_STACK, @ptrCast(sk)), @as(?*anyopaque, @ptrCast(@volatileCast(@constCast(p)))), where);
+    return OPENSSL_sk_insert(@as(?*OPENSSL_STACK, @ptrCast(sk)), @as(?*anyopaque, @ptrCast(@constCast(@volatileCast(p)))), where);
 }
 pub fn sk_SSL_CIPHER_delete(arg_sk: ?*struct_stack_st_SSL_CIPHER, arg_where: usize) callconv(.c) ?*const SSL_CIPHER {
     var sk = arg_sk;
@@ -8723,7 +8723,7 @@ pub fn sk_SSL_CIPHER_push(arg_sk: ?*struct_stack_st_SSL_CIPHER, arg_p: ?*const S
     _ = &sk;
     var p = arg_p;
     _ = &p;
-    return OPENSSL_sk_push(@as(?*OPENSSL_STACK, @ptrCast(sk)), @as(?*anyopaque, @ptrCast(@volatileCast(@constCast(p)))));
+    return OPENSSL_sk_push(@as(?*OPENSSL_STACK, @ptrCast(sk)), @as(?*anyopaque, @ptrCast(@constCast(@volatileCast(p)))));
 }
 pub fn sk_SSL_CIPHER_pop(arg_sk: ?*struct_stack_st_SSL_CIPHER) callconv(.c) ?*const SSL_CIPHER {
     var sk = arg_sk;
@@ -8977,7 +8977,7 @@ pub fn sk_SRTP_PROTECTION_PROFILE_call_copy_func(arg_copy_func: OPENSSL_sk_copy_
     _ = &copy_func;
     var ptr = arg_ptr;
     _ = &ptr;
-    return @as(?*anyopaque, @ptrCast(@volatileCast(@constCast(@as(sk_SRTP_PROTECTION_PROFILE_copy_func, @ptrCast(@alignCast(copy_func))).?(@as([*c]const SRTP_PROTECTION_PROFILE, @ptrCast(@alignCast(ptr))))))));
+    return @as(?*anyopaque, @ptrCast(@constCast(@volatileCast(@as(sk_SRTP_PROTECTION_PROFILE_copy_func, @ptrCast(@alignCast(copy_func))).?(@as([*c]const SRTP_PROTECTION_PROFILE, @ptrCast(@alignCast(ptr))))))));
 }
 pub fn sk_SRTP_PROTECTION_PROFILE_call_cmp_func(arg_cmp_func: OPENSSL_sk_cmp_func, arg_a: ?*const anyopaque, arg_b: ?*const anyopaque) callconv(.c) c_int {
     var cmp_func = arg_cmp_func;
@@ -9033,7 +9033,7 @@ pub fn sk_SRTP_PROTECTION_PROFILE_set(arg_sk: ?*struct_stack_st_SRTP_PROTECTION_
     _ = &i;
     var p = arg_p;
     _ = &p;
-    return @as([*c]const SRTP_PROTECTION_PROFILE, @ptrCast(@alignCast(OPENSSL_sk_set(@as(?*OPENSSL_STACK, @ptrCast(sk)), i, @as(?*anyopaque, @ptrCast(@volatileCast(@constCast(p))))))));
+    return @as([*c]const SRTP_PROTECTION_PROFILE, @ptrCast(@alignCast(OPENSSL_sk_set(@as(?*OPENSSL_STACK, @ptrCast(sk)), i, @as(?*anyopaque, @ptrCast(@constCast(@volatileCast(p))))))));
 }
 pub fn sk_SRTP_PROTECTION_PROFILE_free(arg_sk: ?*struct_stack_st_SRTP_PROTECTION_PROFILE) callconv(.c) void {
     var sk = arg_sk;
@@ -9054,7 +9054,7 @@ pub fn sk_SRTP_PROTECTION_PROFILE_insert(arg_sk: ?*struct_stack_st_SRTP_PROTECTI
     _ = &p;
     var where = arg_where;
     _ = &where;
-    return OPENSSL_sk_insert(@as(?*OPENSSL_STACK, @ptrCast(sk)), @as(?*anyopaque, @ptrCast(@volatileCast(@constCast(p)))), where);
+    return OPENSSL_sk_insert(@as(?*OPENSSL_STACK, @ptrCast(sk)), @as(?*anyopaque, @ptrCast(@constCast(@volatileCast(p)))), where);
 }
 pub fn sk_SRTP_PROTECTION_PROFILE_delete(arg_sk: ?*struct_stack_st_SRTP_PROTECTION_PROFILE, arg_where: usize) callconv(.c) [*c]const SRTP_PROTECTION_PROFILE {
     var sk = arg_sk;
@@ -9098,7 +9098,7 @@ pub fn sk_SRTP_PROTECTION_PROFILE_push(arg_sk: ?*struct_stack_st_SRTP_PROTECTION
     _ = &sk;
     var p = arg_p;
     _ = &p;
-    return OPENSSL_sk_push(@as(?*OPENSSL_STACK, @ptrCast(sk)), @as(?*anyopaque, @ptrCast(@volatileCast(@constCast(p)))));
+    return OPENSSL_sk_push(@as(?*OPENSSL_STACK, @ptrCast(sk)), @as(?*anyopaque, @ptrCast(@constCast(@volatileCast(p)))));
 }
 pub fn sk_SRTP_PROTECTION_PROFILE_pop(arg_sk: ?*struct_stack_st_SRTP_PROTECTION_PROFILE) callconv(.c) [*c]const SRTP_PROTECTION_PROFILE {
     var sk = arg_sk;

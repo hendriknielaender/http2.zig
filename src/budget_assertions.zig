@@ -182,8 +182,8 @@ test "Memory budget validation" {
     // Runtime verification that we can actually instantiate the system
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var memory_pool = try memory_budget.StaticMemoryPool.init(arena.allocator());
-    defer memory_pool.deinit();
+    const memory_pool = try memory_budget.StaticMemoryPool.create(arena.allocator());
+    defer memory_pool.destroy();
     // Verify basic pool operations work
     const conn_slot = memory_pool.acquireConnection();
     try std.testing.expect(conn_slot != null);
@@ -199,8 +199,8 @@ test "Memory budget validation" {
 test "Pool operation performance" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var memory_pool = try memory_budget.StaticMemoryPool.init(arena.allocator());
-    defer memory_pool.deinit();
+    const memory_pool = try memory_budget.StaticMemoryPool.create(arena.allocator());
+    defer memory_pool.destroy();
     const start_time = std.time.nanoTimestamp();
     // Perform many pool operations
     const iterations = 1000;

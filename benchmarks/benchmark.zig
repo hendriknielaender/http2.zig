@@ -20,7 +20,7 @@ pub fn main() !void {
     const port_env = std.posix.getenv("PORT");
     const tls_env = std.posix.getenv("TLS");
     const use_tls = if (tls_env) |env_val| std.mem.eql(u8, env_val, "1") or std.mem.eql(u8, env_val, "true") else true;
-    
+
     const port: u16 = if (port_env) |env_val|
         std.fmt.parseInt(u16, env_val, 10) catch (if (use_tls) @as(u16, 8443) else @as(u16, 3000))
     else
@@ -29,21 +29,21 @@ pub fn main() !void {
     // Set up simple router for benchmarking
     var router = http2.Router.init(allocator);
     defer router.deinit();
-    
+
     try router.get("/", helloHandler);
 
     // Configure server for benchmarking with high concurrency
     const config = http2.Server.Config{
         .address = try std.net.Address.resolveIp("127.0.0.1", port),
         .router = &router,
-        .max_connections = 100, // Reduced concurrency to avoid libxev completion reuse issues
+        .max_connections = http2.memory_budget.MemBudget.max_conns,
         .buffer_size = 32 * 1024,
     };
 
     // Initialize TLS context if needed
-    var tls_ctx: ?http2.tls.TlsServerContext = if (use_tls) 
+    var tls_ctx: ?http2.tls.TlsServerContext = if (use_tls)
         try http2.tls.TlsServerContext.init(allocator, "cert.pem", "key.pem")
-    else 
+    else
         null;
     defer if (tls_ctx) |*ctx| ctx.deinit();
 
@@ -51,7 +51,7 @@ pub fn main() !void {
         try http2.Server.initWithTLS(allocator, config, &tls_ctx.?)
     else
         try http2.Server.init(allocator, config);
-    
+
     defer server.deinit();
 
     if (use_tls) {
@@ -66,55 +66,64 @@ pub fn main() !void {
     const MonitorContext = struct {
         server: *http2.Server,
         ready: std.atomic.Value(bool),
+        running: std.atomic.Value(bool),
     };
-    
+
     var monitor_ctx = MonitorContext{
         .server = &server,
         .ready = std.atomic.Value(bool).init(false),
+        .running = std.atomic.Value(bool).init(true),
     };
-    
+
     // Start performance monitoring with synchronization
     const monitor_thread = try std.Thread.spawn(.{}, monitorPerformance, .{&monitor_ctx});
-    defer monitor_thread.join();
-    
+    defer {
+        monitor_ctx.running.store(false, .release);
+        monitor_thread.join();
+    }
+
     // Signal that server is ready before running
     monitor_ctx.ready.store(true, .release);
-    try server.run();
+    server.run() catch |err| {
+        std.log.err("Benchmark server failed: {}", .{err});
+        return err;
+    };
 }
 
 fn monitorPerformance(ctx: *const anyopaque) void {
     const MonitorContext = struct {
         server: *http2.Server,
         ready: std.atomic.Value(bool),
+        running: std.atomic.Value(bool),
     };
-    
+
     const monitor_ctx = @as(*MonitorContext, @ptrCast(@alignCast(@constCast(ctx))));
-    
+
     // Wait for server to be ready
     while (!monitor_ctx.ready.load(.acquire)) {
-        std.time.sleep(10 * std.time.ns_per_ms);
+        std.Thread.sleep(10 * std.time.ns_per_ms);
     }
-    
+
     var last_total: u64 = 0;
     var last_requests: u64 = 0;
     var last_time = std.time.milliTimestamp();
     var peak_rps: u64 = 0;
     var peak_conn_rps: u64 = 0;
 
-    while (true) {
-        std.time.sleep(2 * std.time.ns_per_s);
-        
+    while (monitor_ctx.running.load(.acquire)) {
+        std.Thread.sleep(2 * std.time.ns_per_s);
+
         const stats = monitor_ctx.server.getStats();
         const current_time = std.time.milliTimestamp();
         const time_diff_ms = current_time - last_time;
-        
+
         if (time_diff_ms > 0) {
             const conn_diff = stats.total_connections - last_total;
             const req_diff = stats.requests_processed - last_requests;
-            
+
             const conn_rps = (conn_diff * 1000) / @as(u64, @intCast(time_diff_ms));
             const req_rps = (req_diff * 1000) / @as(u64, @intCast(time_diff_ms));
-            
+
             if (conn_rps > peak_conn_rps) peak_conn_rps = conn_rps;
             if (req_rps > peak_rps) peak_rps = req_rps;
 
@@ -125,7 +134,7 @@ fn monitorPerformance(ctx: *const anyopaque) void {
                 stats.requests_processed,
                 peak_rps,
             });
-            
+
             last_total = stats.total_connections;
             last_requests = stats.requests_processed;
             last_time = current_time;
