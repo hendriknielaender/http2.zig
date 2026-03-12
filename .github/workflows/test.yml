@@ -25,6 +25,16 @@ jobs:
       - name: Build http2.zig
         run: zig build
 
+      - name: Generate TLS certificate
+        run: |
+          openssl req -x509 -newkey rsa:4096 \
+            -keyout key.pem \
+            -out cert.pem \
+            -days 365 \
+            -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
       - name: Run h2spec tests
         env:
           PORT: 8081
