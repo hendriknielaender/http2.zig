@@ -1,5 +1,5 @@
 //! HTTP/2 Request Handler API
-//! 
+//!
 //! Provides a clean, type-safe interface for handling HTTP/2 requests
 //! with zero-allocation patterns and optimal performance.
 
@@ -111,7 +111,7 @@ pub const Context = struct {
     body: []const u8,
     response: ResponseBuilder,
     allocator: std.mem.Allocator,
-    
+
     const Self = @This();
 
     /// Initialize a new request context.
@@ -144,7 +144,7 @@ pub const Context = struct {
         while (query_iter.next()) |param| {
             if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
                 const param_name = param[0..eq_pos];
-                const param_value = param[eq_pos + 1..];
+                const param_value = param[eq_pos + 1 ..];
                 if (std.mem.eql(u8, param_name, name)) {
                     return param_value;
                 }
@@ -176,7 +176,7 @@ pub const HeaderMap = struct {
     pub fn put(self: *Self, name: []const u8, value: []const u8) void {
         std.debug.assert(self.count < 32);
         if (self.count >= 32) return;
-        
+
         self.entries[self.count] = HeaderEntry{
             .name = name,
             .value = value,
@@ -220,7 +220,7 @@ pub const Response = struct {
     pub fn init(allocator: std.mem.Allocator, status: Status) Self {
         return Self{
             .status = status,
-            .headers = std.ArrayList(HeaderPair).init(allocator),
+            .headers = .{},
             .body = "",
             .allocator = allocator,
         };
@@ -233,11 +233,11 @@ pub const Response = struct {
                 self.allocator.free(header.value);
             }
         }
-        self.headers.deinit();
+        self.headers.deinit(self.allocator);
     }
 
     pub fn addHeader(self: *Self, name: []const u8, value: []const u8) !void {
-        try self.headers.append(HeaderPair{ .name = name, .value = value });
+        try self.headers.append(self.allocator, HeaderPair{ .name = name, .value = value });
     }
 
     pub fn setBody(self: *Self, body: []const u8) void {
@@ -260,7 +260,7 @@ pub const ResponseBuilder = struct {
     /// Create a response with the given configuration.
     pub fn apply(self: *const Self, config: ResponseConfig) !Response {
         std.debug.assert(config.body.len <= 1024 * 1024); // 1MB max body size
-        
+
         var response = Response.init(self.allocator, config.status);
 
         // Add content-type header if mime type is specified.
@@ -270,11 +270,7 @@ pub const ResponseBuilder = struct {
 
         // Add content-length header.
         var content_length_buf: [32]u8 = undefined;
-        const content_length_str = try std.fmt.bufPrint(
-            &content_length_buf, 
-            "{d}", 
-            .{config.body.len}
-        );
+        const content_length_str = try std.fmt.bufPrint(&content_length_buf, "{d}", .{config.body.len});
         const content_length_copy = try self.allocator.dupe(u8, content_length_str);
         try response.addHeader("content-length", content_length_copy);
 
@@ -331,7 +327,7 @@ pub const Route = struct {
     pub fn init(method: Method, path: []const u8, handler: HandlerFn) Self {
         std.debug.assert(path.len > 0);
         std.debug.assert(path[0] == '/');
-        
+
         return Self{
             .method = method,
             .path = path,
@@ -350,14 +346,14 @@ pub const Router = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .routes = std.ArrayList(Route).init(allocator),
+            .routes = .{},
             .allocator = allocator,
             .fallback_handler = null,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.routes.deinit();
+        self.routes.deinit(self.allocator);
     }
 
     /// Add a route for GET requests.
@@ -374,8 +370,8 @@ pub const Router = struct {
     pub fn addRoute(self: *Self, method: Method, path: []const u8, handler: HandlerFn) !void {
         std.debug.assert(path.len > 0);
         std.debug.assert(path[0] == '/');
-        
-        try self.routes.append(Route.init(method, path, handler));
+
+        try self.routes.append(self.allocator, Route.init(method, path, handler));
     }
 
     /// Set a fallback handler for unmatched requests.
@@ -386,7 +382,7 @@ pub const Router = struct {
     /// Find handler for the given method and path.
     pub fn findHandler(self: *const Self, method: Method, path: []const u8) ?HandlerFn {
         std.debug.assert(path.len > 0);
-        
+
         for (self.routes.items) |route| {
             if (route.method == method) {
                 if (std.mem.eql(u8, route.path, path)) {
@@ -394,7 +390,7 @@ pub const Router = struct {
                 }
             }
         }
-        
+
         return self.fallback_handler;
     }
 };
@@ -419,7 +415,7 @@ test "header map operations" {
     var headers = HeaderMap.init();
     headers.put("content-type", "text/html");
     headers.put("content-length", "1024");
-    
+
     try std.testing.expectEqualStrings("text/html", headers.get("content-type").?);
     try std.testing.expectEqualStrings("text/html", headers.get("Content-Type").?);
     try std.testing.expect(headers.get("nonexistent") == null);
@@ -428,19 +424,19 @@ test "header map operations" {
 test "router path matching" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    
+
     var router = Router.init(allocator);
     defer router.deinit();
-    
+
     const test_handler: HandlerFn = struct {
         fn handler(ctx: *const Context) !Response {
             return ctx.response.text(.ok, "test");
         }
     }.handler;
-    
+
     try router.get("/", test_handler);
     try router.get("/test", test_handler);
-    
+
     try testing.expect(router.findHandler(.get, "/") != null);
     try testing.expect(router.findHandler(.get, "/test") != null);
     try testing.expect(router.findHandler(.get, "/nonexistent") == null);
@@ -450,12 +446,12 @@ test "router path matching" {
 test "response builder" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    
+
     const builder = ResponseBuilder.init(allocator);
-    
+
     var response = try builder.html(.ok, "<h1>Hello</h1>");
     defer response.deinit();
-    
+
     try testing.expectEqual(Status.ok, response.status);
     try testing.expectEqualStrings("<h1>Hello</h1>", response.body);
 }

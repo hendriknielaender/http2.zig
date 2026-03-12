@@ -91,9 +91,10 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
     return struct {
         // Compile-time constants for performance
         const Self = @This();
-        const WindowInit: u32 = 1 << WindowBits;
+        const WindowBufferSize: u32 = 1 << WindowBits;
+        const WindowDefault: u32 = WindowBufferSize - 1;
         const MaxStreamCount: u32 = MaxStreams;
-        const BufferSize: usize = WindowInit;
+        const BufferSize: usize = WindowBufferSize;
 
         // Static memory allocation for streams
         const StreamPool = struct {
@@ -130,7 +131,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             // Core stream identification and state
             id: u32,
             state: StreamState,
-            conn: *Connection(std.io.AnyReader, std.io.AnyWriter),
+            conn: *Connection,
 
             // Flow control with compile-time optimized window sizes
             recv_window_size: i32,
@@ -153,10 +154,14 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
             // Header processing state
             expecting_continuation: bool,
-            headers: std.BoundedArray(Hpack.HeaderField, 64), // Bounded for performance
+            headers_storage: [64]Hpack.HeaderField,
+            headers: std.ArrayList(Hpack.HeaderField),
             content_length: ?usize,
             total_data_received: usize,
+            request_headers_complete: bool,
             request_complete: bool,
+            response_headers_sent: bool,
+            response_body_sent: usize,
             cleaned_up: bool,
 
             // HTTP/2 priority fields with defaults
@@ -165,14 +170,14 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             weight: u16,
 
             // Compile-time optimized initialization
-            pub fn init(self: *Self.StreamInstance, conn: *Connection(std.io.AnyReader, std.io.AnyWriter), id: u32) void {
+            pub fn init(self: *Self.StreamInstance, conn: *Connection, id: u32) void {
                 self.* = Self.StreamInstance{
                     .id = id,
                     .state = .Idle,
                     .conn = conn,
-                    .recv_window_size = @intCast(WindowInit),
-                    .send_window_size = @intCast(WindowInit),
-                    .initial_window_size = WindowInit,
+                    .recv_window_size = @intCast(WindowDefault),
+                    .send_window_size = @intCast(WindowDefault),
+                    .initial_window_size = WindowDefault,
 
                     // Zero-initialize static buffers
                     .recv_headers_buf = [_]u8{0} ** BufferSize,
@@ -189,15 +194,20 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     .header_block_fragments_len = 0,
 
                     .expecting_continuation = false,
-                    .headers = std.BoundedArray(Hpack.HeaderField, 64).init(0) catch unreachable,
+                    .headers_storage = undefined,
+                    .headers = .empty,
                     .content_length = null,
                     .total_data_received = 0,
+                    .request_headers_complete = false,
                     .request_complete = false,
+                    .response_headers_sent = false,
+                    .response_body_sent = 0,
                     .cleaned_up = false,
                     .stream_dependency = 0,
                     .exclusive = false,
                     .weight = 16,
                 };
+                self.headers = std.ArrayList(Hpack.HeaderField).initBuffer(&self.headers_storage);
             }
 
             // Optimized cleanup with static memory management
@@ -217,9 +227,11 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 self.recv_data_len = 0;
                 self.send_data_len = 0;
                 self.header_block_fragments_len = 0;
+                self.response_headers_sent = false;
+                self.response_body_sent = 0;
 
-                // Free header field allocations with exhaustive cleanup
-                for (self.headers.slice()) |header| {
+                // Free header field allocations with exhaustive cleanup.
+                for (self.headers.items) |header| {
                     if (header.name.len > 0) {
                         self.conn.allocator.free(header.name);
                     }
@@ -228,8 +240,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     }
                 }
 
-                // Reset bounded array without deallocation
-                self.headers.len = 0;
+                self.headers.clearRetainingCapacity();
+                self.request_headers_complete = false;
                 self.cleaned_up = true;
             }
 
@@ -250,8 +262,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                         .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY => false,
                     },
                     .HalfClosedRemote => switch (frame.header.frame_type) {
-                        .WINDOW_UPDATE, .PRIORITY, .RST_STREAM => true,
-                        .DATA, .HEADERS, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .CONTINUATION => false,
+                        .WINDOW_UPDATE, .PRIORITY, .RST_STREAM, .CONTINUATION => true,
+                        .DATA, .HEADERS, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY => false,
                     },
                     .HalfClosedLocal => switch (frame.header.frame_type) {
                         .HEADERS, .DATA, .PRIORITY, .RST_STREAM, .WINDOW_UPDATE, .CONTINUATION => true,
@@ -318,21 +330,17 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                         try self.conn.mark_stream_closed(self.id);
                     }
                 }
-
-                // Process completed requests immediately
-                if (self.request_complete) {
-                    log.debug("Request complete for stream {}, processing response immediately but yielding", .{self.id});
-                    // Process the request immediately but in a way that yields control quickly
-                    try self.conn.process_request(self);
-                    log.debug("Response processing finished for stream {}", .{self.id});
-                }
             }
 
             // Compile-time optimized flow control with window size calculations
             pub fn updateSendWindow(self: *Self.StreamInstance, increment: i32) !void {
-                // Compile-time flow control bounds checking
-                const new_window = self.send_window_size + increment;
-                if (new_window > WindowInit * 2) { // Allow 2x initial window as maximum
+                const overflow = @addWithOverflow(self.send_window_size, increment);
+                if (overflow[1] != 0) {
+                    return error.FlowControlError;
+                }
+
+                const new_window = overflow[0];
+                if (new_window > std.math.maxInt(i32)) {
                     return error.FlowControlError;
                 }
                 self.send_window_size = new_window;
@@ -346,7 +354,12 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     else => return error.InvalidStreamState,
                 }
 
-                if (data.len > self.send_window_size) {
+                if (self.send_window_size <= 0) {
+                    return error.FlowControlError;
+                }
+
+                const send_window_size: usize = @intCast(self.send_window_size);
+                if (data.len > send_window_size) {
                     return error.FlowControlError;
                 }
 
@@ -361,7 +374,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
                 const frame_flags = if (end_stream) FrameFlags.init(FrameFlags.END_STREAM) else FrameFlags.init(0);
 
-                const frame = Frame{
+                var frame = Frame{
                     .header = FrameHeader{
                         .length = @intCast(data.len),
                         .frame_type = FrameType.DATA,
@@ -579,7 +592,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 // This is critical for HTTP/2 flow control
                 if (frame.header.length > 0) {
                     try self.conn.send_window_update(self.id, @intCast(frame.header.length));
-                    log.debug("Sent WINDOW_UPDATE for stream {} with increment {}", .{self.id, frame.header.length});
+                    log.debug("Sent WINDOW_UPDATE for stream {} with increment {}", .{ self.id, frame.header.length });
                 }
 
                 if (frame.header.flags.isEndStream()) {
@@ -676,29 +689,34 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
             fn decodeHeaderBlock(self: *Self.StreamInstance) !void {
                 const header_block = self.header_block_fragments_buf[0..self.header_block_fragments_len];
+                var cursor: usize = 0;
+                var saw_header_field = false;
 
-                // Clear existing headers efficiently
-                for (self.headers.slice()) |header| {
+                // Clear existing headers efficiently.
+                for (self.headers.items) |header| {
                     self.conn.allocator.free(header.name);
                     self.conn.allocator.free(header.value);
                 }
-                self.headers.len = 0;
+                self.headers.clearRetainingCapacity();
 
-                var cursor: usize = 0;
                 while (cursor < header_block.len) {
                     const remaining_data = header_block[cursor..];
-
-                    var decoded_header = Hpack.decodeHeaderField(remaining_data, &self.conn.hpack_dynamic_table, self.conn.allocator) catch |err| {
+                    var decoded_header = Hpack.decodeHeaderField(
+                        remaining_data,
+                        &self.conn.hpack_decoder_table,
+                        self.conn.allocator,
+                    ) catch |err| {
                         log.err("Header decompression failed: {}\n", .{err});
                         try self.conn.send_goaway(0, 0x09, "Compression Error: COMPRESSION_ERROR");
                         return error.CompressionError;
                     };
 
-                    // Filter out empty headers from HPACK dynamic table size updates
+                    // Filter out empty headers from HPACK dynamic table size updates.
                     if (decoded_header.header.name.len > 0) {
-                        if (self.headers.len >= 64) {
+                        saw_header_field = true;
+                        if (self.headers.items.len >= self.headers.capacity) {
                             log.err("Too many headers: INTERNAL_ERROR\n", .{});
-                            try self.sendRstStream(0x2); // INTERNAL_ERROR
+                            try self.sendRstStream(0x2);
                             return error.TooManyHeaders;
                         }
 
@@ -707,162 +725,150 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                             .value = try self.conn.allocator.dupe(u8, decoded_header.header.value),
                         };
                         self.headers.appendAssumeCapacity(header_copy);
+                    } else if (saw_header_field) {
+                        try self.conn.send_goaway(0, 0x09, "Compression Error: COMPRESSION_ERROR");
+                        return error.CompressionError;
                     }
 
-                    decoded_header.deinit();
                     cursor += decoded_header.bytes_consumed;
+                    decoded_header.deinit();
                 }
 
-                try self.validateHeaders(self.headers.slice());
+                if (self.request_headers_complete) {
+                    try self.validateTrailers(self.headers.items);
+                } else {
+                    try self.validateHeaders(self.headers.items);
+                    self.request_headers_complete = true;
+                }
             }
 
-            fn validateHeaders(self: *Self.StreamInstance, headers: []Hpack.HeaderField) !void {
-                var pseudo_header_fields = std.StringHashMap([]const u8).init(self.conn.allocator);
-                defer pseudo_header_fields.deinit();
+            const RequestPseudoHeaders = struct {
+                method: ?[]const u8 = null,
+                scheme: ?[]const u8 = null,
+                authority: ?[]const u8 = null,
+                path: ?[]const u8 = null,
+                regular_header_seen: bool = false,
 
-                var header_fields_after_pseudo = false;
+                fn add(self: *@This(), header: Hpack.HeaderField) !void {
+                    if (self.regular_header_seen) {
+                        return error.ProtocolError;
+                    }
+
+                    const target = self.slot(header.name) orelse return error.ProtocolError;
+                    if (target.* != null) {
+                        return error.ProtocolError;
+                    }
+
+                    target.* = header.value;
+                }
+
+                fn markRegularHeader(self: *@This()) void {
+                    self.regular_header_seen = true;
+                }
+
+                fn validateRequest(self: *const @This()) !void {
+                    const method = self.method orelse return error.ProtocolError;
+                    if (method.len == 0) return error.ProtocolError;
+
+                    if (std.mem.eql(u8, method, "CONNECT")) {
+                        if (self.scheme != null) return error.ProtocolError;
+                        if (self.path != null) return error.ProtocolError;
+                        if (self.authority == null) return error.ProtocolError;
+                        return;
+                    }
+
+                    const scheme = self.scheme orelse return error.ProtocolError;
+                    const path = self.path orelse return error.ProtocolError;
+                    if (scheme.len == 0) return error.ProtocolError;
+                    if (path.len == 0) return error.ProtocolError;
+                }
+
+                fn slot(self: *@This(), name: []const u8) ?*?[]const u8 {
+                    if (std.mem.eql(u8, name, ":method")) return &self.method;
+                    if (std.mem.eql(u8, name, ":scheme")) return &self.scheme;
+                    if (std.mem.eql(u8, name, ":authority")) return &self.authority;
+                    if (std.mem.eql(u8, name, ":path")) return &self.path;
+                    return null;
+                }
+            };
+
+            fn validateHeaders(self: *Self.StreamInstance, headers: []Hpack.HeaderField) !void {
+                var pseudo_headers = RequestPseudoHeaders{};
 
                 for (headers) |header| {
                     if (header.name.len == 0) {
-                        log.err("Empty header name: PROTOCOL_ERROR\n", .{});
-                        try self.sendRstStream(0x1); // PROTOCOL_ERROR
-                        return error.ProtocolError;
+                        try self.fail_protocol_error("Empty header name");
                     }
 
                     if (header.name[0] == ':') {
-                        if (header_fields_after_pseudo) {
-                            // RFC 7540 Section 8.1.2.1 mandates that pseudo-header fields MUST appear
-                            // before regular header fields in HTTP/2. When clients violate this rule,
-                            // we have two choices:
-                            //
-                            // 1. Strict compliance: Send RST_STREAM with PROTOCOL_ERROR (original behavior)
-                            // 2. Graceful handling: Log warning and ignore malformed headers (current behavior)
-                            //
-                            // We chose graceful handling to improve robustness against malformed clients
-                            // while still logging the protocol violation for debugging purposes.
-                            log.warn("Pseudo-header field '{s}' after regular header field - ignoring malformed header per HTTP/2 spec section 8.1.2.1\n", .{header.name});
-                            continue; // Skip this malformed pseudo-header instead of failing the entire request
-
-                            // To restore strict compliance, uncomment the following lines:
-                            // log.err("Pseudo-header field after regular header field: PROTOCOL_ERROR\n", .{});
-                            // try self.sendRstStream(0x1); // PROTOCOL_ERROR
-                            // return error.ProtocolError;
-                        }
-
-                        if (pseudo_header_fields.contains(header.name)) {
-                            log.err("Duplicate pseudo-header field: {s}: PROTOCOL_ERROR\n", .{header.name});
-                            try self.sendRstStream(0x1); // PROTOCOL_ERROR
-                            return error.ProtocolError;
-                        }
-
-                        try pseudo_header_fields.put(header.name, header.value);
-                    } else {
-                        header_fields_after_pseudo = true;
-
-                        if (isConnectionSpecificHeader(header.name)) {
-                            log.err("Connection-specific header field '{s}' is prohibited in HTTP/2: PROTOCOL_ERROR\n", .{header.name});
-                            try self.sendRstStream(0x1); // PROTOCOL_ERROR
-                            return error.ProtocolError;
-                        }
-
-                        if (std.mem.eql(u8, header.name, "te")) {
-                            if (!std.mem.eql(u8, header.value, "trailers")) {
-                                log.err("Invalid TE header field value: {s}: PROTOCOL_ERROR\n", .{header.value});
-                                try self.sendRstStream(0x1); // PROTOCOL_ERROR
-                                return error.ProtocolError;
-                            }
-                        }
-
-                        if (!isAllLowercase(header.name)) {
-                            log.err("Header field name contains uppercase letters: {s}: PROTOCOL_ERROR\n", .{header.name});
-                            try self.sendRstStream(0x1); // PROTOCOL_ERROR
-                            return error.ProtocolError;
-                        }
-                    }
-                }
-
-                const allowed_pseudo_headers = [_][]const u8{ ":method", ":scheme", ":authority", ":path" };
-                const required_pseudo_headers = [_][]const u8{ ":method", ":scheme", ":path" };
-
-                // Validate allowed pseudo-headers
-                var it = pseudo_header_fields.iterator();
-                while (it.next()) |entry| {
-                    const ph_name = entry.key_ptr.*;
-                    var is_allowed = false;
-                    for (allowed_pseudo_headers) |allowed| {
-                        if (std.mem.eql(u8, ph_name, allowed)) {
-                            is_allowed = true;
-                            break;
-                        }
-                    }
-                    if (!is_allowed) {
-                        log.err("Unknown pseudo-header field: {s}: PROTOCOL_ERROR\n", .{ph_name});
-                        try self.sendRstStream(0x1); // PROTOCOL_ERROR
-                        return error.ProtocolError;
-                    }
-                }
-
-                for (required_pseudo_headers) |required| {
-                    if (!pseudo_header_fields.contains(required)) {
-                        const default_value = if (std.mem.eql(u8, required, ":method"))
-                            "GET"
-                        else if (std.mem.eql(u8, required, ":scheme"))
-                            "http"
-                        else if (std.mem.eql(u8, required, ":path"))
-                            "/"
-                        else
-                            "";
-
-                        log.debug("Missing pseudo-header {s}, using default: {s}", .{ required, default_value });
-                        try pseudo_header_fields.put(required, default_value);
-                    } else {
-                        const value = pseudo_header_fields.get(required).?;
-                        if (value.len == 0) {
-                            // Empty value - provide default
-                            const default_value = if (std.mem.eql(u8, required, ":method"))
-                                "GET"
-                            else if (std.mem.eql(u8, required, ":scheme"))
-                                "http"
-                            else if (std.mem.eql(u8, required, ":path"))
-                                "/"
-                            else
-                                "";
-
-                            log.debug("Empty pseudo-header {s}, using default: {s}", .{ required, default_value });
-                            try pseudo_header_fields.put(required, default_value);
-                        }
-                    }
-                }
-
-                // Handle CONNECT method validation
-                const method = pseudo_header_fields.get(":method").?;
-                if (std.mem.eql(u8, method, "CONNECT")) {
-                    if (pseudo_header_fields.contains(":scheme") or pseudo_header_fields.contains(":path")) {
-                        log.err("CONNECT method must not contain :scheme or :path pseudo-header fields: PROTOCOL_ERROR\n", .{});
-                        try self.sendRstStream(0x1); // PROTOCOL_ERROR
-                        return error.ProtocolError;
-                    }
-                }
-
-                // Parse content-length
-                for (headers) |header| {
-                    if (std.mem.eql(u8, header.name, "content-length")) {
-                        const content_length_result = std.fmt.parseInt(usize, header.value, 10) catch |err| {
-                            log.err("Error: {any} Invalid content-length value: {s}: PROTOCOL_ERROR\n", .{ err, header.value });
-                            try self.sendRstStream(0x1); // PROTOCOL_ERROR
-                            return error.ProtocolError;
+                        pseudo_headers.add(header) catch {
+                            try self.fail_protocol_error("Invalid pseudo-header field");
                         };
+                        continue;
+                    }
 
-                        self.content_length = content_length_result;
+                    pseudo_headers.markRegularHeader();
+                    try self.validateRegularHeader(header);
+                    try self.validateContentLength(header);
+                }
+
+                pseudo_headers.validateRequest() catch {
+                    try self.fail_protocol_error("Invalid request pseudo-header fields");
+                };
+            }
+
+            fn validateRegularHeader(self: *Self.StreamInstance, header: Hpack.HeaderField) !void {
+                if (isConnectionSpecificHeader(header.name)) {
+                    try self.fail_protocol_error("Connection-specific header field");
+                }
+
+                if (std.mem.eql(u8, header.name, "te")) {
+                    if (!std.mem.eql(u8, header.value, "trailers")) {
+                        try self.fail_protocol_error("Invalid TE header field value");
                     }
                 }
+
+                if (!isAllLowercase(header.name)) {
+                    try self.fail_protocol_error("Header field name contains uppercase letters");
+                }
+            }
+
+            fn validateContentLength(self: *Self.StreamInstance, header: Hpack.HeaderField) !void {
+                if (!std.mem.eql(u8, header.name, "content-length")) {
+                    return;
+                }
+
+                const content_length = std.fmt.parseInt(usize, header.value, 10) catch {
+                    try self.fail_protocol_error("Invalid content-length header field");
+                };
+                self.content_length = content_length;
+            }
+
+            fn validateTrailers(self: *Self.StreamInstance, headers: []Hpack.HeaderField) !void {
+                for (headers) |header| {
+                    if (header.name.len == 0) {
+                        try self.fail_protocol_error("Empty trailer header name");
+                    }
+                    if (header.name[0] == ':') {
+                        try self.fail_protocol_error("Pseudo-header field in trailers");
+                    }
+
+                    try self.validateRegularHeader(header);
+                    try self.validateContentLength(header);
+                }
+            }
+
+            fn fail_protocol_error(self: *Self.StreamInstance, message: []const u8) !noreturn {
+                log.err("{s}: PROTOCOL_ERROR\n", .{message});
+                try self.sendRstStream(0x1);
+                return error.ProtocolError;
             }
         };
 
         // Public API for the generic Stream type
         pool: StreamPool = StreamPool{},
 
-        pub fn createStream(self: *Self, allocator: std.mem.Allocator, conn: *Connection(std.io.AnyReader, std.io.AnyWriter), id: u32) !*Self.StreamInstance {
+        pub fn createStream(self: *Self, allocator: std.mem.Allocator, conn: *Connection, id: u32) !*Self.StreamInstance {
             const stream = try self.pool.allocate(allocator);
             stream.init(conn, id);
             return stream;

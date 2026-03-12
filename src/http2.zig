@@ -69,7 +69,7 @@ pub const Server = struct {
     /// Initialize a new HTTP/2 server
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         std.debug.assert(@intFromPtr(config.router) != 0);
-        
+
         return Self{
             .inner = try LibxevServer.init(allocator, .{
                 .address = config.address,
@@ -85,7 +85,7 @@ pub const Server = struct {
     pub fn initWithTLS(allocator: std.mem.Allocator, config: Config, tls_ctx: *tls.TlsServerContext) !Self {
         std.debug.assert(@intFromPtr(config.router) != 0);
         std.debug.assert(@intFromPtr(tls_ctx) != 0);
-        
+
         return Self{
             .inner = try LibxevServer.initWithTLS(allocator, .{
                 .address = config.address,
@@ -122,31 +122,31 @@ pub const Server = struct {
 /// This follows true async patterns with completions and callbacks
 pub const AsyncServer = struct {
     inner: LibxevServer,
-    
+
     const Self = @This();
-    
+
     pub const Config = LibxevServer.Config;
-    
+
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         return Self{
             .inner = try LibxevServer.init(allocator, config),
         };
     }
-    
+
     pub fn initWithTLS(allocator: std.mem.Allocator, config: Config, tls_ctx: *tls.TlsServerContext) !Self {
         return Self{
             .inner = try LibxevServer.initWithTLS(allocator, config, tls_ctx),
         };
     }
-    
+
     pub fn deinit(self: *Self) void {
         self.inner.deinit();
     }
-    
+
     pub fn run(self: *Self) !void {
         try self.inner.run();
     }
-    
+
     pub fn getStats(self: *Self) ServerStats {
         return self.inner.getStats();
     }

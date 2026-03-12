@@ -94,7 +94,7 @@ pub fn main() !void {
     var server = try http2.Server.initWithTLS(allocator, config, &tls_ctx);
     defer server.deinit();
 
-    std.log.info("HTTP/2 over TLS server listening on {}", .{config.address});
+    std.log.info("HTTP/2 over TLS server listening on {f}", .{config.address});
     std.log.info("Routes:", .{});
     std.log.info("  GET  / - Main page", .{});
     std.log.info("  GET  /api/hello - API endpoint", .{});
