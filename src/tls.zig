@@ -516,6 +516,20 @@ pub const TlsServerConnection = struct {
         return pending > 0;
     }
 
+    pub fn encryptedDataPendingBytes(self: *TlsServerConnection) u32 {
+        if (self.network_bio == null) {
+            return 0;
+        }
+
+        const pending = boringssl.BIO_pending(self.network_bio);
+        if (pending <= 0) {
+            return 0;
+        }
+
+        std.debug.assert(pending <= std.math.maxInt(u32));
+        return @intCast(pending);
+    }
+
     pub fn reader(self: *TlsServerConnection) *std.Io.Reader {
         return &self.io_reader;
     }

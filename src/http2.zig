@@ -18,6 +18,7 @@ pub const FrameHeader = @import("frame.zig").FrameHeader;
 pub const FrameType = @import("frame.zig").FrameType;
 pub const FrameFlags = @import("frame.zig").FrameFlags;
 pub const Hpack = @import("hpack.zig").Hpack;
+pub const Priority = @import("http_priority.zig").Priority;
 
 // Memory Management
 pub const memory_budget = @import("memory_budget.zig");

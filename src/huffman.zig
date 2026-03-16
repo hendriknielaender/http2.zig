@@ -379,6 +379,63 @@ pub const Huffman = struct {
         return decoded.toOwnedSlice(allocator);
     }
 
+    pub fn decodeBounded(input: []const u8, output: []u8) ![]u8 {
+        std.debug.assert(input.len <= 16384);
+
+        var output_used: usize = 0;
+        var bit_buffer: u64 = 0;
+        var bit_count: u8 = 0;
+        var code: u32 = 0;
+        var code_bits: u8 = 0;
+
+        for (input) |byte| {
+            bit_buffer = (bit_buffer << 8) | @as(u64, byte);
+            bit_count += 8;
+
+            while (bit_count > 0) {
+                const bit_count_u6: u6 = @intCast(bit_count - 1);
+                const bit_u32: u32 = @intCast((bit_buffer >> bit_count_u6) & 0x1);
+                code = (code << 1) | bit_u32;
+                code_bits += 1;
+                bit_count -= 1;
+
+                var found = false;
+                for (huffmanTable) |entry| {
+                    if (entry.bits != code_bits) continue;
+                    if (entry.code != code) continue;
+                    if (entry.symbol == .eos) return error.InvalidHuffmanCode;
+                    if (output_used >= output.len) return error.HuffmanOutputTooLarge;
+
+                    output[output_used] = entry.symbol.byte;
+                    output_used += 1;
+                    code = 0;
+                    code_bits = 0;
+                    found = true;
+                    break;
+                }
+
+                if (found) continue;
+                if (code_bits > 30) return error.InvalidHuffmanCode;
+            }
+        }
+
+        try validateHuffmanPadding(code, code_bits);
+        return output[0..output_used];
+    }
+
+    fn validateHuffmanPadding(code: u32, code_bits: u8) !void {
+        if (code_bits == 0) return;
+        if (code_bits > 7) return error.InvalidHuffmanCode;
+
+        const eos_code: u32 = 0x3fffffff;
+        const eos_bits: u5 = 30;
+        const code_bits_u5: u5 = @intCast(code_bits);
+        const shift: u5 = eos_bits - code_bits_u5;
+        const masked_eos_code = (eos_code >> shift) & ((@as(u32, 1) << code_bits_u5) - 1);
+
+        if (code != masked_eos_code) return error.InvalidHuffmanCode;
+    }
+
     fn findHuffmanEntry(byte: u8) !HuffmanEntry {
         for (huffmanTable) |entry| {
             if (entry.symbol == .byte and entry.symbol.byte == byte) return entry;

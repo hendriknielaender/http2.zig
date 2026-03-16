@@ -33,9 +33,21 @@ pub const FrameType = enum(u8) {
     GOAWAY = 0x7,
     WINDOW_UPDATE = 0x8,
     CONTINUATION = 0x9,
+    PRIORITY_UPDATE = 0x10,
     pub fn isValid(self: FrameType) bool {
         return switch (self) {
-            .DATA, .HEADERS, .PRIORITY, .RST_STREAM, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .WINDOW_UPDATE, .CONTINUATION => true,
+            .DATA,
+            .HEADERS,
+            .PRIORITY,
+            .RST_STREAM,
+            .SETTINGS,
+            .PUSH_PROMISE,
+            .PING,
+            .GOAWAY,
+            .WINDOW_UPDATE,
+            .CONTINUATION,
+            .PRIORITY_UPDATE,
+            => true,
         };
     }
     pub fn fromU8(value: u8) ?FrameType {
@@ -50,6 +62,7 @@ pub const FrameType = enum(u8) {
             0x7 => .GOAWAY,
             0x8 => .WINDOW_UPDATE,
             0x9 => .CONTINUATION,
+            0x10 => .PRIORITY_UPDATE,
             else => null,
         };
     }
@@ -64,6 +77,7 @@ pub const FRAME_TYPE_PING = @intFromEnum(FrameType.PING);
 pub const FRAME_TYPE_GOAWAY = @intFromEnum(FrameType.GOAWAY);
 pub const FRAME_TYPE_WINDOW_UPDATE = @intFromEnum(FrameType.WINDOW_UPDATE);
 pub const FRAME_TYPE_CONTINUATION = @intFromEnum(FrameType.CONTINUATION);
+pub const FRAME_TYPE_PRIORITY_UPDATE = @intFromEnum(FrameType.PRIORITY_UPDATE);
 /// Represents the flags of an HTTP/2 frame
 pub const FrameFlags = struct {
     value: u8,
@@ -150,11 +164,10 @@ pub const FrameHeader = struct {
             return error.InvalidFrameLength;
         }
         const frame_type_value: u8 = buffer[3];
-        if (frame_type_value > FRAME_TYPE_CONTINUATION) {
+        const frame_type = FrameType.fromU8(frame_type_value) orelse {
             log.err("Invalid frame_type_value: {}\n", .{frame_type_value});
             return error.InvalidEnumValue;
-        }
-        const frame_type: FrameType = frame_type_value;
+        };
         const flags = FrameFlags.init(buffer[4]);
         // Parse the 31-bit stream ID from the last four bytes
         const stream_id_raw = std.mem.readInt(u32, buffer[5..9], .big);
@@ -241,11 +254,7 @@ pub const Frame = struct {
 };
 test "frame header read and write" {
     var buffer: [9]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
-    var legacy_writer = stream.writer();
-    var writer_adapter = legacy_writer.adaptToNewApi(&.{});
-    var legacy_reader = stream.reader();
-    var reader_adapter = legacy_reader.adaptToNewApi(&.{});
+    var writer: std.Io.Writer = .fixed(&buffer);
     var header = FrameHeader{
         .length = 16,
         .frame_type = FrameType.SETTINGS,
@@ -253,16 +262,10 @@ test "frame header read and write" {
         .reserved = false,
         .stream_id = 0,
     };
-    // Initialize the buffer with zeroes
-    buffer = std.mem.zeroes([9]u8);
-    // Write to the buffer
-    try header.write(&writer_adapter.new_interface);
-    // Recreate the FixedBufferStream to reset the read position
-    stream = std.io.fixedBufferStream(&buffer);
-    legacy_reader = stream.reader();
-    reader_adapter = legacy_reader.adaptToNewApi(&.{});
-    // Read the header back
-    const read_header = try FrameHeader.read(&reader_adapter.new_interface);
+    try header.write(&writer);
+
+    var reader: std.Io.Reader = .fixed(writer.buffered());
+    const read_header = try FrameHeader.read(&reader);
     assert(read_header.length == header.length);
     assert(read_header.frame_type == header.frame_type);
     assert(read_header.flags.value == header.flags.value);
@@ -270,18 +273,15 @@ test "frame header read and write" {
     assert(read_header.stream_id == header.stream_id);
 }
 test "frame read and write" {
-    var buffer: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buffer);
+    var allocator_buffer: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&allocator_buffer);
     const allocator = fba.allocator();
-    var stream = std.io.fixedBufferStream(&buffer);
-    var legacy_writer = stream.writer();
-    var writer_adapter = legacy_writer.adaptToNewApi(&.{});
+    var io_buffer: [4096]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&io_buffer);
     var payload: [16]u8 = undefined;
-    // Initialize the payload with a known pattern
     for (&payload) |*byte| {
         byte.* = 0xaa;
     }
-    // Create the frame with the payload
     var frame = Frame.init(FrameHeader{
         .length = 16,
         .frame_type = FrameType.SETTINGS,
@@ -289,24 +289,14 @@ test "frame read and write" {
         .reserved = false,
         .stream_id = 0,
     }, &payload);
-    try frame.write(&writer_adapter.new_interface);
-    // Copy the data from buffer to read_buffer
-    var read_buffer: [4096]u8 = undefined;
-    for (buffer, 0..) |byte, i| {
-        read_buffer[i] = byte;
-    }
-    // Use the read_buffer for reading
-    var read_stream = std.io.fixedBufferStream(&read_buffer);
-    var legacy_reader = read_stream.reader();
-    var reader_adapter = legacy_reader.adaptToNewApi(&.{});
-    // Read the frame back from the buffer
-    const read_frame = try Frame.read(&reader_adapter.new_interface, allocator);
-    // Assert that the read frame matches the written frame
+    try frame.write(&writer);
+
+    var reader: std.Io.Reader = .fixed(writer.buffered());
+    const read_frame = try Frame.read(&reader, allocator);
     assert(read_frame.header.length == frame.header.length);
     assert(read_frame.header.frame_type == frame.header.frame_type);
     assert(read_frame.header.flags.value == frame.header.flags.value);
     assert(read_frame.header.reserved == frame.header.reserved);
     assert(read_frame.header.stream_id == frame.header.stream_id);
-    // Compare payloads directly; should be the same
     assert(std.mem.eql(u8, read_frame.payload, frame.payload));
 }

@@ -7,6 +7,9 @@ const FrameTypes = @import("frame.zig");
 const FrameFlags = @import("frame.zig").FrameFlags;
 const Connection = @import("connection.zig").Connection;
 const Hpack = @import("hpack.zig").Hpack;
+const Priority = @import("http_priority.zig").Priority;
+const memory_budget = @import("memory_budget.zig");
+const TestIo = @import("testing/fixed_io.zig").FixedIo;
 
 const log = std.log.scoped(.stream);
 
@@ -94,7 +97,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
         const WindowBufferSize: u32 = 1 << WindowBits;
         const WindowDefault: u32 = WindowBufferSize - 1;
         const MaxStreamCount: u32 = MaxStreams;
-        const BufferSize: usize = WindowBufferSize;
+        const HeaderBufferSize = memory_budget.MemBudget.max_header_size;
+        const HeaderCountMax = 64;
 
         // Static memory allocation for streams
         const StreamPool = struct {
@@ -139,22 +143,16 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             initial_window_size: u32,
 
             // Static buffer allocation for maximum performance
-            recv_headers_buf: [BufferSize]u8,
-            send_headers_buf: [BufferSize]u8,
-            recv_data_buf: [BufferSize]u8,
-            send_data_buf: [BufferSize]u8,
-            header_block_fragments_buf: [BufferSize]u8,
+            header_block_fragments_buf: [HeaderBufferSize]u8,
+            headers_bytes_storage: [HeaderBufferSize]u8,
 
             // Buffer length tracking for static arrays
-            recv_headers_len: usize,
-            send_headers_len: usize,
-            recv_data_len: usize,
-            send_data_len: usize,
             header_block_fragments_len: usize,
+            headers_bytes_len: usize,
 
             // Header processing state
             expecting_continuation: bool,
-            headers_storage: [64]Hpack.HeaderField,
+            headers_storage: [HeaderCountMax]Hpack.HeaderField,
             headers: std.ArrayList(Hpack.HeaderField),
             content_length: ?usize,
             total_data_received: usize,
@@ -163,6 +161,12 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             response_headers_sent: bool,
             response_body_sent: usize,
             cleaned_up: bool,
+
+            // RFC 9218 extensible priority state.
+            priority: Priority,
+            priority_update_received: bool,
+            schedule_epoch_last: u64,
+            schedule_count: u32,
 
             // HTTP/2 priority fields with defaults
             stream_dependency: u32,
@@ -179,19 +183,11 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     .send_window_size = @intCast(WindowDefault),
                     .initial_window_size = WindowDefault,
 
-                    // Zero-initialize static buffers
-                    .recv_headers_buf = [_]u8{0} ** BufferSize,
-                    .send_headers_buf = [_]u8{0} ** BufferSize,
-                    .recv_data_buf = [_]u8{0} ** BufferSize,
-                    .send_data_buf = [_]u8{0} ** BufferSize,
-                    .header_block_fragments_buf = [_]u8{0} ** BufferSize,
+                    .header_block_fragments_buf = undefined,
+                    .headers_bytes_storage = undefined,
 
-                    // Initialize buffer lengths
-                    .recv_headers_len = 0,
-                    .send_headers_len = 0,
-                    .recv_data_len = 0,
-                    .send_data_len = 0,
                     .header_block_fragments_len = 0,
+                    .headers_bytes_len = 0,
 
                     .expecting_continuation = false,
                     .headers_storage = undefined,
@@ -203,6 +199,10 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     .response_headers_sent = false,
                     .response_body_sent = 0,
                     .cleaned_up = false,
+                    .priority = .{},
+                    .priority_update_received = false,
+                    .schedule_epoch_last = 0,
+                    .schedule_count = 0,
                     .stream_dependency = 0,
                     .exclusive = false,
                     .weight = 16,
@@ -222,23 +222,10 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 }
 
                 // Static buffers don't need deinitialization, just reset lengths
-                self.recv_headers_len = 0;
-                self.send_headers_len = 0;
-                self.recv_data_len = 0;
-                self.send_data_len = 0;
                 self.header_block_fragments_len = 0;
+                self.headers_bytes_len = 0;
                 self.response_headers_sent = false;
                 self.response_body_sent = 0;
-
-                // Free header field allocations with exhaustive cleanup.
-                for (self.headers.items) |header| {
-                    if (header.name.len > 0) {
-                        self.conn.allocator.free(header.name);
-                    }
-                    if (header.value.len > 0) {
-                        self.conn.allocator.free(header.value);
-                    }
-                }
 
                 self.headers.clearRetainingCapacity();
                 self.request_headers_complete = false;
@@ -255,24 +242,41 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 const is_valid_frame = switch (current_state) {
                     .Idle => switch (frame.header.frame_type) {
                         .HEADERS, .PRIORITY => true,
-                        .DATA, .RST_STREAM, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .WINDOW_UPDATE, .CONTINUATION => false,
+                        .DATA,
+                        .RST_STREAM,
+                        .SETTINGS,
+                        .PUSH_PROMISE,
+                        .PING,
+                        .GOAWAY,
+                        .WINDOW_UPDATE,
+                        .CONTINUATION,
+                        .PRIORITY_UPDATE,
+                        => false,
                     },
                     .Open => switch (frame.header.frame_type) {
                         .HEADERS, .DATA, .PRIORITY, .RST_STREAM, .WINDOW_UPDATE, .CONTINUATION => true,
-                        .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY => false,
+                        .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .PRIORITY_UPDATE => false,
                     },
                     .HalfClosedRemote => switch (frame.header.frame_type) {
                         .WINDOW_UPDATE, .PRIORITY, .RST_STREAM, .CONTINUATION => true,
-                        .DATA, .HEADERS, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY => false,
+                        .DATA, .HEADERS, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .PRIORITY_UPDATE => false,
                     },
                     .HalfClosedLocal => switch (frame.header.frame_type) {
                         .HEADERS, .DATA, .PRIORITY, .RST_STREAM, .WINDOW_UPDATE, .CONTINUATION => true,
-                        .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY => false,
+                        .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .PRIORITY_UPDATE => false,
                     },
                     .Closed => false, // No frames allowed
                     .ReservedLocal, .ReservedRemote => switch (frame.header.frame_type) {
                         .PRIORITY, .RST_STREAM, .WINDOW_UPDATE => true,
-                        .DATA, .HEADERS, .SETTINGS, .PUSH_PROMISE, .PING, .GOAWAY, .CONTINUATION => false,
+                        .DATA,
+                        .HEADERS,
+                        .SETTINGS,
+                        .PUSH_PROMISE,
+                        .PING,
+                        .GOAWAY,
+                        .CONTINUATION,
+                        .PRIORITY_UPDATE,
+                        => false,
                     },
                 };
 
@@ -316,7 +320,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                         self.state = transitionState(self.state, .RecvPriority);
                     },
                     // Handle remaining frame types that shouldn't reach stream level
-                    .SETTINGS, .PING, .GOAWAY, .PUSH_PROMISE => {
+                    .SETTINGS, .PING, .GOAWAY, .PUSH_PROMISE, .PRIORITY_UPDATE => {
                         log.err("Received connection-level frame type {s} on stream {d}: PROTOCOL_ERROR\n", .{ @tagName(frame.header.frame_type), self.id });
                         try self.sendRstStream(0x1); // PROTOCOL_ERROR
                         return error.ProtocolError;
@@ -363,13 +367,6 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     return error.FlowControlError;
                 }
 
-                // Use static buffer instead of dynamic allocation
-                if (self.send_data_len + data.len > BufferSize) {
-                    return error.BufferOverflow;
-                }
-
-                @memcpy(self.send_data_buf[self.send_data_len .. self.send_data_len + data.len], data);
-                self.send_data_len += data.len;
                 self.send_window_size -= @intCast(data.len);
 
                 const frame_flags = if (end_stream) FrameFlags.init(FrameFlags.END_STREAM) else FrameFlags.init(0);
@@ -488,15 +485,17 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                         return error.ProtocolError;
                     }
 
-                    self.stream_dependency = stream_dependency;
-                    self.exclusive = exclusive;
-                    self.weight = weight;
+                    if (!self.conn.rfc7540_priority_signals_ignored()) {
+                        self.stream_dependency = stream_dependency;
+                        self.exclusive = exclusive;
+                        self.weight = weight;
+                    }
 
                     hpack_data = hpack_data[5..];
                 }
 
                 // Use static buffer for header block fragments
-                if (self.header_block_fragments_len + hpack_data.len > BufferSize) {
+                if (self.header_block_fragments_len + hpack_data.len > HeaderBufferSize) {
                     log.err("Header block fragments exceed buffer size: INTERNAL_ERROR\n", .{});
                     try self.sendRstStream(0x2); // INTERNAL_ERROR
                     return error.BufferOverflow;
@@ -529,7 +528,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 }
 
                 // Use static buffer for continuation fragments
-                if (self.header_block_fragments_len + frame.payload.len > BufferSize) {
+                if (self.header_block_fragments_len + frame.payload.len > HeaderBufferSize) {
                     log.err("Header block fragments exceed buffer size: INTERNAL_ERROR\n", .{});
                     try self.sendRstStream(0x2); // INTERNAL_ERROR
                     return error.BufferOverflow;
@@ -571,15 +570,6 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     payload = payload[0 .. payload.len - @as(u32, pad_length)];
                 }
 
-                // Use static buffer for received data
-                if (self.recv_data_len + payload.len > BufferSize) {
-                    log.err("Received data exceeds buffer size: INTERNAL_ERROR\n", .{});
-                    try self.sendRstStream(0x2); // INTERNAL_ERROR
-                    return error.BufferOverflow;
-                }
-
-                @memcpy(self.recv_data_buf[self.recv_data_len .. self.recv_data_len + payload.len], payload);
-                self.recv_data_len += payload.len;
                 self.total_data_received += payload.len;
 
                 // Compile-time optimized flow control
@@ -680,11 +670,13 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     return error.ProtocolError;
                 }
 
-                // Store priority information for compile-time optimization
+                if (self.conn.rfc7540_priority_signals_ignored()) {
+                    return;
+                }
+
                 self.stream_dependency = dependency_stream_id;
                 self.exclusive = exclusive;
                 self.weight = @as(u16, weight) + 1; // Weight is 1-256
-
             }
 
             fn decodeHeaderBlock(self: *Self.StreamInstance) !void {
@@ -692,19 +684,15 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 var cursor: usize = 0;
                 var saw_header_field = false;
 
-                // Clear existing headers efficiently.
-                for (self.headers.items) |header| {
-                    self.conn.allocator.free(header.name);
-                    self.conn.allocator.free(header.value);
-                }
                 self.headers.clearRetainingCapacity();
+                self.headers_bytes_len = 0;
 
                 while (cursor < header_block.len) {
+                    Hpack.resetScratchBuffer();
                     const remaining_data = header_block[cursor..];
-                    var decoded_header = Hpack.decodeHeaderField(
+                    const decoded_header = Hpack.decodeHeaderFieldView(
                         remaining_data,
                         &self.conn.hpack_decoder_table,
-                        self.conn.allocator,
                     ) catch |err| {
                         log.err("Header decompression failed: {}\n", .{err});
                         try self.conn.send_goaway(0, 0x09, "Compression Error: COMPRESSION_ERROR");
@@ -720,18 +708,13 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                             return error.TooManyHeaders;
                         }
 
-                        const header_copy = Hpack.HeaderField{
-                            .name = try self.conn.allocator.dupe(u8, decoded_header.header.name),
-                            .value = try self.conn.allocator.dupe(u8, decoded_header.header.value),
-                        };
-                        self.headers.appendAssumeCapacity(header_copy);
+                        try self.storeHeader(decoded_header.header);
                     } else if (saw_header_field) {
                         try self.conn.send_goaway(0, 0x09, "Compression Error: COMPRESSION_ERROR");
                         return error.CompressionError;
                     }
 
                     cursor += decoded_header.bytes_consumed;
-                    decoded_header.deinit();
                 }
 
                 if (self.request_headers_complete) {
@@ -740,6 +723,35 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     try self.validateHeaders(self.headers.items);
                     self.request_headers_complete = true;
                 }
+            }
+
+            fn storeHeader(self: *Self.StreamInstance, header: Hpack.HeaderField) !void {
+                const total_len = header.name.len + header.value.len;
+                if (self.headers_bytes_len + total_len > self.headers_bytes_storage.len) {
+                    return error.HeadersTooLarge;
+                }
+
+                const name_start = self.headers_bytes_len;
+                const name_end = name_start + header.name.len;
+                const value_start = name_end;
+                const value_end = value_start + header.value.len;
+
+                std.mem.copyForwards(
+                    u8,
+                    self.headers_bytes_storage[name_start..name_end],
+                    header.name,
+                );
+                std.mem.copyForwards(
+                    u8,
+                    self.headers_bytes_storage[value_start..value_end],
+                    header.value,
+                );
+                self.headers_bytes_len = value_end;
+
+                self.headers.appendAssumeCapacity(.{
+                    .name = self.headers_bytes_storage[name_start..name_end],
+                    .value = self.headers_bytes_storage[value_start..value_end],
+                });
             }
 
             const RequestPseudoHeaders = struct {
@@ -770,7 +782,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     const method = self.method orelse return error.ProtocolError;
                     if (method.len == 0) return error.ProtocolError;
 
-                    if (std.mem.eql(u8, method, "CONNECT")) {
+                    if (self.isConnect()) {
                         if (self.scheme != null) return error.ProtocolError;
                         if (self.path != null) return error.ProtocolError;
                         if (self.authority == null) return error.ProtocolError;
@@ -783,6 +795,11 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     if (path.len == 0) return error.ProtocolError;
                 }
 
+                fn isConnect(self: *const @This()) bool {
+                    const method = self.method orelse return false;
+                    return std.mem.eql(u8, method, "CONNECT");
+                }
+
                 fn slot(self: *@This(), name: []const u8) ?*?[]const u8 {
                     if (std.mem.eql(u8, name, ":method")) return &self.method;
                     if (std.mem.eql(u8, name, ":scheme")) return &self.scheme;
@@ -792,8 +809,9 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 }
             };
 
-            fn validateHeaders(self: *Self.StreamInstance, headers: []Hpack.HeaderField) !void {
+            fn validateHeaders(self: *Self.StreamInstance, headers: []const Hpack.HeaderField) !void {
                 var pseudo_headers = RequestPseudoHeaders{};
+                var priority_header_seen = false;
 
                 for (headers) |header| {
                     if (header.name.len == 0) {
@@ -810,11 +828,18 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     pseudo_headers.markRegularHeader();
                     try self.validateRegularHeader(header);
                     try self.validateContentLength(header);
+                    if (self.applyPriorityHeader(header)) {
+                        priority_header_seen = true;
+                    }
                 }
 
                 pseudo_headers.validateRequest() catch {
                     try self.fail_protocol_error("Invalid request pseudo-header fields");
                 };
+                self.applyDefaultRequestPriority(
+                    &pseudo_headers,
+                    priority_header_seen,
+                );
             }
 
             fn validateRegularHeader(self: *Self.StreamInstance, header: Hpack.HeaderField) !void {
@@ -844,7 +869,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 self.content_length = content_length;
             }
 
-            fn validateTrailers(self: *Self.StreamInstance, headers: []Hpack.HeaderField) !void {
+            fn validateTrailers(self: *Self.StreamInstance, headers: []const Hpack.HeaderField) !void {
                 for (headers) |header| {
                     if (header.name.len == 0) {
                         try self.fail_protocol_error("Empty trailer header name");
@@ -862,6 +887,50 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 log.err("{s}: PROTOCOL_ERROR\n", .{message});
                 try self.sendRstStream(0x1);
                 return error.ProtocolError;
+            }
+
+            pub fn applyPriority(self: *Self.StreamInstance, priority: Priority) void {
+                assert(priority.urgency <= 7);
+
+                self.priority = priority;
+                self.priority_update_received = true;
+            }
+
+            fn applyPriorityHeader(
+                self: *Self.StreamInstance,
+                header: Hpack.HeaderField,
+            ) bool {
+                if (!std.mem.eql(u8, header.name, "priority")) {
+                    return false;
+                }
+                if (self.priority_update_received) {
+                    return true;
+                }
+
+                const priority = Priority.parse(header.value) catch {
+                    log.debug("Ignoring malformed Priority header on stream {d}\n", .{self.id});
+                    return true;
+                };
+                self.priority = priority;
+                return true;
+            }
+
+            fn applyDefaultRequestPriority(
+                self: *Self.StreamInstance,
+                pseudo_headers: *const RequestPseudoHeaders,
+                priority_header_seen: bool,
+            ) void {
+                if (self.priority_update_received) {
+                    return;
+                }
+                if (priority_header_seen) {
+                    return;
+                }
+                if (!pseudo_headers.isConnect()) {
+                    return;
+                }
+
+                self.priority.incremental = true;
             }
         };
 
@@ -933,4 +1002,55 @@ test "state machine transitions" {
     try std.testing.expectEqual(StreamState.Open, transitionState(.Idle, .RecvHeaders));
     try std.testing.expectEqual(StreamState.HalfClosedRemote, transitionState(.Open, .RecvEndStream));
     try std.testing.expectEqual(StreamState.Closed, transitionState(.HalfClosedLocal, .RecvEndStream));
+}
+
+test "CONNECT defaults request priority to incremental" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+
+    var connection = try Connection.init(
+        arena.allocator(),
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+    const stream = try connection.get_stream(1);
+
+    const headers = [_]Hpack.HeaderField{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.com:443" },
+    };
+
+    try stream.validateHeaders(&headers);
+    try std.testing.expect(stream.priority.incremental);
+    try std.testing.expectEqual(@as(u8, 3), stream.priority.urgency);
+}
+
+test "CONNECT priority header overrides default incremental behavior" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+
+    var connection = try Connection.init(
+        arena.allocator(),
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+    const stream = try connection.get_stream(1);
+
+    const headers = [_]Hpack.HeaderField{
+        .{ .name = ":method", .value = "CONNECT" },
+        .{ .name = ":authority", .value = "example.com:443" },
+        .{ .name = "priority", .value = "u=1" },
+    };
+
+    try stream.validateHeaders(&headers);
+    try std.testing.expectEqual(@as(u8, 1), stream.priority.urgency);
+    try std.testing.expect(!stream.priority.incremental);
 }

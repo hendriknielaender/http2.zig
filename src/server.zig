@@ -18,6 +18,9 @@ const Hpack = @import("hpack.zig").Hpack;
 const DefaultStream = @import("stream.zig").DefaultStream;
 const connection_module = @import("connection.zig");
 const io_adapters = @import("io_adapters.zig");
+const memory_budget = @import("memory_budget.zig");
+
+const output_backpressure_divisor: u32 = 4;
 
 pub const Server = struct {
     // Core infrastructure - use pointers for proper initialization
@@ -43,7 +46,8 @@ pub const Server = struct {
     accept_active: std.atomic.Value(bool),
 
     // Connection management
-    connections: std.ArrayList(*Connection),
+    connections: []*Connection,
+    active_connection_count: u32,
     connection_pool: ConnectionPool,
 
     // Statistics
@@ -107,6 +111,8 @@ pub const Server = struct {
 
         loop.* = try xev.Loop.init(.{ .thread_pool = thread_pool });
         const server_tcp = try xev.TCP.init(config.address);
+        const connections = try allocator.alloc(*Connection, config.max_connections);
+        errdefer allocator.free(connections);
         assertInitializationInvariants(thread_pool, loop);
 
         return Self{
@@ -122,7 +128,8 @@ pub const Server = struct {
             .accept_completions = [2]xev.Completion{ .{}, .{} },
             .current_accept_completion = std.atomic.Value(u8).init(0),
             .accept_active = std.atomic.Value(bool).init(false),
-            .connections = .{},
+            .connections = connections,
+            .active_connection_count = 0,
             .connection_pool = try ConnectionPool.init(allocator, config.max_connections, config.buffer_size),
             .stats = Stats.init(),
         };
@@ -151,6 +158,8 @@ pub const Server = struct {
 
         loop.* = try xev.Loop.init(.{ .thread_pool = thread_pool });
         const server_tcp = try xev.TCP.init(config.address);
+        const connections = try allocator.alloc(*Connection, config.max_connections);
+        errdefer allocator.free(connections);
         assertInitializationInvariants(thread_pool, loop);
 
         return Self{
@@ -166,7 +175,8 @@ pub const Server = struct {
             .accept_completions = [2]xev.Completion{ .{}, .{} },
             .current_accept_completion = std.atomic.Value(u8).init(0),
             .accept_active = std.atomic.Value(bool).init(false),
-            .connections = .{},
+            .connections = connections,
+            .active_connection_count = 0,
             .connection_pool = try ConnectionPool.init(allocator, config.max_connections, config.buffer_size),
             .stats = Stats.init(),
         };
@@ -174,7 +184,7 @@ pub const Server = struct {
 
     pub fn deinit(self: *Self) void {
         self.connection_pool.deinit();
-        self.connections.deinit(self.allocator);
+        self.allocator.free(self.connections);
         self.loop.deinit();
         self.thread_pool.shutdown();
         self.thread_pool.deinit();
@@ -322,10 +332,16 @@ pub const Server = struct {
         std.debug.assert(@intFromPtr(conn) != 0);
         std.debug.assert(!conn.active);
 
+        configureAcceptedSocket(client_tcp);
+
+        var active_streams = conn.active_streams;
+        active_streams.clearRetainingCapacity();
+
         conn.* = Connection{
             .server = self,
             .tcp = client_tcp,
             .tls_conn = null,
+            .tls_storage = undefined,
             .read_buffer = conn.read_buffer,
             .write_buffer = conn.write_buffer,
             .read_start = 0,
@@ -333,6 +349,8 @@ pub const Server = struct {
             .write_start = 0,
             .write_pos = 0,
             .h2_conn = null,
+            .h2_storage = undefined,
+            .h2_stream_storage = conn.h2_stream_storage,
             .h2_reader = undefined,
             .h2_writer = undefined,
             .active = true,
@@ -341,8 +359,9 @@ pub const Server = struct {
             .tls_handshake_attempts = 0,
             .close_after_write = false,
             .negotiated_protocol = null,
+            .read_blocked_by_output = false,
             .next_stream_id = 1,
-            .active_streams = std.AutoHashMap(u32, StreamState).init(self.allocator),
+            .active_streams = active_streams,
             .read_completions = [2]xev.Completion{ .{}, .{} },
             .write_completions = [2]xev.Completion{ .{}, .{} },
             .shutdown_completion = .{},
@@ -369,11 +388,15 @@ pub const Server = struct {
         std.debug.assert(@intFromPtr(self) != 0);
         std.debug.assert(@intFromPtr(conn) != 0);
         std.debug.assert(conn.active);
+        const active_connection_index: usize = self.active_connection_count;
+        std.debug.assert(active_connection_index < self.connections.len);
 
-        self.connections.append(self.allocator, conn) catch |err| {
-            std.log.warn("Failed to track connection: {}", .{err});
-            return err;
-        };
+        if (active_connection_index >= self.connections.len) {
+            return error.ConnectionTrackingExhausted;
+        }
+
+        self.connections[active_connection_index] = conn;
+        self.active_connection_count += 1;
     }
 
     /// Release a connection back to the pool.
@@ -383,6 +406,19 @@ pub const Server = struct {
 
         conn.active = false;
         self.connection_pool.release(conn);
+    }
+
+    fn configureAcceptedSocket(tcp: xev.TCP) void {
+        const enable: i32 = 1;
+
+        std.posix.setsockopt(
+            tcp.fd,
+            std.posix.IPPROTO.TCP,
+            std.posix.TCP.NODELAY,
+            std.mem.asBytes(&enable),
+        ) catch |err| {
+            std.log.warn("Failed to enable TCP_NODELAY on accepted socket: {}", .{err});
+        };
     }
 
     /// Update connection statistics.
@@ -428,13 +464,13 @@ pub const Server = struct {
             conn.h2_conn = null;
         }
 
-        // Clean up stream state
-        conn.active_streams.deinit();
-
         // Remove from active connections
-        for (self.connections.items, 0..) |active_conn, connection_index| {
+        const active_connection_count: usize = self.active_connection_count;
+        for (self.connections[0..active_connection_count], 0..) |active_conn, connection_index| {
             if (active_conn == conn) {
-                _ = self.connections.swapRemove(connection_index);
+                const last_index = active_connection_count - 1;
+                self.connections[connection_index] = self.connections[last_index];
+                self.active_connection_count -= 1;
                 break;
             }
         }
@@ -479,6 +515,7 @@ const Connection = struct {
     server: *Server,
     tcp: xev.TCP,
     tls_conn: ?*tls.TlsServerConnection, // TLS connection if HTTPS
+    tls_storage: tls.TlsServerConnection,
 
     // I/O buffers (static allocation)
     read_buffer: []u8,
@@ -489,7 +526,9 @@ const Connection = struct {
     write_pos: u32,
 
     // HTTP/2 protocol engine and event-driven adapters.
-    h2_conn: ?Http2Connection,
+    h2_conn: ?*Http2Connection,
+    h2_storage: Http2Connection,
+    h2_stream_storage: *Http2Connection.StreamStorage,
     h2_reader: IoAdapters.Reader,
     h2_writer: IoAdapters.Writer,
 
@@ -500,6 +539,7 @@ const Connection = struct {
     tls_handshake_attempts: u32, // Track handshake retry attempts
     close_after_write: bool, // Mark connection for closure after writes complete
     negotiated_protocol: ?[]const u8, // ALPN negotiated protocol
+    read_blocked_by_output: bool,
 
     // HTTP/2 stream management
     next_stream_id: u32, // Track stream IDs for proper multiplexing
@@ -536,6 +576,63 @@ const Connection = struct {
     fn writeBytesBuffered(self: *const Self) u32 {
         std.debug.assert(self.write_start <= self.write_pos);
         return self.write_pos - self.write_start;
+    }
+
+    fn outputQueueCapacity(self: *const Self) u32 {
+        var capacity: usize = self.write_buffer.len;
+        if (self.tls_conn != null) {
+            capacity += self.tls_plaintext_buffer.len;
+        }
+        std.debug.assert(capacity <= std.math.maxInt(u32));
+        return @intCast(capacity);
+    }
+
+    fn outputQueuedBytes(self: *const Self) u32 {
+        const encrypted_pending = if (self.tls_conn) |tls_connection|
+            tls_connection.encryptedDataPendingBytes()
+        else
+            0;
+        const queued_total =
+            @as(u64, self.writeBytesBuffered()) +
+            @as(u64, self.tlsPlaintextBytesPending()) +
+            @as(u64, encrypted_pending);
+
+        std.debug.assert(queued_total <= std.math.maxInt(u32));
+        return @intCast(queued_total);
+    }
+
+    fn outputSoftLimit(self: *const Self) u32 {
+        const capacity = self.outputQueueCapacity();
+        const slack = @divFloor(capacity, output_backpressure_divisor);
+        return capacity - slack;
+    }
+
+    fn outputBackpressureActive(self: *const Self) bool {
+        return self.outputQueuedBytes() >= self.outputSoftLimit();
+    }
+
+    fn resumeReadingAfterDrain(self: *Self) void {
+        if (!self.read_blocked_by_output) {
+            return;
+        }
+        if (!self.active) {
+            return;
+        }
+        if (self.close_after_write) {
+            return;
+        }
+        if (self.awaiting_peer_close) {
+            return;
+        }
+        if (self.read_active.load(.acquire)) {
+            return;
+        }
+        if (self.outputBackpressureActive()) {
+            return;
+        }
+
+        self.read_blocked_by_output = false;
+        self.startReading();
     }
 
     fn compactReadBuffer(self: *Self) void {
@@ -686,11 +783,14 @@ const Connection = struct {
                 }
 
                 std.debug.assert(self.h2_conn == null);
-                self.h2_conn = try Http2Connection.initServerEventDriven(
+                try Http2Connection.initServerEventDrivenInPlace(
+                    &self.h2_storage,
+                    self.h2_stream_storage,
                     self.server.allocator,
                     self.h2_reader.reader(),
                     self.h2_writer.writer(),
                 );
+                self.h2_conn = &self.h2_storage;
 
                 // Mark as initialized
                 self.http2_initialized = true;
@@ -772,7 +872,7 @@ const Connection = struct {
                 return error.FrameTooLarge;
             }
 
-            if (self.h2_conn) |*h2_conn| {
+            if (self.h2_conn) |h2_conn| {
                 if (frame_length > h2_conn.settings.max_frame_size) {
                     try h2_conn.send_goaway(0, 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
                     self.close_after_write = true;
@@ -809,9 +909,17 @@ const Connection = struct {
             std.log.debug("Frame processed successfully, read_pos now: {}", .{self.readBytesAvailable()});
         }
 
-        if (self.h2_conn) |*h2_conn| {
+        if (self.h2_conn) |h2_conn| {
             if (!self.close_after_write) {
                 try h2_conn.flush_ready_streams();
+            }
+
+            const completed_responses = h2_conn.takeCompletedResponses();
+            if (completed_responses > 0) {
+                _ = self.server.stats.requests_processed.fetchAdd(
+                    @as(u64, completed_responses),
+                    .monotonic,
+                );
             }
         }
 
@@ -825,7 +933,7 @@ const Connection = struct {
     /// Handle a single HTTP/2 frame - fast, non-blocking operation
     fn handleFrame(self: *Self, frame_data: []u8) !void {
         std.debug.assert(self.h2_conn != null);
-        const h2_conn = &self.h2_conn.?;
+        const h2_conn = self.h2_conn.?;
 
         const frame_length = (@as(u32, frame_data[0]) << 16) |
             (@as(u32, frame_data[1]) << 8) |
@@ -1454,6 +1562,12 @@ const Connection = struct {
         std.debug.assert(self.read_pos <= self.read_buffer.len);
 
         if (!self.active) return;
+        if (self.awaiting_peer_close) return;
+        if (self.outputBackpressureActive()) {
+            self.read_blocked_by_output = true;
+            return;
+        }
+        self.read_blocked_by_output = false;
 
         // Check if read is already active to prevent double submission
         if (self.read_active.swap(true, .acquire)) {
@@ -1711,7 +1825,10 @@ const Connection = struct {
 
         if (self.close_after_write and !self.tlsHasBufferedWrites()) {
             self.beginGracefulCloseAfterWrite();
+            return;
         }
+
+        self.resumeReadingAfterDrain();
     }
 
     /// Callback for read operations
@@ -1813,17 +1930,11 @@ const Connection = struct {
         std.debug.assert(self.read_buffer.len > 0);
 
         const socket_fd = self.tcp.fd;
-        var tls_connection = try self.server.tls_ctx.?.createAsyncConnection(
+        self.tls_storage = try self.server.tls_ctx.?.createAsyncConnection(
             socket_fd,
             .{ .bio_capacity_bytes = self.read_buffer.len },
         );
-
-        const tls_conn_ptr = self.server.allocator.create(tls.TlsServerConnection) catch |err| {
-            tls_connection.deinit();
-            return err;
-        };
-        tls_conn_ptr.* = tls_connection;
-        self.tls_conn = tls_conn_ptr;
+        self.tls_conn = &self.tls_storage;
     }
 
     fn handleTLSHandshake(self: *Connection, tls_connection: *tls.TlsServerConnection) xev.CallbackAction {
@@ -2036,55 +2147,55 @@ const Connection = struct {
                     if (self.awaiting_peer_close) {
                         self.discardBufferedInput();
                     } else {
-                    std.log.debug("Processing {} bytes of available data", .{self.readBytesAvailable()});
+                        std.log.debug("Processing {} bytes of available data", .{self.readBytesAvailable()});
 
-                    // Handle based on negotiated protocol
-                    if (self.negotiated_protocol) |protocol| {
-                        if (std.mem.eql(u8, protocol, "h2")) {
-                            // Try to initialize HTTP/2 connection (handles preface asynchronously)
-                            self.initHttp2Connection() catch |err| switch (err) {
-                                // If we need more data, just continue reading
-                                else => {
-                                    std.log.err("Failed to initialize HTTP/2 connection: {}", .{err});
+                        // Handle based on negotiated protocol
+                        if (self.negotiated_protocol) |protocol| {
+                            if (std.mem.eql(u8, protocol, "h2")) {
+                                // Try to initialize HTTP/2 connection (handles preface asynchronously)
+                                self.initHttp2Connection() catch |err| switch (err) {
+                                    // If we need more data, just continue reading
+                                    else => {
+                                        std.log.err("Failed to initialize HTTP/2 connection: {}", .{err});
+                                        self.server.closeConnection(self);
+                                        return .disarm;
+                                    },
+                                };
+
+                                // Process through simplified HTTP/2 protocol handling
+                                self.processHttp2() catch |err| {
+                                    std.log.err("HTTP/2 protocol error: {}", .{err});
                                     self.server.closeConnection(self);
                                     return .disarm;
-                                },
-                            };
+                                };
 
-                            // Process through simplified HTTP/2 protocol handling
-                            self.processHttp2() catch |err| {
-                                std.log.err("HTTP/2 protocol error: {}", .{err});
-                                self.server.closeConnection(self);
-                                return .disarm;
-                            };
-
-                            // Connection state is now managed directly in the connection object
+                                // Connection state is now managed directly in the connection object
+                            } else {
+                                // Handle HTTP/1.1 request
+                                self.processHttp11() catch |err| {
+                                    std.log.err("HTTP/1.1 processing error: {}", .{err});
+                                    self.server.closeConnection(self);
+                                    return .disarm;
+                                };
+                            }
                         } else {
-                            // Handle HTTP/1.1 request
+                            // Default to HTTP/1.1 if no protocol negotiated
                             self.processHttp11() catch |err| {
                                 std.log.err("HTTP/1.1 processing error: {}", .{err});
                                 self.server.closeConnection(self);
                                 return .disarm;
                             };
                         }
-                    } else {
-                        // Default to HTTP/1.1 if no protocol negotiated
-                        self.processHttp11() catch |err| {
-                            std.log.err("HTTP/1.1 processing error: {}", .{err});
-                            self.server.closeConnection(self);
-                            return .disarm;
-                        };
-                    }
 
-                    // After processing, drain any encrypted response data
-                    if (tls_connection.hasEncryptedDataToSend()) {
-                        self.drainTLSEncryptedData(tls_connection);
-                    }
+                        // After processing, drain any encrypted response data
+                        if (tls_connection.hasEncryptedDataToSend()) {
+                            self.drainTLSEncryptedData(tls_connection);
+                        }
 
-                    std.log.debug("Processed available data, read_pos now: {}, active: {}", .{
-                        self.readBytesAvailable(),
-                        self.active,
-                    });
+                        std.log.debug("Processed available data, read_pos now: {}, active: {}", .{
+                            self.readBytesAvailable(),
+                            self.active,
+                        });
                     }
                 }
             }
@@ -2281,6 +2392,7 @@ const Connection = struct {
             return .disarm;
         }
 
+        self.resumeReadingAfterDrain();
         return .disarm;
     }
 };
@@ -2289,15 +2401,24 @@ const Connection = struct {
 const ConnectionPool = struct {
     pool: []Connection,
     buffers: []u8,
-    free_list: std.ArrayList(u32),
+    h2_stream_storage: []connection_module.Connection.StreamStorage,
+    free_list: []u32,
+    free_count: u32,
     allocator: std.mem.Allocator,
     buffer_size: u32,
 
     pub fn init(allocator: std.mem.Allocator, max_connections: u32, buffer_size: u32) !ConnectionPool {
         const pool = try allocator.alloc(Connection, max_connections);
+        errdefer allocator.free(pool);
         // Allocate all buffers in one contiguous block
         const total_buffer_size = max_connections * buffer_size * 3; // read + write + TLS plaintext
         const buffers = try allocator.alloc(u8, total_buffer_size);
+        errdefer allocator.free(buffers);
+        const h2_stream_storage = try allocator.alloc(
+            connection_module.Connection.StreamStorage,
+            max_connections,
+        );
+        errdefer allocator.free(h2_stream_storage);
 
         // Set up buffer slices for each connection and initialize to safe defaults
         for (pool, 0..) |*connection_slot, pool_index| {
@@ -2309,6 +2430,7 @@ const ConnectionPool = struct {
                 .server = undefined, // Will be set when acquired
                 .tcp = undefined, // Will be set when acquired
                 .tls_conn = null, // No TLS connection initially
+                .tls_storage = undefined,
                 .read_buffer = buffers[buffer_offset .. buffer_offset + buffer_size],
                 .write_buffer = buffers[buffer_offset + buffer_size .. buffer_offset + buffer_size * 2],
                 .tls_plaintext_buffer = buffers[buffer_offset + buffer_size * 2 .. buffer_offset + buffer_size * 3],
@@ -2317,6 +2439,8 @@ const ConnectionPool = struct {
                 .write_start = 0,
                 .write_pos = 0,
                 .h2_conn = null,
+                .h2_storage = undefined,
+                .h2_stream_storage = &h2_stream_storage[pool_index],
                 .h2_reader = undefined,
                 .h2_writer = undefined,
                 .active = false,
@@ -2325,6 +2449,7 @@ const ConnectionPool = struct {
                 .tls_handshake_attempts = 0,
                 .close_after_write = false,
                 .negotiated_protocol = null,
+                .read_blocked_by_output = false,
                 .next_stream_id = 1,
                 .active_streams = std.AutoHashMap(u32, StreamState).init(allocator),
                 .read_completions = [2]xev.Completion{ .{}, .{} },
@@ -2343,38 +2468,54 @@ const ConnectionPool = struct {
 
             connection_slot.h2_reader = Connection.IoAdapters.Reader.init(connection_slot);
             connection_slot.h2_writer = Connection.IoAdapters.Writer.init(connection_slot);
+            try connection_slot.active_streams.ensureTotalCapacity(memory_budget.MemBudget.max_streams_per_conn);
         }
 
-        var free_list = try std.ArrayList(u32).initCapacity(allocator, max_connections);
+        const free_list = try allocator.alloc(u32, max_connections);
+        errdefer allocator.free(free_list);
         for (0..max_connections) |pool_index_usize| {
             const pool_index: u32 = @intCast(pool_index_usize);
             std.debug.assert(pool_index < max_connections);
-            free_list.appendAssumeCapacity(pool_index);
+            free_list[pool_index_usize] = pool_index;
         }
 
         return ConnectionPool{
             .pool = pool,
             .buffers = buffers,
+            .h2_stream_storage = h2_stream_storage,
             .free_list = free_list,
+            .free_count = max_connections,
             .allocator = allocator,
             .buffer_size = buffer_size,
         };
     }
 
     pub fn deinit(self: *ConnectionPool) void {
+        for (self.pool) |*connection| {
+            if (connection.h2_conn) |h2_conn| {
+                h2_conn.deinit();
+                connection.h2_conn = null;
+            }
+            if (connection.tls_conn) |tls_conn| {
+                tls_conn.deinit();
+                connection.tls_conn = null;
+            }
+            connection.active_streams.deinit();
+        }
+        self.allocator.free(self.h2_stream_storage);
         self.allocator.free(self.buffers);
         self.allocator.free(self.pool);
-        self.free_list.deinit(self.allocator);
+        self.allocator.free(self.free_list);
     }
 
     pub fn acquire(self: *ConnectionPool) ?*Connection {
         // Assert pool has available connections
-        if (self.free_list.items.len == 0) return null;
+        if (self.free_count == 0) return null;
 
-        const pool_index = self.free_list.items[self.free_list.items.len - 1];
+        self.free_count -= 1;
+        const pool_index = self.free_list[self.free_count];
         std.debug.assert(pool_index < self.pool.len);
         std.debug.assert(pool_index < std.math.maxInt(u32));
-        self.free_list.items.len -= 1;
 
         const acquired_connection = &self.pool[pool_index];
         std.debug.assert(!acquired_connection.active);
@@ -2407,6 +2548,7 @@ const ConnectionPool = struct {
         released_connection.active = false;
         released_connection.http2_initialized = false;
         released_connection.close_after_write = false;
+        released_connection.read_blocked_by_output = false;
         released_connection.write_side_shutdown = false;
         released_connection.awaiting_peer_close = false;
         released_connection.read_start = 0;
@@ -2419,6 +2561,7 @@ const ConnectionPool = struct {
         // Clean up stream state - avoid HashMap operations to prevent alignment issues
         // Simply reset the stream ID counter; streams will be properly managed on next use
         released_connection.next_stream_id = 1;
+        released_connection.active_streams.clearRetainingCapacity();
         released_connection.h2_conn = null;
         released_connection.tls_plaintext_read_pos = 0;
         released_connection.tls_plaintext_write_pos = 0;
@@ -2429,9 +2572,7 @@ const ConnectionPool = struct {
             released_connection.tls_conn = null;
 
             // TLS cleanup is handled by tls_conn.deinit()
-
             tls_conn.deinit();
-            released_connection.server.allocator.destroy(tls_conn);
         }
 
         // Reset all TLS-related state
@@ -2440,7 +2581,9 @@ const ConnectionPool = struct {
         released_connection.h2_reader = Connection.IoAdapters.Reader.init(released_connection);
         released_connection.h2_writer = Connection.IoAdapters.Writer.init(released_connection);
 
-        self.free_list.append(self.allocator, pool_index) catch {};
+        std.debug.assert(self.free_count < self.free_list.len);
+        self.free_list[self.free_count] = pool_index;
+        self.free_count += 1;
     }
 };
 
