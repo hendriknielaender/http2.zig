@@ -1,11 +1,12 @@
 //! HTTP/2 server transport built on the Zig standard library I/O stack.
 //!
-//! On Linux this uses `std.Io.Evented`, which maps to the native io_uring
-//! backend in Zig 0.16. On platforms without an evented backend, it falls back
-//! to `std.Io.Threaded`.
+//! The default build uses `std.Io.Threaded`.
+//! On Linux, the experimental `std.Io.Evented` backend can be enabled with
+//! `-Devented=true` once the toolchain backend is known to compile cleanly.
 
 const builtin = @import("builtin");
 const std = @import("std");
+const build_options = @import("build_options");
 
 const connection_module = @import("connection.zig");
 const handler = @import("handler.zig");
@@ -15,7 +16,10 @@ const Connection = connection_module.Connection;
 const ServerStats = @import("http2.zig").ServerStats;
 const log = std.log.scoped(.server);
 
-const backend_uses_evented = builtin.os.tag == .linux and std.Io.Evented != void;
+const backend_uses_evented = if (build_options.use_evented_backend)
+    builtin.os.tag == .linux and std.Io.Evented != void
+else
+    false;
 
 const Backend = if (backend_uses_evented)
     struct {

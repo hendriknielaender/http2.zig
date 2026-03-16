@@ -1,7 +1,7 @@
 //! High-performance HTTP/2 implementation with Zig's native I/O backends.
 //!
 //! Features:
-//! - Cross-platform event-driven I/O via `std.Io.Evented`
+//! - Cross-platform async I/O via Zig `std.Io` backends
 //! - Static memory allocation with compile-time budgets
 //! - Zero-copy operations where possible
 //! - Lock-free atomic operations
@@ -49,7 +49,7 @@ pub const initial_window_size_default = 65535;
 const TransportServer = @import("server.zig").Server;
 
 /// High-performance HTTP/2 server.
-/// Uses Zig's native evented I/O implementation when it is available.
+/// Uses the configured Zig `std.Io` backend.
 pub const Server = struct {
     inner: TransportServer,
     allocator: std.mem.Allocator,

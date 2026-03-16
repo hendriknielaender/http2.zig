@@ -311,8 +311,8 @@ pub const SIMDFrameParser = struct {
             std.debug.assert(byte_index + chunk_size <= data.len);
             std.debug.assert(byte_index + chunk_size <= expected.len);
 
-            const data_chunk = @as(@Vector(32, u8), data[byte_index .. byte_index + chunk_size].*);
-            const expected_chunk = @as(@Vector(32, u8), expected[byte_index .. byte_index + chunk_size].*);
+            const data_chunk = @as(@Vector(32, u8), data[byte_index..][0..chunk_size].*);
+            const expected_chunk = @as(@Vector(32, u8), expected[byte_index..][0..chunk_size].*);
 
             // Compare chunks using SIMD
             const comparison = data_chunk == expected_chunk;

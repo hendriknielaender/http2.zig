@@ -16,6 +16,14 @@ pub fn build(b: *std.Build) void {
     // Standard target and optimization options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const evented = b.option(
+        bool,
+        "evented",
+        "Enable the experimental std.Io.Evented backend.",
+    ) orelse false;
+
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "use_evented_backend", evented);
 
     // Create module for use in other projects
     const http2_module = b.addModule("http2", .{
@@ -25,6 +33,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .link_libcpp = true,
     });
+    http2_module.addOptions("build_options", build_options);
 
     // Core HTTP/2 library
     const http2_lib = b.addLibrary(.{
@@ -37,13 +46,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(http2_lib);
 
     // Example applications
-    add_examples(b, target, optimize, http2_module);
+    add_examples(b, target, optimize, http2_module, build_options);
 
     // Benchmark application
-    add_benchmark(b, target, optimize, http2_module);
+    add_benchmark(b, target, optimize, http2_module, build_options);
 
     // Test suite
-    add_tests(b, target, optimize);
+    add_tests(b, target, optimize, build_options);
 
     // Documentation
     add_documentation(b, http2_lib);
@@ -58,6 +67,7 @@ fn add_examples(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     http2_module: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
 ) void {
     // Basic TLS Example
     const basic_tls_module = b.createModule(.{
@@ -66,6 +76,7 @@ fn add_examples(
         .optimize = optimize,
     });
     basic_tls_module.addImport("http2", http2_module);
+    basic_tls_module.addOptions("build_options", build_options);
 
     const basic_tls = b.addExecutable(.{
         .name = "basic_tls_server",
@@ -87,6 +98,7 @@ fn add_benchmark(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     http2_module: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
 ) void {
     // Benchmark server
     const benchmark_module = b.createModule(.{
@@ -95,6 +107,7 @@ fn add_benchmark(
         .optimize = optimize,
     });
     benchmark_module.addImport("http2", http2_module);
+    benchmark_module.addOptions("build_options", build_options);
 
     const benchmark = b.addExecutable(.{
         .name = "benchmark",
@@ -115,6 +128,7 @@ fn add_tests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    build_options: *std.Build.Step.Options,
 ) void {
     // Unit tests for core modules
     const test_modules = [_][]const u8{
@@ -140,6 +154,7 @@ fn add_tests(
             .link_libc = true,
             .link_libcpp = true,
         });
+        test_module.addOptions("build_options", build_options);
 
         const module_test = b.addTest(.{
             .root_module = test_module,
