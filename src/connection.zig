@@ -713,6 +713,12 @@ pub const Connection = struct {
         if (!stream.request_complete) {
             return;
         }
+        if (!stream.request_headers_complete) {
+            return;
+        }
+        if (stream.expecting_continuation) {
+            return;
+        }
         if (stream.response_body_sent >= default_response_body.len) {
             return;
         }
@@ -1629,6 +1635,9 @@ pub const Connection = struct {
     }
 
     pub fn process_request(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
+        assert(stream.request_complete);
+        assert(stream.request_headers_complete);
+        assert(!stream.expecting_continuation);
         log.debug("Processing request for stream ID: {d}, state: {s}", .{ stream.id, @tagName(stream.state) });
         try self.process_request_send_headers(stream);
         try self.process_request_send_body(stream);
@@ -2584,12 +2593,51 @@ test "flush_ready_streams reports completed responses once" {
 
     const stream = try connection.get_stream(1);
     stream.state = .HalfClosedRemote;
+    stream.request_headers_complete = true;
     stream.request_complete = true;
 
     try connection.queueStreamIfReady(stream);
     try connection.flush_ready_streams();
 
     try std.testing.expectEqual(@as(u32, 1), connection.takeCompletedResponses());
+    try std.testing.expectEqual(@as(u32, 0), connection.takeCompletedResponses());
+}
+
+test "flush_ready_streams does not respond before END_HEADERS" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(allocator, &test_io.reader, &test_io.writer, false);
+    const initial_written_len = test_io.written().len;
+
+    const fragmented_headers = Frame{
+        .header = .{
+            .length = 1,
+            .frame_type = .HEADERS,
+            .flags = FrameFlags.init(FrameFlags.END_STREAM),
+            .reserved = false,
+            .stream_id = 1,
+        },
+        .payload = &[_]u8{0x82},
+    };
+
+    try connection.handleFrameEventDriven(fragmented_headers);
+
+    const stream = try connection.get_stream(1);
+    try std.testing.expectEqual(@as(?u32, 1), connection.expecting_continuation_stream_id);
+    try std.testing.expect(stream.state == .HalfClosedRemote);
+    try std.testing.expect(!stream.request_headers_complete);
+    try std.testing.expect(!stream.request_complete);
+    try std.testing.expect(!stream.response_headers_sent);
+
+    try connection.flush_ready_streams();
+
+    try std.testing.expectEqual(initial_written_len, test_io.written().len);
+    try std.testing.expect(!stream.response_headers_sent);
     try std.testing.expectEqual(@as(u32, 0), connection.takeCompletedResponses());
 }
 
@@ -2728,11 +2776,13 @@ test "scheduler prefers lower urgency before higher urgency" {
 
     const low_urgency_stream = try connection.get_stream(1);
     low_urgency_stream.state = .HalfClosedRemote;
+    low_urgency_stream.request_headers_complete = true;
     low_urgency_stream.request_complete = true;
     low_urgency_stream.priority.urgency = 5;
 
     const high_urgency_stream = try connection.get_stream(3);
     high_urgency_stream.state = .HalfClosedRemote;
+    high_urgency_stream.request_headers_complete = true;
     high_urgency_stream.request_complete = true;
     high_urgency_stream.priority.urgency = 0;
 
@@ -2761,12 +2811,14 @@ test "scheduler gives same-urgency incremental streams a first turn" {
 
     const incremental_stream = try connection.get_stream(1);
     incremental_stream.state = .HalfClosedRemote;
+    incremental_stream.request_headers_complete = true;
     incremental_stream.request_complete = true;
     incremental_stream.priority.urgency = 2;
     incremental_stream.priority.incremental = true;
 
     const blocking_stream = try connection.get_stream(3);
     blocking_stream.state = .HalfClosedRemote;
+    blocking_stream.request_headers_complete = true;
     blocking_stream.request_complete = true;
     blocking_stream.priority.urgency = 2;
     blocking_stream.priority.incremental = false;

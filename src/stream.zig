@@ -515,7 +515,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     self.conn.expecting_continuation_stream_id = self.id;
                 }
 
-                if (frame.header.flags.isEndStream()) {
+                if (frame.header.flags.isEndStream() and frame.header.flags.isEndHeaders()) {
                     self.request_complete = true;
                 }
             }
@@ -543,6 +543,9 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
                     self.expecting_continuation = false;
                     self.conn.expecting_continuation_stream_id = null;
+                    if (self.state == .HalfClosedRemote) {
+                        self.request_complete = true;
+                    }
                 }
             }
 
