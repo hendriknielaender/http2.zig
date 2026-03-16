@@ -197,11 +197,12 @@ test "Memory budget validation" {
     if (conn_slot) |c| memory_pool.releaseConnection(c);
 }
 test "Pool operation performance" {
+    const io = std.Io.Threaded.global_single_threaded.io();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const memory_pool = try memory_budget.StaticMemoryPool.create(arena.allocator());
     defer memory_pool.destroy();
-    const start_time = std.time.nanoTimestamp();
+    const start_time = std.Io.Clock.awake.now(io).toNanoseconds();
     // Perform many pool operations
     const iterations = 1000;
     for (0..iterations) |_| {
@@ -212,7 +213,7 @@ test "Pool operation performance" {
             memory_pool.releaseConnection(conn);
         }
     }
-    const end_time = std.time.nanoTimestamp();
+    const end_time = std.Io.Clock.awake.now(io).toNanoseconds();
     const duration_ns = end_time - start_time;
     const ns_per_op = @divTrunc(duration_ns, (iterations * 2)); // 2 operations per iteration
     // Should be very fast (< 1000ns per operation)

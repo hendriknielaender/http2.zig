@@ -13,7 +13,7 @@ fn helloHandler(ctx: *const http2.Context) !http2.Response {
 
 /// High-performance HTTP/2 over HTTPS benchmark server
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -22,12 +22,16 @@ pub fn main() !void {
     defer http2.deinit();
 
     // Get port and TLS mode from environment
-    const port_env = std.posix.getenv("PORT");
-    const tls_env = std.posix.getenv("TLS");
-    const use_tls = if (tls_env) |env_val| std.mem.eql(u8, env_val, "1") or std.mem.eql(u8, env_val, "true") else true;
+    const port_env = if (std.c.getenv("PORT")) |value| std.mem.span(value) else null;
+    const tls_env = if (std.c.getenv("TLS")) |value| std.mem.span(value) else null;
+    const use_tls = if (tls_env) |env_val|
+        std.mem.eql(u8, env_val, "1") or std.mem.eql(u8, env_val, "true")
+    else
+        true;
 
     const port: u16 = if (port_env) |env_val|
-        std.fmt.parseInt(u16, env_val, 10) catch (if (use_tls) @as(u16, 8443) else @as(u16, 3000))
+        std.fmt.parseInt(u16, env_val, 10) catch
+            (if (use_tls) @as(u16, 8443) else @as(u16, 3000))
     else
         (if (use_tls) @as(u16, 8443) else @as(u16, 3000));
 
@@ -39,7 +43,7 @@ pub fn main() !void {
 
     // Configure server for benchmarking with high concurrency
     const config = http2.Server.Config{
-        .address = try std.net.Address.resolveIp("127.0.0.1", port),
+        .address = try std.Io.net.IpAddress.parse("127.0.0.1", port),
         .router = &router,
         .max_connections = http2.memory_budget.MemBudget.max_conns,
         .buffer_size = 32 * 1024,
@@ -65,7 +69,7 @@ pub fn main() !void {
     } else {
         log.info("HTTP/2 benchmark server ready on port {}", .{port});
     }
-    log.info("Event-driven architecture with libxev (cross-platform)", .{});
+    log.info("Event-driven architecture with Zig std.Io backend", .{});
 
     // Create a context for the monitor thread
     const MonitorContext = struct {
@@ -103,24 +107,25 @@ fn monitorPerformance(ctx: *const anyopaque) void {
     };
 
     const monitor_ctx = @as(*MonitorContext, @ptrCast(@alignCast(@constCast(ctx))));
+    const io = std.Io.Threaded.global_single_threaded.io();
 
     // Wait for server to be ready
     while (!monitor_ctx.ready.load(.acquire)) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        sleepFor(10 * std.time.ns_per_ms);
     }
 
     var last_total: u64 = 0;
     var last_requests: u64 = 0;
-    var last_time = std.time.milliTimestamp();
+    var last_time = std.Io.Clock.Timestamp.now(io, .awake);
     var peak_rps: u64 = 0;
     var peak_conn_rps: u64 = 0;
 
     while (monitor_ctx.running.load(.acquire)) {
-        std.Thread.sleep(2 * std.time.ns_per_s);
+        sleepFor(2 * std.time.ns_per_s);
 
         const stats = monitor_ctx.server.getStats();
-        const current_time = std.time.milliTimestamp();
-        const time_diff_ms = current_time - last_time;
+        const current_time = std.Io.Clock.Timestamp.now(io, .awake);
+        const time_diff_ms = last_time.durationTo(current_time).raw.toMilliseconds();
 
         if (time_diff_ms > 0) {
             const conn_diff = stats.total_connections - last_total;
@@ -145,4 +150,9 @@ fn monitorPerformance(ctx: *const anyopaque) void {
             last_time = current_time;
         }
     }
+}
+
+fn sleepFor(duration_ns: u64) void {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    io.sleep(.fromNanoseconds(duration_ns), .awake) catch unreachable;
 }

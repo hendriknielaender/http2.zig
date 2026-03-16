@@ -275,7 +275,7 @@ pub const Huffman = struct {
 
         var bit_buffer: u64 = 0;
         var bit_count: u6 = 0;
-        var encoded: std.ArrayList(u8) = .{};
+        var encoded: std.ArrayList(u8) = .empty;
         defer encoded.deinit(allocator);
 
         for (input) |byte| {
@@ -310,7 +310,7 @@ pub const Huffman = struct {
         std.debug.assert(input.len <= 16384); // Reasonable input size limit
         std.debug.assert(@intFromPtr(&allocator) != 0);
 
-        var decoded: std.ArrayList(u8) = .{};
+        var decoded: std.ArrayList(u8) = .empty;
         defer decoded.deinit(allocator);
 
         var bit_buffer: u64 = 0;

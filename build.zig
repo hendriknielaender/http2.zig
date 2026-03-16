@@ -1,6 +1,6 @@
-//! HTTP/2 Protocol Implementation Build Configuration
+//! HTTP/2 protocol implementation build configuration.
 //!
-//! - High-performance HTTP/2 library with libxev
+//! - High-performance HTTP/2 library
 //! - Example server applications
 //! - Comprehensive test suite
 //! - Documentation generation
@@ -10,26 +10,21 @@ const std = @import("std");
 
 // Project metadata
 const project_name = "http2";
-const project_version = "0.1.0";
+const project_version = "0.0.3";
 
 pub fn build(b: *std.Build) void {
     // Standard target and optimization options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Add libxev dependency
-    const libxev = b.dependency("libxev", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
     // Create module for use in other projects
     const http2_module = b.addModule("http2", .{
         .root_source_file = b.path("src/http2.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
     });
-    http2_module.addImport("xev", libxev.module("xev"));
 
     // Core HTTP/2 library
     const http2_lib = b.addLibrary(.{
@@ -48,7 +43,7 @@ pub fn build(b: *std.Build) void {
     add_benchmark(b, target, optimize, http2_module);
 
     // Test suite
-    add_tests(b, target, optimize, libxev);
+    add_tests(b, target, optimize);
 
     // Documentation
     add_documentation(b, http2_lib);
@@ -120,7 +115,6 @@ fn add_tests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    libxev: *std.Build.Dependency,
 ) void {
     // Unit tests for core modules
     const test_modules = [_][]const u8{
@@ -143,8 +137,9 @@ fn add_tests(
             .root_source_file = b.path(module_path),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
         });
-        test_module.addImport("xev", libxev.module("xev"));
 
         const module_test = b.addTest(.{
             .root_module = test_module,
@@ -188,10 +183,10 @@ fn add_code_quality_checks(b: *std.Build) void {
 }
 
 fn linkBoringSsl(b: *std.Build, artifact: *std.Build.Step.Compile) void {
-    artifact.linkLibC();
-    artifact.linkLibCpp();
-    artifact.addIncludePath(b.path("boringssl/include"));
-    artifact.addLibraryPath(b.path("boringssl/build"));
-    artifact.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
-    artifact.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
+    artifact.root_module.link_libc = true;
+    artifact.root_module.link_libcpp = true;
+    artifact.root_module.addIncludePath(b.path("boringssl/include"));
+    artifact.root_module.addLibraryPath(b.path("boringssl/build"));
+    artifact.root_module.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
+    artifact.root_module.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
 }

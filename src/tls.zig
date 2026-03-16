@@ -97,8 +97,8 @@ pub const TlsServerContext = struct {
         }
     }
 
-    /// Create a new TLS connection with BIO pair for proper async I/O
-    /// This avoids socket FD conflicts with libxev
+    /// Create a new TLS connection with BIO pair for proper async I/O.
+    /// This keeps the TLS engine decoupled from the transport backend.
     pub fn createAsyncConnection(
         self: *TlsServerContext,
         socket_fd: std.posix.fd_t,
@@ -159,12 +159,30 @@ pub const TlsServerContext = struct {
         };
     }
 
-    /// Accept a new TLS connection (legacy blocking version)
+    /// Accept a new TLS connection using BoringSSL's direct socket BIO.
+    ///
+    /// The caller retains ownership of `socket_fd` and must close it after the
+    /// returned connection is deinitialized.
     pub fn accept(self: *TlsServerContext, socket_fd: std.posix.fd_t) !TlsServerConnection {
-        var connection = try self.createAsyncConnection(
-            socket_fd,
-            .{ .bio_capacity_bytes = 16 * 1024 },
-        );
+        std.debug.assert(self.ctx != null);
+
+        if (self.ctx == null) {
+            return TlsError.InvalidContext;
+        }
+
+        const ssl_connection = boringssl.SSL_new(self.ctx);
+        if (ssl_connection == null) {
+            return TlsError.InvalidContext;
+        }
+
+        if (boringssl.SSL_set_fd(ssl_connection, socket_fd) != 1) {
+            boringssl.SSL_free(ssl_connection);
+            return TlsError.InitFailed;
+        }
+
+        boringssl.SSL_set_accept_state(ssl_connection);
+
+        var connection = TlsServerConnection.init(self.allocator, ssl_connection.?);
 
         // Perform the server‐side TLS handshake. On success, returns 1.
         const handshake_result = boringssl.SSL_accept(connection.ssl);
@@ -277,10 +295,21 @@ pub const TlsServerContext = struct {
         std.debug.assert(max_cert_size > 0);
         std.debug.assert(max_key_size > 0);
 
-        const certificate_data = try std.fs.cwd().readFileAlloc(self.allocator, cert_path, max_cert_size);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const certificate_data = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            cert_path,
+            self.allocator,
+            .limited(max_cert_size),
+        );
         defer self.allocator.free(certificate_data);
 
-        const private_key_data = try std.fs.cwd().readFileAlloc(self.allocator, key_path, max_key_size);
+        const private_key_data = try std.Io.Dir.cwd().readFileAlloc(
+            io,
+            key_path,
+            self.allocator,
+            .limited(max_key_size),
+        );
         defer self.allocator.free(private_key_data);
 
         // Load certificate from in‐memory bytes with bounds checking
@@ -347,7 +376,7 @@ pub const TlsServerConnection = struct {
     allocator: std.mem.Allocator,
     ssl: ?*boringssl.SSL,
     handshake_state: TlsHandshakeState,
-    // BIO pair for async I/O with libxev
+    // BIO pair for async I/O.
     internal_bio: ?*boringssl.BIO,
     network_bio: ?*boringssl.BIO,
     read_status: IoStatus,
@@ -393,7 +422,7 @@ pub const TlsServerConnection = struct {
     }
 
     /// Attempt async TLS handshake - returns current state
-    /// Handles BoringSSL's async operations properly with libxev
+    /// Handles BoringSSL's async operations with a BIO-pair transport.
     pub fn doAsyncHandshake(self: *TlsServerConnection) TlsHandshakeState {
         if (self.handshake_state == .complete or self.handshake_state == .failed) {
             return self.handshake_state;

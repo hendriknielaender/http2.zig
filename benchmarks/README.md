@@ -8,7 +8,7 @@ High-performance benchmarks for testing HTTP/2 server performance with both HTTP
 
 - **HTTP/2 over HTTPS**: TLS with ALPN h2 negotiation (default)
 - **HTTP/2 cleartext**: Optional fallback mode
-- **Event-driven**: libxev-based async I/O for maximum performance
+- **Event-driven**: Zig std.Io-based async I/O for maximum performance
 - **Cross-platform**: Supports Linux, macOS, and Windows
 
 ## Building
@@ -79,7 +79,7 @@ PORT=8080 TLS=false ./zig-out/bin/http2-benchmark
 ```
 HTTP/2 over HTTPS benchmark server ready on port 8443
 TLS with ALPN h2 negotiation enabled for performance testing
-Event-driven architecture with libxev (cross-platform)
+Event-driven architecture with Zig std.Io backends
 
 [HTTP/2] 23 active | 2850 req/s (42 conn/s) | 142500 total reqs | Peak: 3100 req/s
 [HTTP/2] 45 active | 3120 req/s (38 conn/s) | 185620 total reqs | Peak: 3120 req/s

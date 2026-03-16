@@ -13,7 +13,7 @@ Cross-platform • Zero allocations
 
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
 [![Zig 0.15.2](https://img.shields.io/badge/zig-0.15.2-orange.svg)](https://ziglang.org)
-[![libxev](https://img.shields.io/badge/powered%20by-libxev-brightgreen.svg)](https://github.com/mitchellh/libxev)
+[![std.Io](https://img.shields.io/badge/powered%20by-std.Io-brightgreen.svg)](https://ziglang.org/)
 
 </div>
 
@@ -21,7 +21,7 @@ Cross-platform • Zero allocations
 
 ## Features
 
-- 🌍 **Cross-platform** support via libxev (io_uring, kqueue, epoll)
+- 🌍 **Cross-platform** support via Zig std.Io backends
 - 💾 **Zero runtime allocations** - all memory allocated at compile time
 - 🔒 **Lock-free** atomic operations for maximum concurrency
 - 📦 **Simple API** - just configure and run
@@ -142,8 +142,7 @@ pub const ServerStats = struct {
 
 ### Requirements
 
-- Zig 0.15.2 or later
-- libxev (included as dependency)
+- Zig v0.16.0-dev.2905+5d71e3051
 
 ### Build Commands
 
@@ -208,7 +207,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- Built with [libxev](https://github.com/mitchellh/libxev) by Mitchell Hashimoto
+- Built with Zig 0.16 std.Io
 - Inspired by [TigerBeetle](https://tigerbeetle.com)'s zero-allocation principles
 - HTTP/2 Specification - [RFC 7540](https://tools.ietf.org/html/rfc7540)
 - HPACK Specification - [RFC 7541](https://tools.ietf.org/html/rfc7541)
