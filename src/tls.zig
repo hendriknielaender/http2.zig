@@ -1,5 +1,6 @@
 const std = @import("std");
 const boringssl = @import("bindings/boringssl-bindings.zig");
+const log = std.log.scoped(.tls);
 
 /// TLS operation errors.
 /// These errors cover initialization, handshake, and I/O failures.
@@ -399,7 +400,7 @@ pub const TlsServerConnection = struct {
         }
 
         if (self.ssl == null) {
-            std.log.err("SSL object is null", .{});
+            log.err("SSL object is null", .{});
             self.handshake_state = .failed;
             return .failed;
         }
@@ -431,9 +432,9 @@ pub const TlsServerConnection = struct {
                 if (err_code != 0) {
                     var err_buf: [256]u8 = undefined;
                     _ = boringssl.ERR_error_string_n(err_code, &err_buf, err_buf.len);
-                    std.log.err("SSL handshake failed with error {}: {s}", .{ ssl_error, err_buf });
+                    log.err("SSL handshake failed with error {}: {s}", .{ ssl_error, err_buf });
                 } else {
-                    std.log.err("SSL handshake failed with error: {}", .{ssl_error});
+                    log.err("SSL handshake failed with error: {}", .{ssl_error});
                 }
                 self.handshake_state = .failed;
                 return .failed;
@@ -514,6 +515,20 @@ pub const TlsServerConnection = struct {
         // Check if there's pending data in the network BIO
         const pending = boringssl.BIO_pending(self.network_bio);
         return pending > 0;
+    }
+
+    pub fn encryptedDataPendingBytes(self: *TlsServerConnection) u32 {
+        if (self.network_bio == null) {
+            return 0;
+        }
+
+        const pending = boringssl.BIO_pending(self.network_bio);
+        if (pending <= 0) {
+            return 0;
+        }
+
+        std.debug.assert(pending <= std.math.maxInt(u32));
+        return @intCast(pending);
     }
 
     pub fn reader(self: *TlsServerConnection) *std.Io.Reader {
@@ -703,26 +718,26 @@ pub const TlsServerConnection = struct {
             },
             boringssl.SSL_ERROR_ZERO_RETURN => {
                 // Clean shutdown - client closed the TLS connection
-                std.log.debug("TLS connection closed cleanly by client", .{});
+                log.debug("TLS connection closed cleanly by client", .{});
                 return TlsError.ConnectionClosed;
             },
             boringssl.SSL_ERROR_SYSCALL => {
                 // System call error - could be connection closed
                 if (bytes_read_count == 0) {
-                    std.log.debug("TLS connection closed by client (SYSCALL)", .{});
+                    log.debug("TLS connection closed by client (SYSCALL)", .{});
                     return TlsError.ConnectionClosed;
                 } else {
-                    std.log.err("SSL_read SYSCALL error: {}", .{ssl_error_code});
+                    log.err("SSL_read SYSCALL error: {}", .{ssl_error_code});
                     return TlsError.ReadFailed;
                 }
             },
             boringssl.SSL_ERROR_SSL => {
                 // SSL protocol error - could be connection reset by peer
-                std.log.debug("SSL protocol error (connection likely closed by client): {}", .{ssl_error_code});
+                log.debug("SSL protocol error (connection likely closed by client): {}", .{ssl_error_code});
                 return TlsError.ConnectionClosed;
             },
             else => {
-                std.log.err("SSL_read failed with error: {}", .{ssl_error_code});
+                log.err("SSL_read failed with error: {}", .{ssl_error_code});
                 return TlsError.ReadFailed;
             },
         }
@@ -785,10 +800,7 @@ pub const TlsServerConnection = struct {
             },
             else => {
                 const error_message = boringssl.ERR_error_string(@intCast(ssl_error_code), null);
-                std.debug.print(
-                    "SSL_write error: code={d} msg={s}\n",
-                    .{ ssl_error_code, error_message },
-                );
+                log.err("SSL_write error: code={d} msg={s}", .{ ssl_error_code, error_message });
                 return TlsError.WriteFailed;
             },
         }

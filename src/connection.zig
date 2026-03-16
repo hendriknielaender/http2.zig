@@ -69,11 +69,19 @@ pub const FrameMeta = @import("frame.zig").FrameMeta;
 pub const initFrameArena = @import("frame.zig").initFrameArena;
 pub const Hpack = @import("hpack.zig").Hpack;
 pub const http2 = @import("http2.zig");
+const HttpPriority = @import("http_priority.zig").Priority;
+const memory_budget = @import("memory_budget.zig");
+const TestIo = @import("testing/fixed_io.zig").FixedIo;
 const MAX_IN_FLIGHT_FRAMES = 64;
+const max_streams_per_connection = memory_budget.MemBudget.max_streams_per_conn;
 const max_frame_size_default = http2.max_frame_size_default;
 const log = std.log.scoped(.connection);
 const assert = std.debug.assert;
 const http2_preface: []const u8 = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+const priority_frame_payload_size: usize = 5;
+const priority_update_frame_type: u8 = 0x10;
+const priority_update_payload_id_size: usize = 4;
+const settings_no_rfc7540_priorities_id: u16 = 0x9;
 const default_response_body =
     \\<!DOCTYPE html>
     \\<html>
@@ -123,6 +131,12 @@ const default_response_headers_block = [_]u8{
     '8',
 };
 comptime {
+    assert(max_streams_per_connection == 100);
+    assert(max_streams_per_connection <= std.math.maxInt(u8));
+    assert(priority_frame_payload_size == 5);
+    assert(priority_update_frame_type == @intFromEnum(FrameType.PRIORITY_UPDATE));
+    assert(priority_update_payload_id_size == 4);
+    assert(settings_no_rfc7540_priorities_id == 0x9);
     assert(default_response_body.len == 68);
     assert(default_response_content_type.len == 24);
     assert(std.mem.eql(u8, default_response_content_length, "68"));
@@ -163,6 +177,7 @@ pub const FrameHandler = enum(u8) {
     goaway = @intFromEnum(FrameType.GOAWAY),
     window_update = @intFromEnum(FrameType.WINDOW_UPDATE),
     continuation = @intFromEnum(FrameType.CONTINUATION),
+    priority_update = @intFromEnum(FrameType.PRIORITY_UPDATE),
     pub fn fromFrameType(frame_type: u8) ?FrameHandler {
         return switch (frame_type) {
             @intFromEnum(FrameType.DATA) => .data,
@@ -175,6 +190,7 @@ pub const FrameHandler = enum(u8) {
             @intFromEnum(FrameType.GOAWAY) => .goaway,
             @intFromEnum(FrameType.WINDOW_UPDATE) => .window_update,
             @intFromEnum(FrameType.CONTINUATION) => .continuation,
+            @intFromEnum(FrameType.PRIORITY_UPDATE) => .priority_update,
             else => null,
         };
     }
@@ -224,13 +240,37 @@ pub fn acceptMany(listener: std.net.Server, connections: []std.net.Server.Connec
     return accepted;
 }
 pub const Connection = struct {
+    pub const StreamStorage = struct {
+        slots: [max_streams_per_connection]DefaultStream.StreamInstance,
+        ids: [max_streams_per_connection]u32,
+        in_use: [max_streams_per_connection]bool,
+    };
+    pub const PendingPriorityUpdate = struct {
+        stream_id: u32 = 0,
+        priority: HttpPriority = .{},
+        in_use: bool = false,
+    };
+    pub const FrameArenaStorage = [
+        MAX_IN_FLIGHT_FRAMES *
+            (max_frame_size_default + @sizeOf(FrameMeta))
+    ]u8;
+
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     settings: Settings,
     recv_window_size: i32 = 65535,
     send_window_size: i32 = 65535,
-    streams: std.AutoHashMap(u32, *DefaultStream.StreamInstance),
+    stream_slots: []DefaultStream.StreamInstance,
+    // Keep hot lookup metadata compact so stream scans do not walk the full stream storage.
+    stream_slot_ids: []u32,
+    stream_slots_in_use: []bool,
+    owned_stream_storage: ?*StreamStorage = null,
+    pending_stream_slots: [max_streams_per_connection]u8,
+    pending_stream_queued: [max_streams_per_connection]bool,
+    pending_stream_count: u8 = 0,
+    pending_priority_updates: [max_streams_per_connection]PendingPriorityUpdate,
+    completed_responses_pending: u32 = 0,
     // HPACK keeps independent dynamic tables per direction.
     hpack_decoder_table: Hpack.DynamicTable,
     hpack_encoder_table: Hpack.DynamicTable,
@@ -239,28 +279,67 @@ pub const Connection = struct {
     expecting_continuation_stream_id: ?u32 = null,
     last_stream_id: u32 = 0,
     client_settings_received: bool = false,
-    closed_stream_ids: std.AutoHashMap(u32, void),
+    peer_first_settings_received: bool = false,
+    peer_no_rfc7540_priorities: bool = false,
+    peer_no_rfc7540_priorities_setting_received: bool = false,
+    schedule_epoch_next: u64 = 1,
     connection_closed: bool = false,
-    frame_arena_buffer: [MAX_IN_FLIGHT_FRAMES * (max_frame_size_default + @sizeOf(FrameMeta))]u8,
+    owned_frame_arena_storage: ?*FrameArenaStorage = null,
     frame_arena: FrameArena,
+    frame_arena_available: bool = false,
 
-    fn initBase(allocator: std.mem.Allocator, reader: *std.Io.Reader, writer: *std.Io.Writer) @This() {
-        var self = @This(){
+    fn initStreamStorage(target: *StreamStorage) void {
+        target.* = .{
+            .slots = undefined,
+            .ids = [_]u32{0} ** max_streams_per_connection,
+            .in_use = [_]bool{false} ** max_streams_per_connection,
+        };
+    }
+
+    fn initBase(
+        target: *@This(),
+        stream_storage: *StreamStorage,
+        frame_arena_storage: ?*FrameArenaStorage,
+        allocator: std.mem.Allocator,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+    ) void {
+        initStreamStorage(stream_storage);
+
+        target.* = .{
             .allocator = allocator,
             .reader = reader,
             .writer = writer,
             .settings = Settings.default(),
             .recv_window_size = 65535,
             .send_window_size = 65535,
-            .streams = std.AutoHashMap(u32, *DefaultStream.StreamInstance).init(allocator),
+            .stream_slots = stream_storage.slots[0..],
+            .stream_slot_ids = stream_storage.ids[0..],
+            .stream_slots_in_use = stream_storage.in_use[0..],
+            .owned_stream_storage = null,
+            .pending_stream_slots = undefined,
+            .pending_stream_queued = [_]bool{false} ** max_streams_per_connection,
+            .pending_stream_count = 0,
+            .pending_priority_updates = [_]PendingPriorityUpdate{.{}} ** max_streams_per_connection,
+            .completed_responses_pending = 0,
             .hpack_decoder_table = Hpack.DynamicTable.init(allocator, 4096),
             .hpack_encoder_table = Hpack.DynamicTable.init(allocator, 4096),
-            .closed_stream_ids = std.AutoHashMap(u32, void).init(allocator),
-            .frame_arena_buffer = undefined,
+            .peer_first_settings_received = false,
+            .peer_no_rfc7540_priorities = false,
+            .peer_no_rfc7540_priorities_setting_received = false,
+            .schedule_epoch_next = 1,
+            .owned_frame_arena_storage = null,
             .frame_arena = undefined,
+            .frame_arena_available = false,
         };
-        self.frame_arena = initFrameArena(&self.frame_arena_buffer);
-        return self;
+
+        assert(target.stream_slots.len == max_streams_per_connection);
+        assert(target.stream_slot_ids.len == max_streams_per_connection);
+        assert(target.stream_slots_in_use.len == max_streams_per_connection);
+        if (frame_arena_storage) |storage| {
+            target.frame_arena = initFrameArena(storage);
+            target.frame_arena_available = true;
+        }
     }
 
     pub fn init(
@@ -269,7 +348,15 @@ pub const Connection = struct {
         writer: *std.Io.Writer,
         comptime is_server: bool,
     ) !@This() {
-        var self = initBase(allocator, reader, writer);
+        var self: @This() = undefined;
+        const stream_storage = try allocator.create(StreamStorage);
+        errdefer allocator.destroy(stream_storage);
+        const frame_arena_storage = try allocator.create(FrameArenaStorage);
+        errdefer allocator.destroy(frame_arena_storage);
+
+        initBase(&self, stream_storage, frame_arena_storage, allocator, reader, writer);
+        self.owned_stream_storage = stream_storage;
+        self.owned_frame_arena_storage = frame_arena_storage;
         if (is_server) {
             try self.check_server_preface();
         } else {
@@ -286,9 +373,25 @@ pub const Connection = struct {
         reader: *std.Io.Reader,
         writer: *std.Io.Writer,
     ) !@This() {
-        var self = initBase(allocator, reader, writer);
+        var self: @This() = undefined;
+        const stream_storage = try allocator.create(StreamStorage);
+        errdefer allocator.destroy(stream_storage);
+
+        initBase(&self, stream_storage, null, allocator, reader, writer);
+        self.owned_stream_storage = stream_storage;
         try self.send_settings();
         return self;
+    }
+
+    pub fn initServerEventDrivenInPlace(
+        target: *@This(),
+        stream_storage: *StreamStorage,
+        allocator: std.mem.Allocator,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+    ) !void {
+        initBase(target, stream_storage, null, allocator, reader, writer);
+        try target.send_settings();
     }
     fn check_server_preface(self: *@This()) !void {
         const preface_len = http2_preface.len;
@@ -315,51 +418,337 @@ pub const Connection = struct {
         }
         log.debug("Valid HTTP/2 preface received", .{});
     }
-    pub fn deinit(self: @This()) void {
+    pub fn deinit(self: *@This()) void {
         // Mark connection as closed to prevent further operations
-        @constCast(&self).connection_closed = true;
-        // Deinitialize and free streams
-        var it = self.streams.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.*.deinit();
-            self.allocator.destroy(entry.value_ptr.*);
+        self.connection_closed = true;
+
+        for (self.stream_slots, 0..) |*stream_slot, stream_index| {
+            if (!self.stream_slots_in_use[stream_index]) continue;
+            stream_slot.deinit();
+            self.stream_slot_ids[stream_index] = 0;
+            self.stream_slots_in_use[stream_index] = false;
         }
-        @constCast(&self.streams).deinit();
-        @constCast(&self.closed_stream_ids).deinit();
-        @constCast(&self.hpack_decoder_table).deinit();
-        @constCast(&self.hpack_encoder_table).deinit();
+        self.pending_stream_count = 0;
+        self.pending_stream_queued = [_]bool{false} ** max_streams_per_connection;
+        self.completed_responses_pending = 0;
+        self.hpack_decoder_table.deinit();
+        self.hpack_encoder_table.deinit();
+        if (self.owned_stream_storage) |stream_storage| {
+            self.allocator.destroy(stream_storage);
+            self.owned_stream_storage = null;
+        }
+        if (self.owned_frame_arena_storage) |frame_arena_storage| {
+            self.allocator.destroy(frame_arena_storage);
+            self.owned_frame_arena_storage = null;
+        }
         log.debug("Resources deinitialized for connection\n", .{});
     }
-    /// Mark a stream as closed and track it in the closed set
-    /// Note: The stream will be cleaned up later by process_pending_streams
+
+    /// Mark a stream as closed.
+    /// The stream slot is released by the connection hot path after the frame or response completes.
     pub fn mark_stream_closed(self: *@This(), stream_id: u32) !void {
-        try self.closed_stream_ids.put(stream_id, {});
+        assert(stream_id > 0);
+        _ = self;
         log.debug("Marked stream {d} as closed\n", .{stream_id});
     }
+
     fn active_stream_count(self: *@This()) u32 {
         var count: u32 = 0;
-        var streams_iterator = self.streams.iterator();
 
-        while (streams_iterator.next()) |entry| {
-            if (entry.value_ptr.*.state != .Closed) {
-                count += 1;
-            }
+        var stream_index: u32 = 0;
+        while (stream_index < max_streams_per_connection) : (stream_index += 1) {
+            if (!self.stream_slots_in_use[stream_index]) continue;
+
+            const stream_slot = &self.stream_slots[stream_index];
+            if (stream_slot.state == .Closed) continue;
+            count += 1;
         }
 
         return count;
     }
-    fn send_preface(self: @This()) !void {
+
+    fn send_preface(self: *const @This()) !void {
         try self.writer.writeAll(http2_preface);
     }
-    pub fn highest_stream_id(self: @This()) u32 {
-        var stream_id: u32 = 0;
-        var it = self.streams.iterator();
-        while (it.next()) |entry| {
-            if (entry.key_ptr.* > stream_id) {
-                stream_id = entry.key_ptr.*;
+
+    pub fn highest_stream_id(self: *const @This()) u32 {
+        return self.last_stream_id;
+    }
+
+    fn streamFindIndex(self: *const @This(), stream_id: u32) ?u8 {
+        assert(stream_id > 0);
+
+        var stream_index: u32 = 0;
+        while (stream_index < max_streams_per_connection) : (stream_index += 1) {
+            if (!self.stream_slots_in_use[stream_index]) continue;
+            if (self.stream_slot_ids[stream_index] != stream_id) continue;
+            return @intCast(stream_index);
+        }
+
+        return null;
+    }
+
+    fn streamFind(self: *@This(), stream_id: u32) ?*DefaultStream.StreamInstance {
+        const stream_index = self.streamFindIndex(stream_id) orelse return null;
+        return &self.stream_slots[stream_index];
+    }
+
+    pub fn rfc7540_priority_signals_ignored(self: *const @This()) bool {
+        if (self.settings.no_rfc7540_priorities) {
+            return true;
+        }
+        if (self.peer_no_rfc7540_priorities) {
+            return true;
+        }
+        return false;
+    }
+
+    fn pending_priority_update_count(self: *const @This()) u32 {
+        var update_count: u32 = 0;
+
+        for (self.pending_priority_updates) |pending_update| {
+            if (!pending_update.in_use) {
+                continue;
+            }
+            update_count += 1;
+        }
+
+        return update_count;
+    }
+
+    fn pending_priority_update_find_index(self: *const @This(), stream_id: u32) ?u8 {
+        assert(stream_id > 0);
+
+        for (self.pending_priority_updates, 0..) |pending_update, pending_index| {
+            if (!pending_update.in_use) {
+                continue;
+            }
+            if (pending_update.stream_id != stream_id) {
+                continue;
+            }
+            return @intCast(pending_index);
+        }
+
+        return null;
+    }
+
+    fn pending_priority_update_take(self: *@This(), stream_id: u32) ?HttpPriority {
+        const pending_index = self.pending_priority_update_find_index(stream_id) orelse return null;
+        const pending_priority = self.pending_priority_updates[pending_index].priority;
+
+        self.pending_priority_updates[pending_index] = .{};
+        return pending_priority;
+    }
+
+    fn pending_priority_update_store(
+        self: *@This(),
+        stream_id: u32,
+        priority: HttpPriority,
+    ) !void {
+        assert(stream_id > 0);
+
+        if (self.pending_priority_update_find_index(stream_id)) |pending_index| {
+            self.pending_priority_updates[pending_index].priority = priority;
+            return;
+        }
+
+        const prioritized_streams = self.active_stream_count() + self.pending_priority_update_count();
+        if (prioritized_streams >= self.settings.max_concurrent_streams) {
+            try self.sendGoawayAndClose(
+                0x1,
+                "Too many prioritized idle streams: PROTOCOL_ERROR",
+            );
+            return error.ProtocolError;
+        }
+
+        for (&self.pending_priority_updates) |*pending_update| {
+            if (pending_update.in_use) {
+                continue;
+            }
+
+            pending_update.* = .{
+                .stream_id = stream_id,
+                .priority = priority,
+                .in_use = true,
+            };
+            return;
+        }
+
+        return error.PendingPriorityUpdateBufferFull;
+    }
+
+    fn stream_has_higher_precedence(
+        self: *const @This(),
+        candidate_index: u8,
+        current_index: u8,
+    ) bool {
+        const candidate_stream = &self.stream_slots[candidate_index];
+        const current_stream = &self.stream_slots[current_index];
+
+        if (candidate_stream.priority.urgency < current_stream.priority.urgency) {
+            return true;
+        }
+        if (candidate_stream.priority.urgency > current_stream.priority.urgency) {
+            return false;
+        }
+
+        const candidate_round_robin = stream_in_round_robin_phase(candidate_stream);
+        const current_round_robin = stream_in_round_robin_phase(current_stream);
+        if (candidate_round_robin != current_round_robin) {
+            return !candidate_round_robin;
+        }
+
+        if (!candidate_round_robin) {
+            return candidate_stream.id < current_stream.id;
+        }
+
+        if (candidate_stream.schedule_epoch_last < current_stream.schedule_epoch_last) {
+            return true;
+        }
+        if (candidate_stream.schedule_epoch_last > current_stream.schedule_epoch_last) {
+            return false;
+        }
+
+        return candidate_stream.id < current_stream.id;
+    }
+
+    fn stream_in_round_robin_phase(
+        stream: *const DefaultStream.StreamInstance,
+    ) bool {
+        if (!stream.priority.incremental) {
+            return false;
+        }
+        return stream.schedule_count > 0;
+    }
+
+    fn pendingStreamPush(self: *@This(), stream_index: u8) !void {
+        assert(stream_index < max_streams_per_connection);
+
+        if (self.pending_stream_queued[stream_index]) {
+            return;
+        }
+
+        if (self.pending_stream_count >= max_streams_per_connection) {
+            return error.PendingStreamQueueFull;
+        }
+
+        const pending_index: usize = self.pending_stream_count;
+        self.pending_stream_slots[pending_index] = stream_index;
+        self.pending_stream_queued[stream_index] = true;
+        self.pending_stream_count += 1;
+    }
+
+    fn pendingStreamPop(self: *@This()) ?u8 {
+        if (self.pending_stream_count == 0) {
+            return null;
+        }
+
+        var pending_index_best: u8 = 0;
+        var pending_index: u8 = 1;
+        while (pending_index < self.pending_stream_count) : (pending_index += 1) {
+            const candidate_index = self.pending_stream_slots[pending_index];
+            const current_index = self.pending_stream_slots[pending_index_best];
+            if (self.stream_has_higher_precedence(candidate_index, current_index)) {
+                pending_index_best = pending_index;
             }
         }
-        return stream_id;
+
+        const stream_index = self.pending_stream_slots[pending_index_best];
+        self.pending_stream_queued[stream_index] = false;
+
+        pending_index = pending_index_best + 1;
+        while (pending_index < self.pending_stream_count) : (pending_index += 1) {
+            self.pending_stream_slots[pending_index - 1] = self.pending_stream_slots[pending_index];
+        }
+        self.pending_stream_count -= 1;
+        assert(self.stream_slots[stream_index].schedule_count < std.math.maxInt(u32));
+        self.stream_slots[stream_index].schedule_count += 1;
+        self.stream_slots[stream_index].schedule_epoch_last = self.schedule_epoch_next;
+        self.schedule_epoch_next += 1;
+        return stream_index;
+    }
+
+    fn pendingStreamRemove(self: *@This(), stream_index: u8) void {
+        assert(stream_index < max_streams_per_connection);
+
+        if (!self.pending_stream_queued[stream_index]) {
+            return;
+        }
+
+        var pending_index: u8 = 0;
+        while (pending_index < self.pending_stream_count) : (pending_index += 1) {
+            if (self.pending_stream_slots[pending_index] != stream_index) continue;
+
+            var shift_index = pending_index + 1;
+            while (shift_index < self.pending_stream_count) : (shift_index += 1) {
+                self.pending_stream_slots[shift_index - 1] = self.pending_stream_slots[shift_index];
+            }
+
+            self.pending_stream_count -= 1;
+            self.pending_stream_queued[stream_index] = false;
+            return;
+        }
+
+        unreachable;
+    }
+
+    fn releaseClosedStream(self: *@This(), stream_index: u8) void {
+        assert(stream_index < max_streams_per_connection);
+        assert(self.stream_slots_in_use[stream_index]);
+
+        const stream = &self.stream_slots[stream_index];
+        const stream_id = stream.id;
+
+        self.pendingStreamRemove(stream_index);
+        stream.deinit();
+        self.stream_slot_ids[stream_index] = 0;
+        self.stream_slots_in_use[stream_index] = false;
+        log.debug("Released closed stream {d}\n", .{stream_id});
+    }
+
+    fn queueStreamIfReady(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
+        if (stream.state != .HalfClosedRemote) {
+            return;
+        }
+        if (!stream.request_complete) {
+            return;
+        }
+        if (!stream.request_headers_complete) {
+            return;
+        }
+        if (stream.expecting_continuation) {
+            return;
+        }
+        if (stream.response_body_sent >= default_response_body.len) {
+            return;
+        }
+
+        const stream_index = self.streamFindIndex(stream.id) orelse unreachable;
+        try self.pendingStreamPush(stream_index);
+    }
+
+    pub fn takeCompletedResponses(self: *@This()) u32 {
+        const completed_responses = self.completed_responses_pending;
+        self.completed_responses_pending = 0;
+        return completed_responses;
+    }
+
+    fn streamAllocate(self: *@This(), stream_id: u32) !*DefaultStream.StreamInstance {
+        assert(stream_id > 0);
+
+        for (self.stream_slots, 0..) |*stream_slot, stream_index| {
+            if (self.stream_slots_in_use[stream_index]) continue;
+
+            self.stream_slot_ids[stream_index] = stream_id;
+            self.stream_slots_in_use[stream_index] = true;
+            stream_slot.init(self, stream_id);
+            if (self.pending_priority_update_take(stream_id)) |priority| {
+                stream_slot.applyPriority(priority);
+            }
+            return stream_slot;
+        }
+
+        return error.MaxConcurrentStreamsExceeded;
     }
     /// Sends a RST_STREAM frame for a given stream ID with the specified error code.
     pub fn send_rst_stream(self: *@This(), stream_id: u32, error_code: u32) !void {
@@ -461,13 +850,14 @@ pub const Connection = struct {
             .goaway => try self.handleGoawayFrameOptimized(frame),
             .window_update => try self.handleWindowUpdateFrameOptimized(frame),
             .continuation => try self.handleContinuationFrameOptimized(frame),
+            .priority_update => try self.handlePriorityUpdateFrameOptimized(frame),
         }
     }
     fn handleDataFrameOptimized(self: *@This(), frame: Frame) !void {
         if (frame.header.stream_id == 0) {
             return self.sendGoawayAndClose(0x1, "DATA frame on stream 0");
         }
-        const stream = self.streams.get(frame.header.stream_id) orelse {
+        const stream = self.streamFind(frame.header.stream_id) orelse {
             return self.send_rst_stream(frame.header.stream_id, 0x5); // STREAM_CLOSED
         };
 
@@ -496,8 +886,14 @@ pub const Connection = struct {
         if (frame.header.stream_id == 0) {
             return self.sendGoawayAndClose(0x1, "PRIORITY frame on stream 0");
         }
+
+        if (!priority_frame_payload_has_valid_size(frame)) {
+            try self.send_priority_frame_size_error();
+            return;
+        }
+
         // Priority frames are always safe to ignore if stream doesn't exist
-        if (self.streams.get(frame.header.stream_id)) |stream| {
+        if (self.streamFind(frame.header.stream_id)) |stream| {
             try stream.handleFrame(frame);
         }
     }
@@ -505,7 +901,7 @@ pub const Connection = struct {
         if (frame.header.stream_id == 0) {
             return self.sendGoawayAndClose(0x1, "RST_STREAM frame on stream 0");
         }
-        if (self.streams.get(frame.header.stream_id)) |stream| {
+        if (self.streamFind(frame.header.stream_id)) |stream| {
             stream.state = .Closed;
             try self.mark_stream_closed(frame.header.stream_id);
         }
@@ -554,16 +950,86 @@ pub const Connection = struct {
         if (frame.header.stream_id != expected_stream) {
             return self.sendGoawayAndClose(0x1, "CONTINUATION frame on wrong stream");
         }
-        const stream = self.streams.get(frame.header.stream_id) orelse {
+        const stream = self.streamFind(frame.header.stream_id) orelse {
             return self.send_rst_stream(frame.header.stream_id, 0x5);
         };
         try stream.handleFrame(frame);
+    }
+
+    fn handlePriorityUpdateFrameOptimized(self: *@This(), frame: Frame) !void {
+        try self.handle_priority_update_frame(frame);
     }
 
     fn sendGoawayAndClose(self: *@This(), error_code: u32, debug_msg: []const u8) !void {
         if (!self.goaway_sent) {
             try self.send_goaway(self.last_stream_id, error_code, debug_msg);
             self.goaway_sent = true;
+        }
+    }
+
+    fn priority_frame_payload_has_valid_size(frame: Frame) bool {
+        assert(frame.header.frame_type == FrameType.PRIORITY);
+        assert(frame.header.length == frame.payload.len);
+
+        return frame.payload.len == priority_frame_payload_size;
+    }
+
+    fn send_priority_frame_size_error(self: *@This()) !void {
+        try self.sendGoawayAndClose(0x6, "Frame size error: FRAME_SIZE_ERROR");
+    }
+
+    fn handle_priority_update_frame(self: *@This(), frame: Frame) !void {
+        if (frame.header.stream_id != 0) {
+            return self.sendGoawayAndClose(0x1, "PRIORITY_UPDATE frame on non-zero stream");
+        }
+        if (frame.payload.len < priority_update_payload_id_size + 1) {
+            return self.sendGoawayAndClose(
+                0x1,
+                "Invalid PRIORITY_UPDATE payload: PROTOCOL_ERROR",
+            );
+        }
+
+        const prioritized_stream_id_raw = std.mem.readInt(
+            u32,
+            frame.payload[0..priority_update_payload_id_size],
+            .big,
+        );
+        const prioritized_stream_id = prioritized_stream_id_raw & 0x7FFFFFFF;
+        if (prioritized_stream_id == 0) {
+            return self.sendGoawayAndClose(
+                0x1,
+                "PRIORITY_UPDATE with prioritized stream ID 0: PROTOCOL_ERROR",
+            );
+        }
+        if ((prioritized_stream_id & 1) == 0) {
+            return self.sendGoawayAndClose(
+                0x1,
+                "PRIORITY_UPDATE for unsupported push stream: PROTOCOL_ERROR",
+            );
+        }
+
+        const priority = HttpPriority.parse(
+            frame.payload[priority_update_payload_id_size..],
+        ) catch {
+            return self.sendGoawayAndClose(
+                0x1,
+                "Invalid PRIORITY_UPDATE field value: PROTOCOL_ERROR",
+            );
+        };
+
+        if (self.streamFind(prioritized_stream_id)) |stream| {
+            switch (stream.state) {
+                .HalfClosedLocal, .Closed => return,
+                else => {},
+            }
+
+            stream.applyPriority(priority);
+            return;
+        }
+
+        if (prioritized_stream_id > self.last_stream_id) {
+            try self.pending_priority_update_store(prioritized_stream_id, priority);
+            return;
         }
     }
 
@@ -708,22 +1174,32 @@ pub const Connection = struct {
         }
     }
     pub fn flush_ready_streams(self: *@This()) !void {
-        if (!self.goaway_sent) {
-            var streams_iterator = self.streams.iterator();
-            while (streams_iterator.next()) |entry| {
-                const stream = entry.value_ptr.*;
-                if (!stream.request_complete) {
-                    continue;
-                }
-                if (stream.state != .HalfClosedRemote) {
-                    continue;
-                }
-
-                try self.process_request(stream);
-            }
+        if (self.goaway_sent) {
+            return;
         }
 
-        try self.process_pending_streams();
+        while (self.pendingStreamPop()) |stream_index| {
+            if (!self.stream_slots_in_use[stream_index]) {
+                continue;
+            }
+
+            const stream = &self.stream_slots[stream_index];
+            const response_body_sent_before = stream.response_body_sent;
+
+            try self.process_request(stream);
+
+            if (stream.state == .Closed) {
+                self.releaseClosedStream(stream_index);
+                continue;
+            }
+
+            if (stream.response_body_sent < default_response_body.len) {
+                try self.pendingStreamPush(stream_index);
+                if (stream.response_body_sent == response_body_sent_before) {
+                    break;
+                }
+            }
+        }
     }
 
     /// Handle connection-level frame during settings phase
@@ -833,9 +1309,9 @@ pub const Connection = struct {
         self.last_stream_id = last_stream_id;
 
         // If we've also sent GOAWAY, or if there are no active streams, close the connection
-        if (self.goaway_sent or self.streams.count() == 0) {
+        if (self.goaway_sent or self.active_stream_count() == 0) {
             self.connection_closed = true;
-            log.debug("Connection marked for closure after GOAWAY (goaway_sent: {}, active_streams: {})\n", .{ self.goaway_sent, self.streams.count() });
+            log.debug("Connection marked for closure after GOAWAY (goaway_sent: {}, active_streams: {})\n", .{ self.goaway_sent, self.active_stream_count() });
         }
 
         return;
@@ -886,10 +1362,15 @@ pub const Connection = struct {
 
     fn handle_stream_level_frame_validate_size(self: *@This(), frame: Frame) !void {
         switch (frame.header.frame_type) {
+            .PRIORITY => {
+                if (!priority_frame_payload_has_valid_size(frame)) {
+                    try self.send_priority_frame_size_error();
+                    return error.FrameSizeError;
+                }
+            },
             .RST_STREAM => {
                 if (frame.payload.len != 4) {
-                    try self.send_goaway(self.last_stream_id, 0x6, "Frame size error: FRAME_SIZE_ERROR");
-                    self.goaway_sent = true;
+                    try self.sendGoawayAndClose(0x6, "Frame size error: FRAME_SIZE_ERROR");
                     return error.FrameSizeError;
                 }
             },
@@ -899,7 +1380,11 @@ pub const Connection = struct {
 
     /// Check if frame is being sent to a closed stream
     fn handle_stream_level_frame_check_closed_stream(self: *@This(), frame: Frame) !bool {
-        if (!self.closed_stream_ids.contains(frame.header.stream_id)) {
+        if (self.streamFind(frame.header.stream_id) != null) {
+            return false;
+        }
+
+        if (frame.header.stream_id > self.last_stream_id) {
             return false;
         }
 
@@ -924,14 +1409,8 @@ pub const Connection = struct {
         if (frame.header.frame_type != FrameType.PRIORITY) {
             return false;
         }
-        if (self.streams.contains(frame.header.stream_id)) {
+        if (self.streamFind(frame.header.stream_id) != null) {
             return false;
-        }
-
-        if (frame.payload.len != 5) {
-            try self.send_goaway(self.last_stream_id, 0x6, "Frame size error: FRAME_SIZE_ERROR");
-            self.goaway_sent = true;
-            return error.FrameSizeError;
         }
 
         const stream_dependency_raw = std.mem.readInt(u32, frame.payload[0..4], .big);
@@ -979,6 +1458,14 @@ pub const Connection = struct {
 
             try self.handle_stream_level_frame_process_error(frame.header.stream_id, err);
         };
+
+        if (stream.state == .Closed) {
+            const stream_index = self.streamFindIndex(stream.id) orelse unreachable;
+            self.releaseClosedStream(stream_index);
+            return;
+        }
+
+        try self.queueStreamIfReady(stream);
     }
 
     /// Handle specific stream processing errors
@@ -1035,23 +1522,6 @@ pub const Connection = struct {
             }
         }
     }
-    fn process_pending_streams(self: *@This()) !void {
-        var to_remove: std.ArrayList(u32) = .{};
-        defer to_remove.deinit(self.allocator);
-        var it = self.streams.iterator();
-        while (it.next()) |entry| {
-            const stream = entry.value_ptr.*;
-            if (stream.state == .Closed) {
-                try to_remove.append(self.allocator, entry.key_ptr.*);
-            }
-        }
-        // Remove the closed streams from the map and track them as closed
-        for (to_remove.items) |stream_id| {
-            _ = self.streams.remove(stream_id);
-            try self.closed_stream_ids.put(stream_id, {});
-            log.debug("Marked stream {d} as closed\n", .{stream_id});
-        }
-    }
     fn handle_connection_level_frame(self: *@This(), frame: Frame) !void {
         if (!is_valid_frame_type(@intFromEnum(frame.header.frame_type))) {
             // Unknown frame type, ignore as per RFC 7540 Section 5.5
@@ -1082,6 +1552,9 @@ pub const Connection = struct {
             },
             FrameType.GOAWAY => {
                 try handle_goaway_frame(self, frame);
+            },
+            FrameType.PRIORITY_UPDATE => {
+                try self.handle_priority_update_frame(frame);
             },
             else => {
                 // Ignore unknown connection-level frame types as per RFC 7540 Section 6
@@ -1162,6 +1635,9 @@ pub const Connection = struct {
     }
 
     pub fn process_request(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
+        assert(stream.request_complete);
+        assert(stream.request_headers_complete);
+        assert(!stream.expecting_continuation);
         log.debug("Processing request for stream ID: {d}, state: {s}", .{ stream.id, @tagName(stream.state) });
         try self.process_request_send_headers(stream);
         try self.process_request_send_body(stream);
@@ -1210,6 +1686,12 @@ pub const Connection = struct {
         try stream.sendData(default_response_body[response_start..response_end], end_stream);
         self.send_window_size -= @intCast(response_len);
         stream.response_body_sent = response_end;
+
+        if (end_stream) {
+            assert(stream.state == .Closed);
+            assert(self.completed_responses_pending < std.math.maxInt(u32));
+            self.completed_responses_pending += 1;
+        }
     }
     fn connection_response_window_available(window_size: i32) usize {
         if (window_size > 0) {
@@ -1224,6 +1706,7 @@ pub const Connection = struct {
             .{ 4, self.settings.initial_window_size }, // INITIAL_WINDOW_SIZE
             .{ 5, self.settings.max_frame_size }, // MAX_FRAME_SIZE
             .{ 6, self.settings.max_header_list_size }, // MAX_HEADER_LIST_SIZE
+            .{ settings_no_rfc7540_priorities_id, @intFromBool(self.settings.no_rfc7540_priorities) },
         };
         // Define the settings frame header
         var frame_header = FrameHeader{
@@ -1246,6 +1729,8 @@ pub const Connection = struct {
     }
 
     pub fn receive_frame_arena(self: *@This()) !Frame {
+        assert(self.frame_arena_available);
+
         var header_buf: [9]u8 = undefined;
         // Read the frame header (9 bytes) in a loop to handle partial reads
         var header_read: usize = 0;
@@ -1413,6 +1898,7 @@ pub const Connection = struct {
         const buffer = frame.payload;
         const buffer_size_u32: u32 = @intCast(buffer.len);
         var index: u32 = 0;
+        var no_rfc7540_priorities: ?bool = null;
 
         while (index + 6 <= buffer_size_u32) {
             const setting_id_ptr: *const [2]u8 = @ptrCast(&buffer[index]);
@@ -1421,9 +1907,20 @@ pub const Connection = struct {
             const setting_value_ptr: *const [4]u8 = @ptrCast(&buffer[index + 2]);
             const setting_value = std.mem.readInt(u32, setting_value_ptr, .big);
 
-            try self.apply_frame_settings_process_single_parameter(setting_id, setting_value);
+            if (setting_id == settings_no_rfc7540_priorities_id) {
+                no_rfc7540_priorities = try self.apply_frame_settings_parse_no_rfc7540_priorities(
+                    setting_value,
+                );
+            } else {
+                try self.apply_frame_settings_process_single_parameter(setting_id, setting_value);
+            }
             index += 6;
         }
+
+        try self.apply_frame_settings_finalize_no_rfc7540_priorities(
+            no_rfc7540_priorities,
+        );
+        self.peer_first_settings_received = true;
     }
 
     /// Process a single SETTINGS parameter
@@ -1436,6 +1933,61 @@ pub const Connection = struct {
             5 => try self.apply_frame_settings_max_frame_size(setting_value),
             6 => self.apply_frame_settings_max_header_list_size(setting_value),
             else => {},
+        }
+    }
+
+    fn apply_frame_settings_parse_no_rfc7540_priorities(
+        self: *@This(),
+        value: u32,
+    ) !bool {
+        if (value == 0) {
+            return false;
+        }
+        if (value == 1) {
+            return true;
+        }
+
+        if (!self.goaway_sent) {
+            try self.send_goaway(
+                0,
+                0x1,
+                "Invalid SETTINGS_NO_RFC7540_PRIORITIES value: PROTOCOL_ERROR",
+            );
+            self.goaway_sent = true;
+        }
+        return error.ProtocolError;
+    }
+
+    fn apply_frame_settings_finalize_no_rfc7540_priorities(
+        self: *@This(),
+        value: ?bool,
+    ) !void {
+        if (!self.peer_first_settings_received) {
+            if (value) |setting_value| {
+                self.peer_no_rfc7540_priorities = setting_value;
+                self.peer_no_rfc7540_priorities_setting_received = true;
+            }
+            return;
+        }
+
+        if (value == null) {
+            return;
+        }
+        if (!self.peer_no_rfc7540_priorities_setting_received) {
+            try self.sendGoawayAndClose(
+                0x1,
+                "SETTINGS_NO_RFC7540_PRIORITIES changed: PROTOCOL_ERROR",
+            );
+            return error.ProtocolError;
+        }
+
+        const setting_value = value.?;
+        if (self.peer_no_rfc7540_priorities != setting_value) {
+            try self.sendGoawayAndClose(
+                0x1,
+                "SETTINGS_NO_RFC7540_PRIORITIES changed: PROTOCOL_ERROR",
+            );
+            return error.ProtocolError;
         }
     }
 
@@ -1487,9 +2039,8 @@ pub const Connection = struct {
 
     /// Update all stream window sizes when initial window size changes
     fn apply_frame_settings_update_stream_windows(self: *@This(), window_delta: i32) !void {
-        var streams_iterator = self.streams.iterator();
-        while (streams_iterator.next()) |entry| {
-            const stream = entry.value_ptr.*;
+        for (self.stream_slots, self.stream_slots_in_use) |*stream, in_use| {
+            if (!in_use) continue;
             const new_window_size: i64 = @as(i64, stream.send_window_size) + @as(i64, window_delta);
             if (new_window_size < std.math.minInt(i32)) {
                 log.err("Stream window size underflow on stream {d}: FLOW_CONTROL_ERROR\n", .{stream.id});
@@ -1570,6 +2121,7 @@ pub const Connection = struct {
                 4 => self.settings.initial_window_size = value,
                 5 => self.settings.max_frame_size = value,
                 6 => self.settings.max_header_list_size = value,
+                settings_no_rfc7540_priorities_id => self.settings.no_rfc7540_priorities = value == 1,
                 else => {},
             }
             i += 6;
@@ -1577,18 +2129,18 @@ pub const Connection = struct {
     }
     /// Sends a GOAWAY frame with the given parameters.
     pub fn send_goaway(self: *@This(), last_stream_id: u32, error_code: u32, debug_data: []const u8) !void {
-        const payload_size = 8 + debug_data.len;
+        const debug_data_max = 96;
+        const debug_data_len = @min(debug_data.len, debug_data_max);
+        const payload_size = 8 + debug_data_len;
         assert(payload_size > 0);
-        var payload = self.allocator.alloc(u8, payload_size) catch |err| {
-            log.err("Failed to allocate memory for GOAWAY frame payload: {s}\n", .{@errorName(err)});
-            return err;
-        };
-        defer self.allocator.free(payload);
+
+        var payload: [8 + debug_data_max]u8 = undefined;
         std.mem.writeInt(u32, payload[0..4], last_stream_id & 0x7FFFFFFF, .big);
         std.mem.writeInt(u32, payload[4..8], error_code, .big);
-        if (debug_data.len > 0) {
-            std.mem.copyForwards(u8, payload[8..], debug_data);
+        if (debug_data_len > 0) {
+            std.mem.copyForwards(u8, payload[8 .. 8 + debug_data_len], debug_data[0..debug_data_len]);
         }
+
         var goaway_frame = Frame{
             .header = FrameHeader{
                 .length = @intCast(payload_size),
@@ -1597,7 +2149,7 @@ pub const Connection = struct {
                 .reserved = false,
                 .stream_id = 0,
             },
-            .payload = payload,
+            .payload = payload[0..payload_size],
         };
         try goaway_frame.write(self.writer);
         self.goaway_sent = true;
@@ -1608,20 +2160,12 @@ pub const Connection = struct {
         }
         // Mark as closed to prevent double-closing
         self.connection_closed = true;
-        // Determine the highest stream ID that was processed
-        var stream_id: u32 = 0;
-        var it = self.streams.iterator();
-        while (it.next()) |entry| {
-            if (entry.key_ptr.* > stream_id) {
-                stream_id = entry.key_ptr.*;
-            }
-        }
         // Error code 0 indicates graceful shutdown
         const error_code: u32 = 0; // 0: NO_ERROR, indicating graceful shutdown
         const debug_data = "Connection closing: graceful shutdown";
         // Send the GOAWAY frame with the highest stream ID and debug information
         if (!self.goaway_sent) {
-            self.send_goaway(stream_id, error_code, debug_data) catch |err| {
+            self.send_goaway(self.highest_stream_id(), error_code, debug_data) catch |err| {
                 log.debug("Failed to send GOAWAY frame: {any}\n", .{err});
             };
         }
@@ -1635,7 +2179,7 @@ pub const Connection = struct {
             return error.ProtocolError;
         }
         // Check if the stream already exists
-        if (self.streams.get(stream_id)) |stream| {
+        if (self.streamFind(stream_id)) |stream| {
             return stream;
         } else {
             // Enforce the max concurrent streams limit
@@ -1652,13 +2196,12 @@ pub const Connection = struct {
             // Update the last processed stream ID
             self.last_stream_id = stream_id;
             // Initialize a new stream in-place
-            const new_stream = DefaultStream.init(self.allocator, self, stream_id) catch |err| {
+            const new_stream = self.streamAllocate(stream_id) catch |err| {
                 log.err("Failed to initialize stream {d}: {s}\n", .{ stream_id, @errorName(err) });
                 return err;
             };
             new_stream.send_window_size = @intCast(self.settings.initial_window_size);
             new_stream.initial_window_size = self.settings.initial_window_size;
-            try self.streams.put(stream_id, new_stream);
             return new_stream;
         }
     }
@@ -1779,10 +2322,12 @@ pub const Connection = struct {
 const Settings = struct {
     header_table_size: u32 = 4096,
     enable_push: bool = true,
-    max_concurrent_streams: u32 = 5,
+    max_concurrent_streams: u32 = max_streams_per_connection,
     initial_window_size: u32 = 65535,
     max_frame_size: u32 = 16384,
     max_header_list_size: u32 = 8192,
+    no_rfc7540_priorities: bool = true,
+
     pub fn default() Settings {
         return Settings{};
     }
@@ -1791,7 +2336,11 @@ const Settings = struct {
 /// Note: WINDOW_UPDATE can be both connection-level and stream-level depending on stream ID.
 fn is_connection_level_frame(frame_type: u8) bool {
     return switch (frame_type) {
-        @intFromEnum(FrameType.SETTINGS), @intFromEnum(FrameType.PING), @intFromEnum(FrameType.GOAWAY) => true,
+        @intFromEnum(FrameType.SETTINGS),
+        @intFromEnum(FrameType.PING),
+        @intFromEnum(FrameType.GOAWAY),
+        @intFromEnum(FrameType.PRIORITY_UPDATE),
+        => true,
         else => false,
     };
 }
@@ -1818,6 +2367,7 @@ fn is_valid_flags(header: FrameHeader) bool {
         FrameType.GOAWAY => 0,
         FrameType.WINDOW_UPDATE => 0,
         FrameType.CONTINUATION => FrameFlags.END_HEADERS,
+        FrameType.PRIORITY_UPDATE => 0,
         else => 0, // Unknown frame types have no allowed flags
     };
     // Return true if no invalid flags are set
@@ -1827,17 +2377,11 @@ test "HTTP/2 connection initialization and flow control" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var buffer: [8192]u8 = undefined;
-    var buffer_stream = std.io.fixedBufferStream(&buffer);
-    var legacy_reader = buffer_stream.reader();
-    var read_adapter = legacy_reader.adaptToNewApi(&.{});
-    var legacy_writer = buffer_stream.writer();
-    var write_adapter = legacy_writer.adaptToNewApi(&.{});
+    var test_io = TestIo.init(&.{}, &buffer);
     const allocator = arena.allocator();
-    var connection = try Connection.init(allocator, &read_adapter.new_interface, &write_adapter.new_interface, false); // Use client mode to avoid preface reading
-    // Initialize stream
+    var connection = try Connection.init(allocator, &test_io.reader, &test_io.writer, false);
     var stream = try DefaultStream.init(allocator, &connection, 1);
-    const preface_written_data = buffer_stream.getWritten();
-    // Encode headers using Hpack.encodeHeaderField (request headers for client)
+    const preface_written_data = test_io.written();
     const request_headers = [_]Hpack.HeaderField{
         .{ .name = ":method", .value = "GET" },
         .{ .name = ":path", .value = "/" },
@@ -1862,58 +2406,46 @@ test "HTTP/2 connection initialization and flow control" {
         .payload = headers_payload,
     };
     try stream.handleFrame(headers_frame);
-    // Check if headers were written
-    const headers_written_data = buffer_stream.getWritten();
-    // Ensure headers frame was actually written
+    try connection.process_request_send_headers(stream);
+    const headers_written_data = test_io.written();
     assert(headers_written_data.len > preface_written_data.len);
-    // Send data
     const data = "Hello, world!";
     try connection.send_data(stream, data, false);
-    const written_data = buffer_stream.getWritten();
-    // Verify response was written (should include preface + settings + response headers + response data)
-    const preface_length = 24; // 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n' is 24 bytes
-    const settings_frame_length = 39; // As per debug output
-    const min_expected_length = preface_length + settings_frame_length + 40; // At least preface + settings + some response
-    assert(written_data.len >= min_expected_length); // Should include server response
-    // Clear buffer for next operations
-    buffer_stream.reset();
-    // Check that data was sent after reset
+    const written_data = test_io.written();
+    const preface_length = 24;
+    const settings_frame_length = 39;
+    const min_expected_length = preface_length + settings_frame_length + 40;
+    assert(written_data.len >= min_expected_length);
+    test_io.resetWriter(&buffer);
     const data_after_reset = "Hello again!";
     try connection.send_data(stream, data_after_reset, false);
-    const sent_data = buffer_stream.getWritten();
+    const sent_data = test_io.written();
     assert(sent_data.len > 0);
-    // Simulate receiving a WINDOW_UPDATE frame to increase send window size
     const window_update_frame = Frame{
         .header = FrameHeader{
             .length = 4,
             .frame_type = FrameType.WINDOW_UPDATE,
             .flags = FrameFlags.init(0),
             .reserved = false,
-            .stream_id = 0, // Connection-level window update
+            .stream_id = 0,
         },
         .payload = &[_]u8{ 0x00, 0x00, 0x01, 0x00 },
     };
     try connection.handle_window_update(window_update_frame);
-    // After handling WINDOW_UPDATE, we should be able to send more data
     try connection.send_data(stream, data_after_reset, false);
-    const sent_data_after_window_update = buffer_stream.getWritten();
+    const sent_data_after_window_update = test_io.written();
     assert(sent_data_after_window_update.len > sent_data.len);
 }
 test "apply_frame_settings test" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var buffer: [4096]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buffer);
-    var legacy_reader = stream.reader();
-    var read_adapter = legacy_reader.adaptToNewApi(&.{});
-    var legacy_writer = stream.writer();
-    var write_adapter = legacy_writer.adaptToNewApi(&.{});
+    var test_io = TestIo.init(&.{}, &buffer);
     const alloc = arena.allocator();
-    var connection = try Connection.init(alloc, &read_adapter.new_interface, &write_adapter.new_interface, false);
-    // Frame with the SETTINGS type and 18 bytes of payload
+    var connection = try Connection.init(alloc, &test_io.reader, &test_io.writer, false);
     const frame = Frame{
         .header = FrameHeader{
-            .length = 18, // 3 settings of 6 bytes each
+            .length = 18,
             .frame_type = FrameType.SETTINGS,
             .flags = FrameFlags.init(0),
             .reserved = false,
@@ -1933,19 +2465,50 @@ test "apply_frame_settings test" {
     try std.testing.expect(connection.settings.max_concurrent_streams == 100);
     try std.testing.expect(connection.settings.initial_window_size == 65535);
 }
+
+test "default settings stream" {
+    const settings = Settings.default();
+
+    try std.testing.expectEqual(@as(u32, 100), settings.max_concurrent_streams);
+    try std.testing.expectEqual(max_streams_per_connection, settings.max_concurrent_streams);
+    try std.testing.expect(settings.no_rfc7540_priorities);
+}
+
+test "stream allocation matches fixed concurrent stream capacity" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const alloc = arena.allocator();
+    var connection = try Connection.init(
+        alloc,
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+
+    var stream_index: u32 = 0;
+    while (stream_index < max_streams_per_connection) : (stream_index += 1) {
+        const stream_id = stream_index * 2 + 1;
+        _ = try connection.streamAllocate(stream_id);
+    }
+
+    const overflow_stream_id = max_streams_per_connection * 2 + 1;
+    try std.testing.expectError(
+        error.MaxConcurrentStreamsExceeded,
+        connection.streamAllocate(overflow_stream_id),
+    );
+}
+
 test "send HEADERS and DATA frames with proper flow" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var buffer: [8192]u8 = undefined;
-    var buffer_stream = std.io.fixedBufferStream(&buffer);
-    var legacy_reader = buffer_stream.reader();
-    var read_adapter = legacy_reader.adaptToNewApi(&.{});
-    var legacy_writer = buffer_stream.writer();
-    var write_adapter = legacy_writer.adaptToNewApi(&.{});
+    var test_io = TestIo.init(&.{}, &buffer);
     const allocator = arena.allocator();
-    var connection = try Connection.init(allocator, &read_adapter.new_interface, &write_adapter.new_interface, false);
+    var connection = try Connection.init(allocator, &test_io.reader, &test_io.writer, false);
     var stream = try DefaultStream.init(allocator, &connection, 1);
-    // Send a HEADERS frame with valid header block
     const headers_payload = [_]u8{ 0x82, 0x86, 0x84, 0x81 }; // :method GET, :scheme http, :path /, :authority
     const headers_frame = Frame{
         .header = FrameHeader{
@@ -1959,38 +2522,26 @@ test "send HEADERS and DATA frames with proper flow" {
         },
         .payload = &headers_payload,
     };
-    // Handle HEADERS frame
     try stream.handleFrame(headers_frame);
-    // Check that the HEADERS frame was processed before continuing
-    const headers_written_data = buffer_stream.getWritten();
+    const headers_written_data = test_io.written();
     assert(headers_written_data.len > 0);
-    // Now send the DATA frame only after ensuring the HEADERS frame was handled
     const data = "Hello, world!";
     try connection.send_data(stream, data, false);
-    const written_data = buffer_stream.getWritten();
+    const written_data = test_io.written();
     assert(written_data.len > headers_written_data.len);
 }
 test "send RST_STREAM frame with correct frame_type" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     var buffer: [1024]u8 = undefined;
-    var buffer_stream = std.io.fixedBufferStream(&buffer);
-    var legacy_reader = buffer_stream.reader();
-    var read_adapter = legacy_reader.adaptToNewApi(&.{});
-    var legacy_writer = buffer_stream.writer();
-    var write_adapter = legacy_writer.adaptToNewApi(&.{});
+    var test_io = TestIo.init(&.{}, &buffer);
     const allocator = arena.allocator();
-    var connection = try Connection.init(allocator, &read_adapter.new_interface, &write_adapter.new_interface, false);
+    var connection = try Connection.init(allocator, &test_io.reader, &test_io.writer, false);
     var stream = try DefaultStream.init(allocator, &connection, 1);
-    // Get initial buffer position (after preface and settings)
-    const initial_pos = buffer_stream.getWritten().len;
-    // Send RST_STREAM
-    try stream.sendRstStream(0x1); // PROTOCOL_ERROR
-    // Check the buffer to ensure frame_type is 3
-    const written_data = buffer_stream.getWritten();
-    // Frame header is 9 bytes: length (3), type (1), flags (1), stream_id (4)
-    // RST_STREAM frame starts at initial_pos, so frame type is at initial_pos + 3
-    try std.testing.expectEqual(written_data[initial_pos + 3], 3); // frame_type = 3 for RST_STREAM
+    const initial_pos = test_io.written().len;
+    try stream.sendRstStream(0x1);
+    const written_data = test_io.written();
+    try std.testing.expectEqual(written_data[initial_pos + 3], 3);
 }
 
 test "default response headers block decodes without dynamic table churn" {
@@ -2023,4 +2574,358 @@ test "default response headers block decodes without dynamic table churn" {
 
     try std.testing.expectEqual(default_response_headers_block.len, offset);
     try std.testing.expectEqual(@as(usize, 0), dynamic_table.count);
+}
+
+test "flush_ready_streams reports completed responses once" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(
+        allocator,
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+
+    const stream = try connection.get_stream(1);
+    stream.state = .HalfClosedRemote;
+    stream.request_headers_complete = true;
+    stream.request_complete = true;
+
+    try connection.queueStreamIfReady(stream);
+    try connection.flush_ready_streams();
+
+    try std.testing.expectEqual(@as(u32, 1), connection.takeCompletedResponses());
+    try std.testing.expectEqual(@as(u32, 0), connection.takeCompletedResponses());
+}
+
+test "flush_ready_streams does not respond before END_HEADERS" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(allocator, &test_io.reader, &test_io.writer, false);
+    const initial_written_len = test_io.written().len;
+
+    const fragmented_headers = Frame{
+        .header = .{
+            .length = 1,
+            .frame_type = .HEADERS,
+            .flags = FrameFlags.init(FrameFlags.END_STREAM),
+            .reserved = false,
+            .stream_id = 1,
+        },
+        .payload = &[_]u8{0x82},
+    };
+
+    try connection.handleFrameEventDriven(fragmented_headers);
+
+    const stream = try connection.get_stream(1);
+    try std.testing.expectEqual(@as(?u32, 1), connection.expecting_continuation_stream_id);
+    try std.testing.expect(stream.state == .HalfClosedRemote);
+    try std.testing.expect(!stream.request_headers_complete);
+    try std.testing.expect(!stream.request_complete);
+    try std.testing.expect(!stream.response_headers_sent);
+
+    try connection.flush_ready_streams();
+
+    try std.testing.expectEqual(initial_written_len, test_io.written().len);
+    try std.testing.expect(!stream.response_headers_sent);
+    try std.testing.expectEqual(@as(u32, 0), connection.takeCompletedResponses());
+}
+
+test "send_settings advertises SETTINGS_NO_RFC7540_PRIORITIES in first SETTINGS frame" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    _ = try Connection.init(
+        allocator,
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+
+    const written = test_io.written();
+    const settings_offset = http2_preface.len;
+    try std.testing.expectEqual(
+        @as(u8, @intFromEnum(FrameType.SETTINGS)),
+        written[settings_offset + 3],
+    );
+
+    const payload_length = (@as(u32, written[settings_offset + 0]) << 16) |
+        (@as(u32, written[settings_offset + 1]) << 8) |
+        @as(u32, written[settings_offset + 2]);
+    try std.testing.expectEqual(@as(u32, 36), payload_length);
+
+    var setting_offset: usize = settings_offset + 9;
+    const settings_end = setting_offset + payload_length;
+    var saw_setting = false;
+    while (setting_offset < settings_end) : (setting_offset += 6) {
+        const setting_id = std.mem.readInt(u16, written[setting_offset..][0..2], .big);
+        const setting_value = std.mem.readInt(u32, written[setting_offset + 2 ..][0..4], .big);
+        if (setting_id != settings_no_rfc7540_priorities_id) {
+            continue;
+        }
+
+        saw_setting = true;
+        try std.testing.expectEqual(@as(u32, 1), setting_value);
+    }
+
+    try std.testing.expect(saw_setting);
+}
+
+test "PRIORITY_UPDATE buffers idle stream priority until stream opens" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(
+        allocator,
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+
+    const priority_update_payload = "\x00\x00\x00\x01u=0, i";
+    const priority_update_frame = Frame{
+        .header = .{
+            .length = priority_update_payload.len,
+            .frame_type = .PRIORITY_UPDATE,
+            .flags = FrameFlags.init(0),
+            .reserved = false,
+            .stream_id = 0,
+        },
+        .payload = priority_update_payload,
+    };
+
+    try connection.handle_priority_update_frame(priority_update_frame);
+    const stream = try connection.get_stream(1);
+
+    try std.testing.expectEqual(@as(u8, 0), stream.priority.urgency);
+    try std.testing.expect(stream.priority.incremental);
+    try std.testing.expect(stream.priority_update_received);
+}
+
+test "PRIORITY_UPDATE with prioritized stream ID zero sends PROTOCOL_ERROR" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(
+        allocator,
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+    const write_offset_before = test_io.written().len;
+
+    const invalid_payload = "\x00\x00\x00\x00u=0";
+    const invalid_frame = Frame{
+        .header = .{
+            .length = invalid_payload.len,
+            .frame_type = .PRIORITY_UPDATE,
+            .flags = FrameFlags.init(0),
+            .reserved = false,
+            .stream_id = 0,
+        },
+        .payload = invalid_payload,
+    };
+
+    try connection.handle_priority_update_frame(invalid_frame);
+    try std.testing.expect(connection.goaway_sent);
+
+    const written = test_io.written();
+    try std.testing.expect(written.len > write_offset_before + 16);
+    try std.testing.expectEqual(
+        @intFromEnum(FrameType.GOAWAY),
+        written[write_offset_before + 3],
+    );
+}
+
+test "scheduler prefers lower urgency before higher urgency" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(
+        allocator,
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+
+    const low_urgency_stream = try connection.get_stream(1);
+    low_urgency_stream.state = .HalfClosedRemote;
+    low_urgency_stream.request_headers_complete = true;
+    low_urgency_stream.request_complete = true;
+    low_urgency_stream.priority.urgency = 5;
+
+    const high_urgency_stream = try connection.get_stream(3);
+    high_urgency_stream.state = .HalfClosedRemote;
+    high_urgency_stream.request_headers_complete = true;
+    high_urgency_stream.request_complete = true;
+    high_urgency_stream.priority.urgency = 0;
+
+    try connection.queueStreamIfReady(low_urgency_stream);
+    try connection.queueStreamIfReady(high_urgency_stream);
+
+    const selected_index = connection.pendingStreamPop() orelse unreachable;
+    const selected_stream = &connection.stream_slots[selected_index];
+    try std.testing.expectEqual(@as(u32, 3), selected_stream.id);
+}
+
+test "scheduler gives same-urgency incremental streams a first turn" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [1024]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(
+        allocator,
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+
+    const incremental_stream = try connection.get_stream(1);
+    incremental_stream.state = .HalfClosedRemote;
+    incremental_stream.request_headers_complete = true;
+    incremental_stream.request_complete = true;
+    incremental_stream.priority.urgency = 2;
+    incremental_stream.priority.incremental = true;
+
+    const blocking_stream = try connection.get_stream(3);
+    blocking_stream.state = .HalfClosedRemote;
+    blocking_stream.request_headers_complete = true;
+    blocking_stream.request_complete = true;
+    blocking_stream.priority.urgency = 2;
+    blocking_stream.priority.incremental = false;
+
+    try connection.queueStreamIfReady(blocking_stream);
+    try connection.queueStreamIfReady(incremental_stream);
+
+    const first_index = connection.pendingStreamPop() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 1), connection.stream_slots[first_index].id);
+
+    try connection.pendingStreamPush(first_index);
+
+    const second_index = connection.pendingStreamPop() orelse unreachable;
+    try std.testing.expectEqual(@as(u32, 3), connection.stream_slots[second_index].id);
+}
+
+test "event-driven PRIORITY frame rejects payload lengths other than five octets" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(
+        allocator,
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+    const write_offset_before = test_io.written().len;
+
+    const invalid_priority_frame = Frame{
+        .header = .{
+            .length = 4,
+            .frame_type = .PRIORITY,
+            .flags = FrameFlags.init(0),
+            .reserved = false,
+            .stream_id = 1,
+        },
+        .payload = &[_]u8{ 0x00, 0x00, 0x00, 0x00 },
+    };
+
+    try std.testing.expectError(
+        error.FrameSizeError,
+        connection.handleFrameEventDriven(invalid_priority_frame),
+    );
+    try std.testing.expect(connection.goaway_sent);
+
+    const written = test_io.written();
+    try std.testing.expect(written.len > write_offset_before + 16);
+    try std.testing.expectEqual(
+        @intFromEnum(FrameType.GOAWAY),
+        written[write_offset_before + 3],
+    );
+    const goaway_error_code = (@as(u32, written[write_offset_before + 13]) << 24) |
+        (@as(u32, written[write_offset_before + 14]) << 16) |
+        (@as(u32, written[write_offset_before + 15]) << 8) |
+        @as(u32, written[write_offset_before + 16]);
+    try std.testing.expectEqual(
+        @as(u32, 0x6),
+        goaway_error_code,
+    );
+}
+
+test "optimized PRIORITY dispatch validates payload size before ignoring idle streams" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(
+        allocator,
+        &test_io.reader,
+        &test_io.writer,
+        false,
+    );
+    const write_offset_before = test_io.written().len;
+
+    const invalid_priority_frame = Frame{
+        .header = .{
+            .length = 4,
+            .frame_type = .PRIORITY,
+            .flags = FrameFlags.init(0),
+            .reserved = false,
+            .stream_id = 3,
+        },
+        .payload = &[_]u8{ 0x00, 0x00, 0x00, 0x00 },
+    };
+
+    try connection.dispatchFrameOptimized(invalid_priority_frame);
+    try std.testing.expect(connection.goaway_sent);
+
+    const written = test_io.written();
+    try std.testing.expect(written.len > write_offset_before + 16);
+    try std.testing.expectEqual(
+        @intFromEnum(FrameType.GOAWAY),
+        written[write_offset_before + 3],
+    );
+    const goaway_error_code = (@as(u32, written[write_offset_before + 13]) << 24) |
+        (@as(u32, written[write_offset_before + 14]) << 16) |
+        (@as(u32, written[write_offset_before + 15]) << 8) |
+        @as(u32, written[write_offset_before + 16]);
+    try std.testing.expectEqual(
+        @as(u32, 0x6),
+        goaway_error_code,
+    );
 }

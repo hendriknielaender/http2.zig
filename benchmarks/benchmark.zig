@@ -1,5 +1,10 @@
 const std = @import("std");
 const http2 = @import("http2");
+const log = std.log.scoped(.benchmark);
+
+pub const std_options: std.Options = .{
+    .log_level = .warn,
+};
 
 /// Simple Hello World handler for benchmarking
 fn helloHandler(ctx: *const http2.Context) !http2.Response {
@@ -55,12 +60,12 @@ pub fn main() !void {
     defer server.deinit();
 
     if (use_tls) {
-        std.log.info("HTTP/2 over HTTPS benchmark server ready on port {}", .{port});
-        std.log.info("TLS with ALPN h2 negotiation enabled for performance testing", .{});
+        log.info("HTTP/2 over HTTPS benchmark server ready on port {}", .{port});
+        log.info("TLS with ALPN h2 negotiation enabled for performance testing", .{});
     } else {
-        std.log.info("HTTP/2 benchmark server ready on port {}", .{port});
+        log.info("HTTP/2 benchmark server ready on port {}", .{port});
     }
-    std.log.info("Event-driven architecture with libxev (cross-platform)", .{});
+    log.info("Event-driven architecture with libxev (cross-platform)", .{});
 
     // Create a context for the monitor thread
     const MonitorContext = struct {
@@ -85,7 +90,7 @@ pub fn main() !void {
     // Signal that server is ready before running
     monitor_ctx.ready.store(true, .release);
     server.run() catch |err| {
-        std.log.err("Benchmark server failed: {}", .{err});
+        log.err("Benchmark server failed: {}", .{err});
         return err;
     };
 }
@@ -127,7 +132,7 @@ fn monitorPerformance(ctx: *const anyopaque) void {
             if (conn_rps > peak_conn_rps) peak_conn_rps = conn_rps;
             if (req_rps > peak_rps) peak_rps = req_rps;
 
-            std.log.info("[HTTP/2] {} active | {} req/s ({} conn/s) | {} total reqs | Peak: {} req/s", .{
+            log.info("[HTTP/2] {} active | {} req/s ({} conn/s) | {} total reqs | Peak: {} req/s", .{
                 stats.active_connections,
                 req_rps,
                 conn_rps,

@@ -12,12 +12,8 @@ pub const MiB = 1024 * KiB;
 pub const GiB = 1024 * MiB;
 /// Compile-time Memory Budget Calculator
 pub const MemBudget = struct {
-    // The benchmark suite drives up to 100 concurrent connections with 10
-    // concurrent streams per connection. Keep modest headroom so probes and
-    // warmup traffic do not hit the fixed pool limit.
     pub const max_conns = 128;
-    pub const max_streams_per_conn = 16;
-    // HTTP/2 protocol limits (balanced for constraints)
+    pub const max_streams_per_conn = 100;
     pub const bytes_per_conn = 64 * KiB; // Per-connection flow-control window
     pub const max_frame_size = 16 * KiB; // Standard HTTP/2 frame size
     pub const max_header_size = 8 * KiB; // Maximum header block size (needs 6KB minimum)
