@@ -2304,12 +2304,14 @@ pub const Connection = struct {
 
     /// Handle SETTINGS_INITIAL_WINDOW_SIZE
     fn apply_frame_settings_initial_window_size(self: *@This(), value: u32) !void {
+        // Per RFC 9113 Section 6.9.2: Values above 2^31-1 MUST be treated as FLOW_CONTROL_ERROR
         const max_window_size: u32 = 2147483647;
         if (value > max_window_size) {
             log.err("SETTINGS_INITIAL_WINDOW_SIZE too large {d}: FLOW_CONTROL_ERROR\n", .{value});
             if (!self.goaway_sent) {
                 try self.send_goaway(0, 0x3, "SETTINGS_INITIAL_WINDOW_SIZE too large: FLOW_CONTROL_ERROR");
                 self.goaway_sent = true;
+                try self.flush_output();
             }
             return;
         }
