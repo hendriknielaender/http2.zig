@@ -338,15 +338,26 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
             // Compile-time optimized flow control with window size calculations
             pub fn updateSendWindow(self: *Self.StreamInstance, increment: i32) !void {
-                const overflow = @addWithOverflow(self.send_window_size, increment);
-                if (overflow[1] != 0) {
+                assert(increment > 0);
+
+                // Use overflow-aware arithmetic to prevent panic on overflow
+                const result = @addWithOverflow(self.send_window_size, increment);
+                const new_window = result[0];
+                const overflowed = result[1];
+
+                // Check for overflow - this can happen when window exceeds 2^31-1
+                if (overflowed != 0 or new_window > 2147483647) {
+                    log.err("Stream {} flow control window overflow: FLOW_CONTROL_ERROR\n", .{self.id});
+                    try self.sendRstStream(0x3);
+                    return error.FlowControlError;
+                }
+                // Check for underflow (should not happen with positive increment, but be safe)
+                if (new_window < 0) {
+                    log.err("Stream {} flow control window underflow: {} below 0: FLOW_CONTROL_ERROR\n", .{ self.id, new_window });
+                    try self.sendRstStream(0x3);
                     return error.FlowControlError;
                 }
 
-                const new_window = overflow[0];
-                if (new_window > std.math.maxInt(i32)) {
-                    return error.FlowControlError;
-                }
                 self.send_window_size = new_window;
             }
 
@@ -601,32 +612,39 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             }
 
             fn handleWindowUpdate(self: *Self.StreamInstance, frame: Frame) !void {
-                // Exhaustive state validation
                 switch (self.state) {
                     .Idle => {
-                        log.err("WINDOW_UPDATE received on idle stream {d}\n", .{self.id});
-                        return error.InvalidStreamState;
+                        log.err("WINDOW_UPDATE received on idle stream {}: PROTOCOL_ERROR\n", .{self.id});
+                        try self.sendRstStream(0x1);
+                        return error.ProtocolError;
+                    },
+                    .Closed => {
+                        log.debug("WINDOW_UPDATE received on closed stream {}: ignoring\n", .{self.id});
+                        return;
                     },
                     else => {},
                 }
 
                 if (frame.payload.len != 4) {
-                    return error.InvalidFrameSize;
+                    log.err("WINDOW_UPDATE frame with invalid payload length {} (expected 4): FRAME_SIZE_ERROR\n", .{frame.payload.len});
+                    try self.conn.send_goaway(0, 0x6, "WINDOW_UPDATE frame with invalid payload length: FRAME_SIZE_ERROR");
+                    return error.FrameSizeError;
                 }
 
                 const increment = std.mem.readInt(u32, frame.payload[0..4], .big);
 
                 if (increment == 0) {
-                    log.err("WINDOW_UPDATE received with increment 0 on stream {d}: PROTOCOL_ERROR\n", .{self.id});
-                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    log.err("WINDOW_UPDATE received with increment 0 on stream {}: PROTOCOL_ERROR\n", .{self.id});
+                    try self.sendRstStream(0x1);
                     return error.ProtocolError;
                 }
 
                 if (increment > 0x7FFFFFFF) {
+                    log.err("WINDOW_UPDATE increment {} exceeds maximum on stream {}: FLOW_CONTROL_ERROR\n", .{ increment, self.id });
+                    try self.sendRstStream(0x3);
                     return error.FlowControlError;
                 }
 
-                // Use compile-time optimized window update
                 try self.updateSendWindow(@intCast(increment));
             }
 
@@ -654,6 +672,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
             fn handlePriorityFrame(self: *Self.StreamInstance, frame: Frame) !void {
                 if (frame.payload.len != 5) {
+                    log.err("PRIORITY frame with invalid payload length {} (expected 5): FRAME_SIZE_ERROR\n", .{frame.payload.len});
+                    try self.conn.send_goaway(0, 0x6, "PRIORITY frame with invalid payload length: FRAME_SIZE_ERROR");
                     return error.FrameSizeError;
                 }
 
@@ -668,8 +688,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 const weight = payload[4];
 
                 if (dependency_stream_id == self.id) {
-                    log.err("Stream {d} has a dependency on itself: PROTOCOL_ERROR\n", .{self.id});
-                    try self.sendRstStream(0x1); // PROTOCOL_ERROR
+                    log.err("Stream {} PRIORITY frame depends on itself: PROTOCOL_ERROR\n", .{self.id});
+                    try self.sendRstStream(0x1);
                     return error.ProtocolError;
                 }
 
@@ -679,7 +699,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
                 self.stream_dependency = dependency_stream_id;
                 self.exclusive = exclusive;
-                self.weight = @as(u16, weight) + 1; // Weight is 1-256
+                self.weight = @as(u16, weight) + 1;
             }
 
             fn decodeHeaderBlock(self: *Self.StreamInstance) !void {

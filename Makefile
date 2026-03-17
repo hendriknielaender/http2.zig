@@ -6,7 +6,7 @@ SERVER_KEY_FILE=key.pem
 CLIENT_CERT_FILE=client_cert.pem
 CLIENT_KEY_FILE=client_key.pem
 DH_PARAMS_FILE=dhparam.pem
-PORT=3000
+PORT=8443
 LOG_FILE=server.log
 
 # Default target
@@ -39,12 +39,12 @@ build:
 # Run the TLS HTTP/2 server
 run: cert build
 	@echo "Starting HTTP/2 TLS server on https://localhost:$(PORT)"
-	@./zig-out/bin/hello_world_server
+	@./zig-out/bin/basic_tls_server
 
 # Test with h2spec
 test-h2spec: cert build
 	@echo "Running h2spec tests against TLS server..."
-	@./zig-out/bin/hello_world_server &
+	@./zig-out/bin/basic_tls_server &
 	@SERVER_PID=$$!; \
 	sleep 2; \
 	h2spec -h localhost -p $(PORT) -t -k || true; \
