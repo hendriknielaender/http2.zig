@@ -60,7 +60,7 @@ fn notFoundHandler(ctx: *const http2.Context) !http2.Response {
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -80,7 +80,7 @@ pub fn main() !void {
 
     // Configure server
     const config = http2.Server.Config{
-        .address = try std.net.Address.resolveIp("127.0.0.1", 8443),
+        .address = try std.Io.net.IpAddress.parse("127.0.0.1", 8443),
         .router = &router,
         .max_connections = 100,
         .buffer_size = 32 * 1024,

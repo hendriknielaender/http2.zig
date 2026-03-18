@@ -220,7 +220,7 @@ pub const Response = struct {
     pub fn init(allocator: std.mem.Allocator, status: Status) Self {
         return Self{
             .status = status,
-            .headers = .{},
+            .headers = .empty,
             .body = "",
             .allocator = allocator,
         };
@@ -346,7 +346,7 @@ pub const Router = struct {
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .routes = .{},
+            .routes = .empty,
             .allocator = allocator,
             .fallback_handler = null,
         };

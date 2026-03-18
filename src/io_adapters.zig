@@ -1,4 +1,4 @@
-//! Standard I/O adapters for libxev async connections.
+//! Standard I/O adapters for async connections.
 //! These adapters expose std.Io.Reader and std.Io.Writer interfaces.
 
 const std = @import("std");

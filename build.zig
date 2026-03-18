@@ -1,6 +1,6 @@
-//! HTTP/2 Protocol Implementation Build Configuration
+//! HTTP/2 protocol implementation build configuration.
 //!
-//! - High-performance HTTP/2 library with libxev
+//! - High-performance HTTP/2 library
 //! - Example server applications
 //! - Comprehensive test suite
 //! - Documentation generation
@@ -10,26 +10,30 @@ const std = @import("std");
 
 // Project metadata
 const project_name = "http2";
-const project_version = "0.1.0";
+const project_version = "0.0.3";
 
 pub fn build(b: *std.Build) void {
     // Standard target and optimization options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const evented = b.option(
+        bool,
+        "evented",
+        "Enable the experimental std.Io.Evented backend.",
+    ) orelse false;
 
-    // Add libxev dependency
-    const libxev = b.dependency("libxev", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "use_evented_backend", evented);
 
     // Create module for use in other projects
     const http2_module = b.addModule("http2", .{
         .root_source_file = b.path("src/http2.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
     });
-    http2_module.addImport("xev", libxev.module("xev"));
+    http2_module.addOptions("build_options", build_options);
 
     // Core HTTP/2 library
     const http2_lib = b.addLibrary(.{
@@ -42,13 +46,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(http2_lib);
 
     // Example applications
-    add_examples(b, target, optimize, http2_module);
+    add_examples(b, target, optimize, http2_module, build_options);
 
     // Benchmark application
-    add_benchmark(b, target, optimize, http2_module);
+    add_benchmark(b, target, optimize, http2_module, build_options);
 
     // Test suite
-    add_tests(b, target, optimize, libxev);
+    add_tests(b, target, optimize, build_options);
 
     // Documentation
     add_documentation(b, http2_lib);
@@ -63,6 +67,7 @@ fn add_examples(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     http2_module: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
 ) void {
     // Basic TLS Example
     const basic_tls_module = b.createModule(.{
@@ -71,6 +76,7 @@ fn add_examples(
         .optimize = optimize,
     });
     basic_tls_module.addImport("http2", http2_module);
+    basic_tls_module.addOptions("build_options", build_options);
 
     const basic_tls = b.addExecutable(.{
         .name = "basic_tls_server",
@@ -92,6 +98,7 @@ fn add_benchmark(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     http2_module: *std.Build.Module,
+    build_options: *std.Build.Step.Options,
 ) void {
     // Benchmark server
     const benchmark_module = b.createModule(.{
@@ -100,6 +107,7 @@ fn add_benchmark(
         .optimize = optimize,
     });
     benchmark_module.addImport("http2", http2_module);
+    benchmark_module.addOptions("build_options", build_options);
 
     const benchmark = b.addExecutable(.{
         .name = "benchmark",
@@ -120,7 +128,7 @@ fn add_tests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    libxev: *std.Build.Dependency,
+    build_options: *std.Build.Step.Options,
 ) void {
     // Unit tests for core modules
     const test_modules = [_][]const u8{
@@ -143,8 +151,10 @@ fn add_tests(
             .root_source_file = b.path(module_path),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
         });
-        test_module.addImport("xev", libxev.module("xev"));
+        test_module.addOptions("build_options", build_options);
 
         const module_test = b.addTest(.{
             .root_module = test_module,
@@ -188,10 +198,10 @@ fn add_code_quality_checks(b: *std.Build) void {
 }
 
 fn linkBoringSsl(b: *std.Build, artifact: *std.Build.Step.Compile) void {
-    artifact.linkLibC();
-    artifact.linkLibCpp();
-    artifact.addIncludePath(b.path("boringssl/include"));
-    artifact.addLibraryPath(b.path("boringssl/build"));
-    artifact.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
-    artifact.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
+    artifact.root_module.link_libc = true;
+    artifact.root_module.link_libcpp = true;
+    artifact.root_module.addIncludePath(b.path("boringssl/include"));
+    artifact.root_module.addLibraryPath(b.path("boringssl/build"));
+    artifact.root_module.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
+    artifact.root_module.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
 }

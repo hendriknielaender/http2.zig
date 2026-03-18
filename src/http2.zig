@@ -1,7 +1,7 @@
-//! High-performance HTTP/2 implementation with libxev event loop
+//! High-performance HTTP/2 implementation with Zig's native I/O backends.
 //!
 //! Features:
-//! - Cross-platform event-driven I/O (io_uring, kqueue, epoll)
+//! - Cross-platform async I/O via Zig `std.Io` backends
 //! - Static memory allocation with compile-time budgets
 //! - Zero-copy operations where possible
 //! - Lock-free atomic operations
@@ -45,20 +45,20 @@ pub const max_frame_size_default = 16384;
 pub const max_header_list_size_default = 8192;
 pub const initial_window_size_default = 65535;
 
-// Import the high-performance server
-const LibxevServer = @import("server.zig").Server;
+// Import the high-performance server.
+const TransportServer = @import("server.zig").Server;
 
-/// High-Performance HTTP/2 Server
-/// Event-driven architecture with libxev for maximum throughput
+/// High-performance HTTP/2 server.
+/// Uses the configured Zig `std.Io` backend.
 pub const Server = struct {
-    inner: LibxevServer,
+    inner: TransportServer,
     allocator: std.mem.Allocator,
 
     const Self = @This();
 
     pub const Config = struct {
         /// Address to bind to
-        address: std.net.Address,
+        address: std.Io.net.IpAddress,
         /// Request router for handling HTTP requests
         router: *Router,
         /// Maximum concurrent connections
@@ -72,7 +72,7 @@ pub const Server = struct {
         std.debug.assert(@intFromPtr(config.router) != 0);
 
         return Self{
-            .inner = try LibxevServer.init(allocator, .{
+            .inner = try TransportServer.init(allocator, .{
                 .address = config.address,
                 .router = config.router,
                 .max_connections = config.max_connections,
@@ -88,7 +88,7 @@ pub const Server = struct {
         std.debug.assert(@intFromPtr(tls_ctx) != 0);
 
         return Self{
-            .inner = try LibxevServer.initWithTLS(allocator, .{
+            .inner = try TransportServer.initWithTLS(allocator, .{
                 .address = config.address,
                 .router = config.router,
                 .max_connections = config.max_connections,
@@ -119,24 +119,23 @@ pub const Server = struct {
     }
 };
 
-/// Experimental Async HTTP/2 Server with proper libxev patterns
-/// This follows true async patterns with completions and callbacks
+/// Experimental async HTTP/2 server.
 pub const AsyncServer = struct {
-    inner: LibxevServer,
+    inner: TransportServer,
 
     const Self = @This();
 
-    pub const Config = LibxevServer.Config;
+    pub const Config = TransportServer.Config;
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         return Self{
-            .inner = try LibxevServer.init(allocator, config),
+            .inner = try TransportServer.init(allocator, config),
         };
     }
 
     pub fn initWithTLS(allocator: std.mem.Allocator, config: Config, tls_ctx: *tls.TlsServerContext) !Self {
         return Self{
-            .inner = try LibxevServer.initWithTLS(allocator, config, tls_ctx),
+            .inner = try TransportServer.initWithTLS(allocator, config, tls_ctx),
         };
     }
 
@@ -190,7 +189,7 @@ comptime {
 }
 
 test "HTTP/2 server creation" {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -210,7 +209,7 @@ test "HTTP/2 server creation" {
     try router.get("/", test_handler);
 
     const config = Server.Config{
-        .address = try std.net.Address.resolveIp("127.0.0.1", 3000),
+        .address = try std.Io.net.IpAddress.parse("127.0.0.1", 3000),
         .router = &router,
     };
 

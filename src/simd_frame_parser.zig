@@ -59,6 +59,35 @@ pub const SIMDFrameParser = struct {
         }
     }
 
+    /// Parse frame header accepting any frame type (unknown types will have null frame_type)
+    pub fn parseFrameHeaderLenient(data: []const u8) !struct { length: u32, frame_type: u8, flags: FrameFlags, reserved: bool, stream_id: u32 } {
+        if (data.len < 9) {
+            return error.InsufficientData;
+        }
+
+        const length = (@as(u32, data[0]) << 16) |
+            (@as(u32, data[1]) << 8) |
+            @as(u32, data[2]);
+
+        if (length > 0xFFFFFF) {
+            return error.InvalidFrameLength;
+        }
+
+        const frame_type: u8 = data[3];
+        const flags = FrameFlags.init(data[4]);
+        const stream_id_raw = std.mem.readInt(u32, data[5..9], .big);
+        const reserved = (stream_id_raw & 0x80000000) != 0;
+        const stream_id = stream_id_raw & 0x7FFFFFFF;
+
+        return .{
+            .length = length,
+            .frame_type = frame_type,
+            .flags = flags,
+            .reserved = reserved,
+            .stream_id = stream_id,
+        };
+    }
+
     /// Parse multiple frame headers in batch using SIMD
     pub fn parseFrameHeadersBatch(data: []const u8, headers: []FrameHeader) !u32 {
         // Assert minimum data size for frame header
@@ -311,8 +340,8 @@ pub const SIMDFrameParser = struct {
             std.debug.assert(byte_index + chunk_size <= data.len);
             std.debug.assert(byte_index + chunk_size <= expected.len);
 
-            const data_chunk = @as(@Vector(32, u8), data[byte_index .. byte_index + chunk_size].*);
-            const expected_chunk = @as(@Vector(32, u8), expected[byte_index .. byte_index + chunk_size].*);
+            const data_chunk = @as(@Vector(32, u8), data[byte_index..][0..chunk_size].*);
+            const expected_chunk = @as(@Vector(32, u8), expected[byte_index..][0..chunk_size].*);
 
             // Compare chunks using SIMD
             const comparison = data_chunk == expected_chunk;
