@@ -453,7 +453,7 @@ pub const Router = struct {
         try self.insertRoute(method, path, .exact, handler);
     }
 
-    /// Add a prefix route using the longest-prefix selection model from h2o.
+    /// Add a prefix route using the longest-prefix selection model.
     pub fn addPrefixRoute(
         self: *Self,
         method: Method,
