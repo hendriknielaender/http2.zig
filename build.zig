@@ -182,7 +182,12 @@ fn add_documentation(b: *std.Build, http2_lib: *std.Build.Step.Compile) void {
 fn add_code_quality_checks(b: *std.Build) void {
     // Format check
     const fmt_check = b.addFmt(.{
-        .paths = &[_][]const u8{ "src/", "examples/", "benchmarks/" },
+        .paths = &[_][]const u8{
+            "build.zig",
+            "src/",
+            "examples/",
+            "benchmarks/",
+        },
         .check = true,
     });
     const fmt_check_step = b.step("fmt-check", "Check code formatting");
@@ -190,7 +195,12 @@ fn add_code_quality_checks(b: *std.Build) void {
 
     // Format fix
     const fmt_fix = b.addFmt(.{
-        .paths = &[_][]const u8{ "src/", "examples/", "benchmarks/" },
+        .paths = &[_][]const u8{
+            "build.zig",
+            "src/",
+            "examples/",
+            "benchmarks/",
+        },
         .check = false,
     });
     const fmt_fix_step = b.step("fmt", "Fix code formatting");

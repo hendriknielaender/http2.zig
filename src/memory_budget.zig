@@ -337,11 +337,13 @@ const FrameData = struct {
 // Placeholder functions (will be implemented during integration)
 fn processFrame(frame: *FrameData) void {
     _ = frame;
-    // TODO: Implement frame processing
+    // Frame execution stays in the connection path until the static worker pool
+    // is integrated with protocol state transitions.
 }
 fn processConnection(connection: *ConnectionSlot) void {
     _ = connection;
-    // TODO: Implement connection processing
+    // Connection ownership remains with the server event loop until the worker
+    // handoff semantics are fully defined.
 }
 /// Global static memory pool instance
 var global_memory_pool: ?*StaticMemoryPool = null;

@@ -294,6 +294,7 @@ jobs:
             docs \
             examples \
             src \
+            tools \
             | tar --null --files-from - -cf - \
             | tar -C "${stage_root}" -xf -
 

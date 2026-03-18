@@ -186,8 +186,8 @@ pub const SIMDFrameParser = struct {
         std.debug.assert(data.len >= 36); // 4 frames * 9 bytes
         std.debug.assert(headers.len >= 4);
 
-        // Process each frame header individually for now
-        // TODO: Implement actual vectorized batch processing
+        // Keep the batch bounds explicit while this path falls back to the
+        // scalar parser for each frame header.
         for (0..4) |batch_index| {
             // Assert bounds before processing each frame in batch
             std.debug.assert(batch_index < 4);

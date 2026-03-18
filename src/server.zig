@@ -15,6 +15,21 @@ const tls = @import("tls.zig");
 const Connection = connection_module.Connection;
 const ServerStats = @import("http2.zig").ServerStats;
 const log = std.log.scoped(.server);
+const broken_linux_evented_zig =
+    std.SemanticVersion.parse("0.16.0-dev.2905+5d71e3051") catch unreachable;
+
+comptime {
+    if (build_options.use_evented_backend and builtin.os.tag == .linux and
+        builtin.zig_version.order(broken_linux_evented_zig) == .eq)
+    {
+        @compileError(
+            "`-Devented=true` is unsupported on Linux with Zig " ++
+                builtin.zig_version_string ++
+                " because std.Io.Evented is broken in this toolchain snapshot. " ++
+                "Use the default threaded backend or upgrade the pinned Zig version before re-enabling it.",
+        );
+    }
+}
 
 const backend_uses_evented = if (build_options.use_evented_backend)
     builtin.os.tag == .linux and std.Io.Evented != void

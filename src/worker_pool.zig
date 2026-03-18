@@ -9,9 +9,6 @@
 //! - Graceful shutdown with proper cleanup
 const std = @import("std");
 const memory_budget = @import("memory_budget.zig");
-// TODO: Implement budgeted versions
-// const connection_budgeted = @import("connection_budgeted.zig");
-// const stream_budgeted = @import("stream_budgeted.zig");
 const Connection = @import("connection.zig").Connection;
 const stream = @import("stream.zig");
 const Frame = @import("frame.zig").Frame;
@@ -287,8 +284,8 @@ fn processWorkItem(work_item: WorkItem) !void {
 }
 /// Process HTTP/2 frame (main work type)
 fn processFrame(frame_data: FrameWorkData) !void {
-    // TODO: Implement frame processing
-    // This would involve parsing the frame and updating connection/stream state
+    // The worker path is intentionally explicit while frame execution is still
+    // routed through the connection hot path.
     log.debug("Processing frame for stream {d}", .{frame_data.stream_id});
 }
 /// Process connection-level work
@@ -367,7 +364,8 @@ fn processConnectionWithRetries(connection: *Connection) !void {
 /// Process stream-level work
 fn processStream(stream_data: StreamWorkData) !void {
     _ = stream_data;
-    // TODO: Implement stream processing
+    // Stream work remains a deliberate no-op until stream-owned async work is
+    // introduced and validated against the connection scheduler.
     log.debug("Processing stream work", .{});
 }
 

@@ -448,8 +448,8 @@ pub const Hpack = struct {
         const use_huffman = str.len > 16; // Threshold for Huffman benefit
         const huffman_bit: u8 = if (use_huffman) 0x80 else 0;
         if (use_huffman) {
-            // TODO: Implement Huffman encoding optimization
-            // For now, fall back to literal encoding
+            // Prefer the literal path until an encoder is in place that is both
+            // bounded and measurably beneficial for this code path.
             try Hpack.encodeInt(str.len, 7, buffer, allocator, 0);
             try buffer.appendSlice(allocator, str);
         } else {
