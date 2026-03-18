@@ -837,7 +837,6 @@ pub const Connection = struct {
             try self.send_goaway(self.last_stream_id, 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
             self.goaway_sent = true;
             try self.flush_output();
-            try self.drain_connection();
             return error.FrameSizeError;
         }
         if (parsed.length + 9 > buffer.len) return error.BufferTooSmall;
@@ -1221,7 +1220,6 @@ pub const Connection = struct {
             self.dispatchFrameOptimized(frame) catch |err| {
                 if (self.goaway_sent) {
                     try self.flush_output();
-                    try self.drain_connection();
                     return;
                 }
                 try self.flush_output();
@@ -1267,7 +1265,6 @@ pub const Connection = struct {
                     try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
                     self.goaway_sent = true;
                     try self.flush_output();
-                    try self.drain_connection();
                     return error.ProtocolError;
                 }
             }
@@ -1275,7 +1272,6 @@ pub const Connection = struct {
             self.dispatchFrameOptimized(frame) catch |err| {
                 if (self.goaway_sent) {
                     try self.flush_output();
-                    try self.drain_connection();
                     return;
                 }
                 try self.flush_output();
@@ -1293,23 +1289,6 @@ pub const Connection = struct {
         }
         try self.flush_output();
         log.debug("SIMD-optimized connection handler terminated gracefully.", .{});
-    }
-
-    fn drain_connection(self: *@This()) !void {
-        var drain_buffer: [1024]u8 = undefined;
-        var drain_attempts: u32 = 0;
-        const max_drain_attempts = 100;
-
-        while (drain_attempts < max_drain_attempts) : (drain_attempts += 1) {
-            const bytes_read = self.reader.readSliceShort(&drain_buffer) catch |err| {
-                log.debug("Connection drain completed: {s}", .{@errorName(err)});
-                return;
-            };
-            if (bytes_read == 0) {
-                return;
-            }
-        }
-        log.debug("Connection drain completed after {} attempts", .{drain_attempts});
     }
     /// Adjust frame handling and validation per RFC 9113.
     pub fn handle_connection(self: *@This()) !void {
@@ -2566,7 +2545,6 @@ pub const Connection = struct {
                 if (err == error.FlowControlError) {
                     // GOAWAY was already sent by update_send_window, ensure it's flushed
                     try self.flush_output();
-                    try self.drain_connection();
                     return;
                 }
                 return err;
@@ -2814,6 +2792,46 @@ test "apply_frame_settings rejects oversized initial window with GOAWAY" {
 
     const goaway_error_code = std.mem.readInt(u32, written[13..17], .big);
     try std.testing.expectEqual(@as(u32, 0x3), goaway_error_code);
+}
+
+test "apply_frame_settings allows stream window to become negative" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(allocator, &test_io.reader, &test_io.writer, false);
+    var stream = try connection.get_stream(1);
+    stream.state = .HalfClosedRemote;
+    stream.request_headers_complete = true;
+    stream.request_complete = true;
+    stream.send_window_size = 1;
+
+    test_io.resetWriter(&buffer);
+
+    const frame = Frame{
+        .header = .{
+            .length = 6,
+            .frame_type = .SETTINGS,
+            .flags = FrameFlags.init(0),
+            .reserved = false,
+            .stream_id = 0,
+        },
+        .payload = &[_]u8{
+            0x00, 0x04,
+            0x00, 0x00,
+            0x00, 0x00,
+        },
+    };
+
+    try connection.apply_frame_settings(frame);
+
+    try std.testing.expect(!connection.goaway_sent);
+    try std.testing.expectEqual(@as(u32, 0), connection.settings.initial_window_size);
+    try std.testing.expectEqual(@as(i32, -65534), stream.send_window_size);
+    try std.testing.expectEqual(@as(usize, 0), test_io.written().len);
 }
 
 test "default settings stream" {

@@ -244,14 +244,37 @@ pub const Server = struct {
                 continue;
             };
 
-            // Each connection spends most of its lifetime at cancelable network
-            // operations, which means `async` is the correct primitive here.
+            self.spawnConnectionTask(io, stream, connection_slot) catch |err| {
+                stream.close(io);
+                self.releaseConnectionSlot(connection_slot);
+                return err;
+            };
+        }
+    }
+
+    fn spawnConnectionTask(
+        self: *Self,
+        io: std.Io,
+        stream: std.Io.net.Stream,
+        connection_slot: *ConnectionSlot,
+    ) !void {
+        if (backend_uses_evented) {
             self.connection_group.async(io, serveConnectionTask, .{
                 self,
                 stream,
                 connection_slot,
             });
+            return;
         }
+
+        // The threaded backend consumes a worker while a connection blocks in
+        // TLS or socket I/O, so a connection task requires concurrency rather
+        // than mere asynchrony.
+        try self.connection_group.concurrent(io, serveConnectionTask, .{
+            self,
+            stream,
+            connection_slot,
+        });
     }
 
     fn acquireConnectionSlot(self: *Self) ?*ConnectionSlot {
