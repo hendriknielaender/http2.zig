@@ -1,0 +1,318 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  ZIG_VERSION: 0.16.0-dev.2905+5d71e3051
+  ZLINT_VERSION: v0.7.9
+  BORINGSSL_CACHE_VERSION: v1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check formatting
+        run: zig build fmt-check
+
+  zlint:
+    name: ZLint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install zlint
+        run: |
+          case "$(uname -m)" in
+            x86_64) target="linux-x86_64" ;;
+            aarch64 | arm64) target="linux-aarch64" ;;
+            *)
+              echo "Unsupported zlint architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          install_dir="${RUNNER_TEMP}/zlint-bin"
+          mkdir -p "${install_dir}"
+          curl --fail --location --silent --show-error --retry 3 --retry-delay 2 \
+            --output "${install_dir}/zlint" \
+            "https://github.com/DonIsaac/zlint/releases/download/${ZLINT_VERSION}/zlint-${target}"
+          chmod +x "${install_dir}/zlint"
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+
+      - name: Run zlint
+        run: zlint . --deny-warnings --format github
+
+  boringssl_linux:
+    name: Prepare BoringSSL (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Resolve BoringSSL revision
+        id: boringssl
+        run: |
+          revision="$(git submodule status -- boringssl | awk '{gsub(/^[ -+]/, "", $1); print $1}')"
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore BoringSSL cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-linux-${{ steps.boringssl.outputs.revision }}
+
+      - name: Build BoringSSL
+        run: |
+          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
+            echo "Using cached BoringSSL build."
+            exit 0
+          fi
+
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build boringssl/build --parallel
+
+      - name: Upload BoringSSL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boringssl-linux
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  build_test_linux:
+    name: Build & Unit Test (ubuntu-latest, evented=false)
+    needs: boringssl_linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
+
+      - name: Build release artifacts
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run unit tests
+        run: zig build test
+
+  experimental_evented_linux:
+    name: Build & Unit Test (ubuntu-latest, evented=true)
+    needs: boringssl_linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
+
+      - name: Build release artifacts with evented backend
+        id: evented_build
+        continue-on-error: true
+        run: zig build -Doptimize=ReleaseFast -Devented=true
+
+      - name: Run unit tests with evented backend
+        id: evented_test
+        if: steps.evented_build.outcome == 'success'
+        continue-on-error: true
+        run: zig build test -Devented=true
+
+      - name: Summarize experimental backend result
+        if: always()
+        run: |
+          if [[ "${{ steps.evented_build.outcome }}" != "success" ]]; then
+            echo "::warning title=Experimental Linux evented lane failed::The pinned Zig toolchain does not currently compile std.Io.Evented on ubuntu-latest. This lane is informative only and does not block CI."
+          elif [[ "${{ steps.evented_test.outcome }}" != "success" ]]; then
+            echo "::warning title=Experimental Linux evented tests failed::The experimental std.Io.Evented lane built but unit tests failed. This lane is informative only and does not block CI."
+          else
+            echo "Experimental evented backend checks passed."
+          fi
+
+  docs:
+    name: Docs
+    needs: boringssl_linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
+
+      - name: Generate documentation
+        run: zig build docs
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: http2-docs
+          path: zig-out/docs
+          if-no-files-found: error
+          retention-days: 14
+
+  conformance:
+    name: HTTP/2 Conformance
+    needs: boringssl_linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PORT: "8081"
+      TLS: "true"
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
+
+      - name: Build benchmark server
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Generate test certificate
+        run: |
+          openssl req -x509 -newkey rsa:4096 \
+            -keyout key.pem \
+            -out cert.pem \
+            -days 365 \
+            -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+      - name: Run h2spec suite
+        run: |
+          ./zig-out/bin/benchmark > /tmp/http2-benchmark.log 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "${server_pid}" 2>/dev/null || true
+            wait "${server_pid}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=false
+          for _ in $(seq 1 20); do
+            if curl --silent --show-error --fail --insecure "https://127.0.0.1:${PORT}/" >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "${ready}" != "true" ]; then
+            cat /tmp/http2-benchmark.log
+            exit 1
+          fi
+
+          if ! docker run --rm --network host summerwind/h2spec -h 127.0.0.1 -p "${PORT}" -t -k; then
+            cat /tmp/http2-benchmark.log
+            exit 1
+          fi
+
+      - name: Upload conformance logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: h2spec-logs
+          path: /tmp/http2-benchmark.log
+          if-no-files-found: ignore
+          retention-days: 7

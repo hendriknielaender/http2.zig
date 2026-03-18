@@ -1,0 +1,360 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ZIG_VERSION: 0.16.0-dev.2905+5d71e3051
+  ZLINT_VERSION: v0.7.9
+  BORINGSSL_CACHE_VERSION: v1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  boringssl_linux:
+    name: Prepare BoringSSL (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Resolve BoringSSL revision
+        id: boringssl
+        run: |
+          revision="$(git submodule status -- boringssl | awk '{gsub(/^[ -+]/, "", $1); print $1}')"
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore BoringSSL cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-linux-${{ steps.boringssl.outputs.revision }}
+
+      - name: Build BoringSSL
+        run: |
+          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
+            echo "Using cached BoringSSL build."
+            exit 0
+          fi
+
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build boringssl/build --parallel
+
+      - name: Upload BoringSSL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boringssl-linux
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  verify:
+    name: Verify release
+    needs: boringssl_linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      PORT: "8081"
+      TLS: "true"
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install zlint
+        run: |
+          case "$(uname -m)" in
+            x86_64) target="linux-x86_64" ;;
+            aarch64 | arm64) target="linux-aarch64" ;;
+            *)
+              echo "Unsupported zlint architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          install_dir="${RUNNER_TEMP}/zlint-bin"
+          mkdir -p "${install_dir}"
+          curl --fail --location --silent --show-error --retry 3 --retry-delay 2 \
+            --output "${install_dir}/zlint" \
+            "https://github.com/DonIsaac/zlint/releases/download/${ZLINT_VERSION}/zlint-${target}"
+          chmod +x "${install_dir}/zlint"
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+
+      - name: Run zlint
+        run: zlint . --deny-warnings --format github
+
+      - name: Validate release tag
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          build_version="$(sed -n 's/^const project_version = "\(.*\)";$/\1/p' build.zig)"
+          zon_version="$(sed -n 's/^[[:space:]]*\.version = "\(.*\)",$/\1/p' build.zig.zon | head -n 1)"
+
+          if [[ -z "${build_version}" || -z "${zon_version}" ]]; then
+            echo "Unable to determine project version from build metadata." >&2
+            exit 1
+          fi
+
+          if [[ "${version}" != "${build_version}" || "${version}" != "${zon_version}" ]]; then
+            echo "Release tag ${tag} does not match project metadata:" >&2
+            echo "  build.zig: ${build_version}" >&2
+            echo "  build.zig.zon: ${zon_version}" >&2
+            exit 1
+          fi
+
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
+
+      - name: Check formatting
+        run: zig build fmt-check
+
+      - name: Run unit tests
+        run: zig build test
+
+      - name: Generate documentation
+        run: zig build docs
+
+      - name: Build release artifacts
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Generate test certificate
+        run: |
+          openssl req -x509 -newkey rsa:4096 \
+            -keyout key.pem \
+            -out cert.pem \
+            -days 365 \
+            -nodes \
+            -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+
+      - name: Run h2spec suite
+        run: |
+          ./zig-out/bin/benchmark > /tmp/http2-benchmark.log 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "${server_pid}" 2>/dev/null || true
+            wait "${server_pid}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=false
+          for _ in $(seq 1 20); do
+            if curl --silent --show-error --fail --insecure "https://127.0.0.1:${PORT}/" >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "${ready}" != "true" ]; then
+            cat /tmp/http2-benchmark.log
+            exit 1
+          fi
+
+          if ! docker run --rm --network host summerwind/h2spec -h 127.0.0.1 -p "${PORT}" -t -k; then
+            cat /tmp/http2-benchmark.log
+            exit 1
+          fi
+
+      - name: Upload conformance logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-h2spec-logs
+          path: /tmp/http2-benchmark.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  package_source:
+    name: Package source and docs
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
+
+      - name: Generate release documentation
+        run: zig build docs --prefix "$PWD/dist/install"
+
+      - name: Package source bundle
+        run: |
+          mkdir -p release-assets
+          version="${GITHUB_REF_NAME#v}"
+          stage_root="$PWD/release-stage/http2-v${version}-source"
+
+          mkdir -p "${stage_root}" "${stage_root}/boringssl"
+
+          git ls-files -z \
+            .gitmodules \
+            LICENSE \
+            Makefile \
+            README.md \
+            benchmarks \
+            build.zig \
+            build.zig.zon \
+            docs \
+            examples \
+            src \
+            | tar --null --files-from - -cf - \
+            | tar -C "${stage_root}" -xf -
+
+          git -C boringssl ls-files -z \
+            | tar -C boringssl --null --files-from - -cf - \
+            | tar -C "${stage_root}/boringssl" -xf -
+
+          tar -C "$PWD/release-stage" -czf "release-assets/http2-v${version}-source.tar.gz" "http2-v${version}-source"
+
+          tar -C "$PWD/dist/install" -czf "release-assets/http2-v${version}-docs.tar.gz" docs
+
+      - name: Upload source release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-source-and-docs
+          path: release-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  package_native_linux:
+    name: Package native assets (Linux)
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
+
+      - name: Build installable release payload
+        run: zig build -Doptimize=ReleaseFast --prefix "$PWD/dist/install"
+
+      - name: Package native bundle
+        run: |
+          mkdir -p release-assets
+          version="${GITHUB_REF_NAME#v}"
+          case "${RUNNER_ARCH}" in
+            X64) arch="x86_64" ;;
+            ARM64) arch="aarch64" ;;
+            *)
+              echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2
+              exit 1
+              ;;
+          esac
+          bundle_root="http2-v${version}-linux-${arch}"
+          bundle_dir="release-assets/${bundle_root}"
+
+          mkdir -p "${bundle_dir}/bin" "${bundle_dir}/lib"
+          cp LICENSE README.md "${bundle_dir}/"
+          cp "$PWD/dist/install/bin/basic_tls_server" "${bundle_dir}/bin/"
+          cp "$PWD/dist/install/bin/benchmark" "${bundle_dir}/bin/"
+          cp "$PWD/dist/install/lib/libhttp2.a" "${bundle_dir}/lib/"
+
+          tar -C release-assets -czf "release-assets/${bundle_root}.tar.gz" "${bundle_root}"
+
+      - name: Upload native release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: release-assets/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - package_source
+      - package_native_linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          shasum -a 256 *.tar.gz > checksums.txt
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "${tag}" >/dev/null 2>&1; then
+            gh release create "${tag}" --verify-tag --generate-notes
+          fi
+          gh release upload "${tag}" release-assets/* --clobber
