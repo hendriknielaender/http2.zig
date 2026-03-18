@@ -63,8 +63,16 @@ exe.root_module.addImport("http2", http2_dep.module("http2"));
 const std = @import("std");
 const http2 = @import("http2");
 
+fn indexHandler(ctx: *const http2.Context) !http2.Response {
+    return ctx.response.text(.ok, "hello from http2.zig\n");
+}
+
+fn notFoundHandler(ctx: *const http2.Context) !http2.Response {
+    return ctx.response.text(.not_found, "not found\n");
+}
+
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -72,10 +80,17 @@ pub fn main() !void {
     try http2.init(allocator);
     defer http2.deinit();
 
+    // Configure the request router
+    var router = http2.Router.init(allocator);
+    defer router.deinit();
+
+    try router.get("/", indexHandler);
+    router.setFallback(notFoundHandler);
+
     // Configure and create server
     const config = http2.Server.Config{
-        .address = try std.net.Address.resolveIp("127.0.0.1", 3000),
-        .max_connections = 1000,
+        .address = try std.Io.net.IpAddress.parse("127.0.0.1", 3000),
+        .router = &router,
     };
 
     var server = try http2.Server.init(allocator, config);
@@ -99,7 +114,10 @@ TBD
 ```zig
 pub const Server.Config = struct {
     /// Address to bind to
-    address: std.net.Address,
+    address: std.Io.net.IpAddress,
+
+    /// Request router for handling HTTP requests
+    router: *Router,
     
     /// Maximum concurrent connections (default: 1000)
     max_connections: u32 = 1000,
@@ -108,6 +126,35 @@ pub const Server.Config = struct {
     buffer_size: u32 = 32 * 1024,
 };
 ```
+
+### Router
+
+The server expects a router in `Server.Config`, and requests are dispatched through it.
+
+```zig
+try router.get("/", indexHandler);
+try router.post("/api/messages", createMessageHandler);
+try router.getPrefix("/assets", staticAssetsHandler);
+router.setFallback(notFoundHandler);
+```
+
+Current routing behavior:
+
+- `get`, `post`, `put`, `delete`, `head`, `options`, and `patch` register exact routes.
+- `getPrefix` and `postPrefix` register prefix routes.
+- Prefix routes are ordered by longest path first.
+- Prefix matching is segment-aware: `/api` matches `/api` and `/api/users`, but not `/apix`.
+- A matching path with the wrong method returns `405 Method Not Allowed`.
+- A missing path falls through to the fallback handler when configured; otherwise it returns `404 Not Found`.
+
+The request context passed to handlers exposes:
+
+- `ctx.method`
+- `ctx.path`
+- `ctx.query`
+- `ctx.headers`
+- `ctx.body`
+- `ctx.response`
 
 ### Server Methods
 

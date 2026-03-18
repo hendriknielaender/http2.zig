@@ -8,6 +8,7 @@ const FrameFlags = @import("frame.zig").FrameFlags;
 const Connection = @import("connection.zig").Connection;
 const Hpack = @import("hpack.zig").Hpack;
 const Priority = @import("http_priority.zig").Priority;
+const handler = @import("handler.zig");
 const memory_budget = @import("memory_budget.zig");
 const TestIo = @import("testing/fixed_io.zig").FixedIo;
 
@@ -156,8 +157,13 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             headers: std.ArrayList(Hpack.HeaderField),
             content_length: ?usize,
             total_data_received: usize,
+            request_body_storage: [memory_budget.MemBudget.max_data_buffer]u8,
+            request_body_len: usize,
             request_headers_complete: bool,
             request_complete: bool,
+            response: ?handler.Response,
+            response_prepared: bool,
+            response_header_block_len: usize,
             response_headers_sent: bool,
             response_body_sent: usize,
             cleaned_up: bool,
@@ -194,8 +200,13 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     .headers = .empty,
                     .content_length = null,
                     .total_data_received = 0,
+                    .request_body_storage = undefined,
+                    .request_body_len = 0,
                     .request_headers_complete = false,
                     .request_complete = false,
+                    .response = null,
+                    .response_prepared = false,
+                    .response_header_block_len = 0,
                     .response_headers_sent = false,
                     .response_body_sent = 0,
                     .cleaned_up = false,
@@ -224,9 +235,16 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 // Static buffers don't need deinitialization, just reset lengths
                 self.header_block_fragments_len = 0;
                 self.headers_bytes_len = 0;
+                self.request_body_len = 0;
+                self.response_header_block_len = 0;
+                self.response_prepared = false;
                 self.response_headers_sent = false;
                 self.response_body_sent = 0;
 
+                if (self.response) |*response| {
+                    response.deinit();
+                }
+                self.response = null;
                 self.headers.clearRetainingCapacity();
                 self.request_headers_complete = false;
                 self.cleaned_up = true;
@@ -585,6 +603,18 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 }
 
                 self.total_data_received += payload.len;
+                if (self.request_body_len + payload.len > self.request_body_storage.len) {
+                    try self.sendRstStream(0x2); // INTERNAL_ERROR
+                    return error.BufferOverflow;
+                }
+                const body_start = self.request_body_len;
+                const body_end = body_start + payload.len;
+                std.mem.copyForwards(
+                    u8,
+                    self.request_body_storage[body_start..body_end],
+                    payload,
+                );
+                self.request_body_len = body_end;
 
                 // Compile-time optimized flow control
                 self.recv_window_size -= @intCast(frame.header.length);

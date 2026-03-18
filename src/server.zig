@@ -412,6 +412,7 @@ pub const Server = struct {
             reader,
             writer,
         );
+        h2_connection.bindRouter(self.config.router);
         defer {
             self.recordCompletedResponses(&h2_connection);
             h2_connection.deinit();

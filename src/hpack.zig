@@ -496,6 +496,30 @@ pub const Hpack = struct {
             try dynamic_table.addEntry(field);
         }
     }
+
+    pub fn encodeHeaderFieldWithoutIndexing(
+        field: HeaderField,
+        buffer: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+    ) !void {
+        assert(field.name.len > 0);
+        assert(field.name.len <= MAX_HEADER_LIST_SIZE);
+        assert(@intFromPtr(buffer) != 0);
+
+        if (Hpack.StaticTable.getStaticIndex(field.name, field.value)) |index| {
+            try Hpack.encodeInt(index, 7, buffer, allocator, 0x80);
+            return;
+        }
+
+        if (Hpack.StaticTable.getNameIndex(field.name)) |index| {
+            try Hpack.encodeInt(index, 4, buffer, allocator, 0x00);
+        } else {
+            try buffer.append(allocator, 0x00);
+            try Hpack.encodeString(field.name, buffer, allocator);
+        }
+        try Hpack.encodeString(field.value, buffer, allocator);
+    }
+
     pub const DecodedHeaderView = struct {
         header: HeaderField,
         bytes_consumed: usize,

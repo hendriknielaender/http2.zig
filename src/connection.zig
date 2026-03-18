@@ -58,6 +58,7 @@ fn compare_header_name_simd(a: []const u8, b: []const u8) bool {
 }
 pub const Stream = @import("stream.zig").Stream;
 pub const DefaultStream = @import("stream.zig").DefaultStream;
+const transitionState = @import("stream.zig").transitionState;
 pub const Frame = @import("frame.zig").Frame;
 pub const FrameHeader = @import("frame.zig").FrameHeader;
 pub const FrameFlags = @import("frame.zig").FrameFlags;
@@ -68,6 +69,7 @@ pub const FrameArena = @import("frame.zig").FrameArena;
 pub const FrameMeta = @import("frame.zig").FrameMeta;
 pub const initFrameArena = @import("frame.zig").initFrameArena;
 pub const Hpack = @import("hpack.zig").Hpack;
+const handler = @import("handler.zig");
 pub const http2 = @import("http2.zig");
 const HttpPriority = @import("http_priority.zig").Priority;
 const memory_budget = @import("memory_budget.zig");
@@ -92,45 +94,6 @@ const default_response_body =
     \\</html>
 ;
 const default_response_content_type = "text/html; charset=utf-8";
-const default_response_content_length = std.fmt.comptimePrint(
-    "{d}",
-    .{default_response_body.len},
-);
-const default_response_headers_block = [_]u8{
-    0x88,
-    0x0f,
-    0x0d,
-    0x02,
-    '6',
-    '8',
-    0x0f,
-    0x10,
-    0x18,
-    't',
-    'e',
-    'x',
-    't',
-    '/',
-    'h',
-    't',
-    'm',
-    'l',
-    ';',
-    ' ',
-    'c',
-    'h',
-    'a',
-    'r',
-    's',
-    'e',
-    't',
-    '=',
-    'u',
-    't',
-    'f',
-    '-',
-    '8',
-};
 comptime {
     assert(max_streams_per_connection == 100);
     assert(max_streams_per_connection <= std.math.maxInt(u8));
@@ -141,9 +104,12 @@ comptime {
     assert(default_response_body.len == 68);
     assert(default_response_body.len <= http2_frame_size_min);
     assert(default_response_content_type.len == 24);
-    assert(std.mem.eql(u8, default_response_content_length, "68"));
-    assert(default_response_headers_block.len == 33);
 }
+
+const RequestTarget = struct {
+    normalized_path: []const u8,
+    query: []const u8,
+};
 pub const Config = struct {
     // Socket options - configured at comptime for zero-cost abstractions
     pub const SocketOpts = struct {
@@ -258,6 +224,7 @@ pub const Connection = struct {
     ]u8;
 
     allocator: std.mem.Allocator,
+    router: ?*const handler.Router,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     settings: Settings,
@@ -310,6 +277,7 @@ pub const Connection = struct {
 
         target.* = .{
             .allocator = allocator,
+            .router = null,
             .reader = reader,
             .writer = writer,
             .settings = Settings.default(),
@@ -411,6 +379,11 @@ pub const Connection = struct {
         try target.check_server_preface();
         try target.send_settings();
         try target.flush_output();
+    }
+
+    pub fn bindRouter(self: *@This(), router: *const handler.Router) void {
+        assert(@intFromPtr(router) != 0);
+        self.router = router;
     }
 
     fn flush_output(self: *@This()) !void {
@@ -747,7 +720,7 @@ pub const Connection = struct {
         if (stream.expecting_continuation) {
             return;
         }
-        if (stream.response_body_sent >= default_response_body.len) {
+        if (self.streamResponseComplete(stream)) {
             return;
         }
 
@@ -888,11 +861,11 @@ pub const Connection = struct {
             return;
         }
         const frame_type_u8 = @intFromEnum(frame.header.frame_type);
-        const handler = FrameHandler.fromFrameType(frame_type_u8) orelse {
+        const frame_handler = FrameHandler.fromFrameType(frame_type_u8) orelse {
             log.debug("Ignoring unknown frame type {d} on stream {d}", .{ frame_type_u8, frame.header.stream_id });
             return;
         };
-        switch (handler) {
+        switch (frame_handler) {
             .data => try self.handleDataFrameOptimized(frame),
             .headers => try self.handleHeadersFrameOptimized(frame),
             .priority => try self.handlePriorityFrameOptimized(frame),
@@ -1427,7 +1400,7 @@ pub const Connection = struct {
             return false;
         }
 
-        if (stream.response_body_sent < default_response_body.len) {
+        if (!self.streamResponseComplete(stream)) {
             return true;
         }
 
@@ -1928,39 +1901,78 @@ pub const Connection = struct {
         assert(stream.request_headers_complete);
         assert(!stream.expecting_continuation);
         log.debug("Processing request for stream ID: {d}, state: {s}", .{ stream.id, @tagName(stream.state) });
+        try self.process_request_prepare_response(stream);
         try self.process_request_send_headers(stream);
         try self.process_request_send_body(stream);
+    }
+
+    fn process_request_prepare_response(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
+        if (stream.response_prepared) {
+            return;
+        }
+
+        var response = try self.build_response(stream);
+        errdefer response.deinit();
+        try self.encode_response(stream, &response);
+        stream.response = response;
+        stream.response_prepared = true;
     }
 
     fn process_request_send_headers(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
         if (stream.response_headers_sent) {
             return;
         }
+        try self.process_request_prepare_response(stream);
 
+        const response_header_block = self.responseHeadersBlock(stream);
+        const end_stream = self.shouldEndStreamWithHeaders(stream);
         var headers_frame = FrameHeader{
-            .length = default_response_headers_block.len,
+            .length = @intCast(response_header_block.len),
             .frame_type = FrameType.HEADERS,
-            .flags = FrameFlags{ .value = FrameFlags.END_HEADERS },
+            .flags = .{
+                .value = if (end_stream)
+                    FrameFlags.END_HEADERS | FrameFlags.END_STREAM
+                else
+                    FrameFlags.END_HEADERS,
+            },
             .reserved = false,
             .stream_id = stream.id,
         };
 
         log.debug("Sending HEADERS frame for stream {} ({} bytes)", .{
             stream.id,
-            default_response_headers_block.len,
+            response_header_block.len,
         });
         try headers_frame.write(self.writer);
-        try self.writer.writeAll(&default_response_headers_block);
+        try self.writer.writeAll(response_header_block);
         stream.response_headers_sent = true;
+
+        if (end_stream) {
+            stream.state = transitionState(stream.state, .SendEndStream);
+            if (stream.state == .Closed) {
+                try self.mark_stream_closed(stream.id);
+                assert(self.completed_responses_pending < std.math.maxInt(u32));
+                self.completed_responses_pending += 1;
+            }
+        }
     }
+
     fn process_request_send_body(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
-        if (stream.response_body_sent >= default_response_body.len) {
+        if (!stream.response_headers_sent) {
+            return;
+        }
+        if (self.shouldSuppressResponseBody(stream)) {
+            return;
+        }
+
+        const response_body = self.responseBody(stream);
+        if (stream.response_body_sent >= response_body.len) {
             return;
         }
 
         const connection_window = connection_response_window_available(self.send_window_size);
         const stream_window = connection_response_window_available(stream.send_window_size);
-        const remaining_len = default_response_body.len - stream.response_body_sent;
+        const remaining_len = response_body.len - stream.response_body_sent;
         const frame_limit: usize = @intCast(self.settings.max_frame_size);
         const response_len = @min(remaining_len, @min(frame_limit, @min(connection_window, stream_window)));
         if (response_len == 0) {
@@ -1969,10 +1981,10 @@ pub const Connection = struct {
 
         const response_start = stream.response_body_sent;
         const response_end = response_start + response_len;
-        const end_stream = response_end == default_response_body.len;
+        const end_stream = response_end == response_body.len;
 
         log.debug("Sending DATA frame for stream {} ({} bytes)", .{ stream.id, response_len });
-        try stream.sendData(default_response_body[response_start..response_end], end_stream);
+        try stream.sendData(response_body[response_start..response_end], end_stream);
         self.send_window_size -= @intCast(response_len);
         stream.response_body_sent = response_end;
 
@@ -1982,6 +1994,174 @@ pub const Connection = struct {
             self.completed_responses_pending += 1;
         }
     }
+
+    fn build_response(self: *@This(), stream: *DefaultStream.StreamInstance) !handler.Response {
+        if (self.router) |router| {
+            return self.dispatch_route(router, stream) catch |err| switch (err) {
+                error.InvalidRequestTarget,
+                error.MissingMethod,
+                error.MissingPath,
+                error.RequestTargetTooLarge,
+                => self.simpleResponse(.bad_request, "Bad Request"),
+                error.UnsupportedMethod => self.simpleResponse(.not_implemented, "Not Implemented"),
+                else => return err,
+            };
+        }
+        return self.build_default_response();
+    }
+
+    fn build_default_response(self: *@This()) !handler.Response {
+        const builder = handler.ResponseBuilder.init(self.allocator);
+        return builder.html(.ok, default_response_body);
+    }
+
+    fn dispatch_route(
+        self: *@This(),
+        router: *const handler.Router,
+        stream: *DefaultStream.StreamInstance,
+    ) !handler.Response {
+        const method = try self.requestMethod(stream);
+        var normalized_path_storage: [memory_budget.MemBudget.max_header_size]u8 = undefined;
+        const target = try self.requestTarget(stream, &normalized_path_storage);
+        var context = handler.Context.init(
+            self.allocator,
+            method,
+            target.normalized_path,
+            target.query,
+            stream.request_body_storage[0..stream.request_body_len],
+        );
+        self.copyRequestHeaders(&context, stream);
+
+        return switch (router.lookup(method, target.normalized_path)) {
+            .handler => |route_handler| route_handler(&context) catch |err| {
+                log.err("Handler failed on stream {d}: {s}\n", .{ stream.id, @errorName(err) });
+                return self.simpleResponse(.internal_server_error, "Internal Server Error");
+            },
+            .method_not_allowed => self.simpleResponse(.method_not_allowed, "Method Not Allowed"),
+            .not_found => self.simpleResponse(.not_found, "Not Found"),
+        };
+    }
+
+    fn requestMethod(self: *@This(), stream: *DefaultStream.StreamInstance) !handler.Method {
+        const method_bytes = self.requestPseudoHeader(stream, ":method") orelse {
+            return error.MissingMethod;
+        };
+        return handler.Method.fromBytes(method_bytes) orelse error.UnsupportedMethod;
+    }
+
+    fn requestTarget(
+        self: *@This(),
+        stream: *DefaultStream.StreamInstance,
+        normalized_path_storage: []u8,
+    ) !RequestTarget {
+        const raw_target = self.requestPseudoHeader(stream, ":path") orelse {
+            return error.MissingPath;
+        };
+        return normalizeRequestTarget(raw_target, normalized_path_storage);
+    }
+
+    fn requestPseudoHeader(
+        self: *@This(),
+        stream: *const DefaultStream.StreamInstance,
+        name: []const u8,
+    ) ?[]const u8 {
+        _ = self;
+        for (stream.headers.items) |header_field| {
+            if (std.mem.eql(u8, header_field.name, name)) {
+                return header_field.value;
+            }
+        }
+        return null;
+    }
+
+    fn copyRequestHeaders(
+        self: *@This(),
+        context: *handler.Context,
+        stream: *const DefaultStream.StreamInstance,
+    ) void {
+        _ = self;
+        for (stream.headers.items) |header_field| {
+            if (header_field.name.len == 0) {
+                continue;
+            }
+            if (header_field.name[0] == ':') {
+                continue;
+            }
+            context.headers.put(header_field.name, header_field.value);
+        }
+    }
+
+    fn simpleResponse(self: *@This(), status: handler.Status, body: []const u8) !handler.Response {
+        const builder = handler.ResponseBuilder.init(self.allocator);
+        return builder.text(status, body);
+    }
+
+    fn encode_response(
+        self: *@This(),
+        stream: *DefaultStream.StreamInstance,
+        response: *const handler.Response,
+    ) !void {
+        var encoded = std.ArrayList(u8).initBuffer(&stream.header_block_fragments_buf);
+        var status_storage: [3]u8 = undefined;
+        const status_code = try std.fmt.bufPrint(
+            &status_storage,
+            "{d}",
+            .{@intFromEnum(response.status)},
+        );
+
+        try Hpack.encodeHeaderFieldWithoutIndexing(
+            .{ .name = ":status", .value = status_code },
+            &encoded,
+            self.allocator,
+        );
+        for (response.headers()) |header_field| {
+            try Hpack.encodeHeaderFieldWithoutIndexing(
+                .{ .name = header_field.name, .value = header_field.value },
+                &encoded,
+                self.allocator,
+            );
+        }
+
+        stream.response_header_block_len = encoded.items.len;
+    }
+
+    fn responseHeadersBlock(self: *@This(), stream: *DefaultStream.StreamInstance) []const u8 {
+        _ = self;
+        return stream.header_block_fragments_buf[0..stream.response_header_block_len];
+    }
+
+    fn responseBody(self: *@This(), stream: *DefaultStream.StreamInstance) []const u8 {
+        _ = self;
+        return stream.response.?.body;
+    }
+
+    fn shouldEndStreamWithHeaders(self: *@This(), stream: *DefaultStream.StreamInstance) bool {
+        if (self.shouldSuppressResponseBody(stream)) {
+            return true;
+        }
+        return self.responseBody(stream).len == 0;
+    }
+
+    fn shouldSuppressResponseBody(self: *@This(), stream: *DefaultStream.StreamInstance) bool {
+        const method = self.requestPseudoHeader(stream, ":method") orelse return false;
+        return std.mem.eql(u8, method, "HEAD");
+    }
+
+    fn streamResponseComplete(self: *@This(), stream: *const DefaultStream.StreamInstance) bool {
+        _ = self;
+        if (!stream.response_prepared) {
+            return false;
+        }
+        if (!stream.response_headers_sent) {
+            return false;
+        }
+        if (stream.state == .Closed) {
+            return true;
+        }
+        const response = stream.response orelse return false;
+        return stream.response_body_sent >= response.body.len;
+    }
+
     fn connection_response_window_available(window_size: i32) usize {
         if (window_size > 0) {
             return @intCast(window_size);
@@ -2640,6 +2820,126 @@ fn is_connection_level_frame(frame_type: u8) bool {
     };
 }
 
+fn normalizeRequestTarget(
+    raw_target: []const u8,
+    normalized_path_storage: []u8,
+) !RequestTarget {
+    if (normalized_path_storage.len == 0) {
+        return error.RequestTargetTooLarge;
+    }
+
+    const query_index = std.mem.indexOfScalar(u8, raw_target, '?') orelse raw_target.len;
+    const raw_path = raw_target[0..query_index];
+    const query = if (query_index < raw_target.len)
+        raw_target[query_index + 1 ..]
+    else
+        "";
+
+    var source_index: usize = 0;
+    var target_index: usize = 0;
+    var last_slash: usize = 0;
+
+    normalized_path_storage[target_index] = '/';
+    target_index += 1;
+    if (raw_path.len > 0 and raw_path[0] == '/') {
+        source_index = 1;
+    }
+
+    while (source_index < raw_path.len) {
+        const decoded = try decodePathByte(raw_path, &source_index);
+        if (decoded == 0) return error.InvalidRequestTarget;
+
+        if (decoded == '/') {
+            const rewind = rewindSpecialPath(
+                normalized_path_storage[0..target_index],
+                last_slash,
+            );
+            target_index -= rewind;
+            if (rewind > 0) {
+                last_slash = if (target_index > 0) target_index - 1 else 0;
+                continue;
+            }
+            last_slash = target_index;
+        }
+
+        if (target_index >= normalized_path_storage.len) {
+            return error.RequestTargetTooLarge;
+        }
+        normalized_path_storage[target_index] = decoded;
+        target_index += 1;
+    }
+
+    const rewind = rewindSpecialPath(
+        normalized_path_storage[0..target_index],
+        last_slash,
+    );
+    target_index -= rewind;
+    if (target_index == 0) {
+        normalized_path_storage[0] = '/';
+        target_index = 1;
+    }
+
+    return .{
+        .normalized_path = normalized_path_storage[0..target_index],
+        .query = query,
+    };
+}
+
+fn decodePathByte(raw_path: []const u8, source_index: *usize) !u8 {
+    std.debug.assert(source_index.* < raw_path.len);
+
+    const current = raw_path[source_index.*];
+    if (current != '%') {
+        source_index.* += 1;
+        return current;
+    }
+    if (source_index.* + 2 >= raw_path.len) {
+        source_index.* += 1;
+        return current;
+    }
+
+    const hi = decodeHexDigit(raw_path[source_index.* + 1]) orelse {
+        source_index.* += 1;
+        return current;
+    };
+    const lo = decodeHexDigit(raw_path[source_index.* + 2]) orelse {
+        source_index.* += 1;
+        return current;
+    };
+
+    source_index.* += 3;
+    return (hi << 4) | lo;
+}
+
+fn decodeHexDigit(byte: u8) ?u8 {
+    if (byte >= '0' and byte <= '9') return byte - '0';
+    if (byte >= 'A' and byte <= 'F') return byte - 'A' + 10;
+    if (byte >= 'a' and byte <= 'f') return byte - 'a' + 10;
+    return null;
+}
+
+fn rewindSpecialPath(path: []const u8, last_slash: usize) usize {
+    std.debug.assert(path.len > 0);
+    std.debug.assert(last_slash < path.len);
+
+    const original_len = path.len;
+    var new_len = original_len;
+    const part_len = original_len - last_slash;
+
+    if (part_len == 2 and path[original_len - 1] == '.') {
+        new_len -= 1;
+    } else if (part_len == 3 and path[original_len - 2] == '.' and path[original_len - 1] == '.') {
+        new_len -= 2;
+        if (new_len > 1) {
+            while (new_len > 0 and path[new_len - 1] != '/') {
+                new_len -= 1;
+            }
+        }
+    }
+
+    return original_len - new_len;
+}
+
 fn is_valid_frame_type(frame_type: u8) bool {
     return FrameHandler.fromFrameType(frame_type) != null;
 }
@@ -2935,24 +3235,37 @@ test "send RST_STREAM frame with correct frame_type" {
     try std.testing.expectEqual(written_data[initial_pos + 3], 3);
 }
 
-test "default response headers block decodes without dynamic table churn" {
+test "default response header encoding decodes without dynamic table churn" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
 
+    var buffer: [4096]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    var connection = try Connection.init(allocator, &test_io.reader, &test_io.writer, false);
+    const stream = try connection.get_stream(1);
+
+    var response = try connection.build_default_response();
+    defer response.deinit();
+    try connection.encode_response(stream, &response);
+
     var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
     defer dynamic_table.deinit();
 
+    const expected_content_length = std.fmt.comptimePrint(
+        "{d}",
+        .{default_response_body.len},
+    );
     const expected_headers = [_]Hpack.HeaderField{
         .{ .name = ":status", .value = "200" },
-        .{ .name = "content-length", .value = default_response_content_length },
         .{ .name = "content-type", .value = default_response_content_type },
+        .{ .name = "content-length", .value = expected_content_length },
     };
 
     var offset: usize = 0;
     for (expected_headers) |expected_header| {
         var decoded = try Hpack.decodeHeaderField(
-            default_response_headers_block[offset..],
+            stream.header_block_fragments_buf[offset..stream.response_header_block_len],
             &dynamic_table,
             allocator,
         );
@@ -2963,7 +3276,7 @@ test "default response headers block decodes without dynamic table churn" {
         offset += decoded.bytes_consumed;
     }
 
-    try std.testing.expectEqual(default_response_headers_block.len, offset);
+    try std.testing.expectEqual(stream.response_header_block_len, offset);
     try std.testing.expectEqual(@as(usize, 0), dynamic_table.count);
 }
 
