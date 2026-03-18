@@ -4,7 +4,6 @@
 //! with zero-allocation patterns and optimal performance.
 
 const std = @import("std");
-const http2 = @import("http2.zig");
 
 /// HTTP status codes commonly used in responses.
 pub const Status = enum(u16) {
@@ -156,7 +155,7 @@ pub const Context = struct {
 
 /// Simple header map for request headers.
 pub const HeaderMap = struct {
-    entries: [32]HeaderEntry,
+    entries: [64]HeaderEntry,
     count: u32,
 
     const HeaderEntry = struct {
@@ -168,14 +167,14 @@ pub const HeaderMap = struct {
 
     pub fn init() Self {
         return Self{
-            .entries = std.mem.zeroes([32]HeaderEntry),
+            .entries = std.mem.zeroes([64]HeaderEntry),
             .count = 0,
         };
     }
 
     pub fn put(self: *Self, name: []const u8, value: []const u8) void {
-        std.debug.assert(self.count < 32);
-        if (self.count >= 32) return;
+        std.debug.assert(self.count < self.entries.len);
+        if (self.count >= self.entries.len) return;
 
         self.entries[self.count] = HeaderEntry{
             .name = name,
@@ -211,68 +210,96 @@ pub const HeaderPair = struct {
 /// HTTP response data structure.
 pub const Response = struct {
     status: Status,
-    headers: std.ArrayList(HeaderPair),
+    headers_storage: [32]HeaderPair,
+    headers_count: u8,
     body: []const u8,
-    allocator: std.mem.Allocator,
+    content_length_storage: [32]u8,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, status: Status) Self {
+    pub fn init(status: Status) Self {
         return Self{
             .status = status,
-            .headers = .empty,
+            .headers_storage = undefined,
+            .headers_count = 0,
             .body = "",
-            .allocator = allocator,
+            .content_length_storage = undefined,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        // Free all allocated header values
-        for (self.headers.items) |header| {
-            if (std.mem.eql(u8, header.name, "content-length")) {
-                self.allocator.free(header.value);
-            }
-        }
-        self.headers.deinit(self.allocator);
+        _ = self;
     }
 
     pub fn addHeader(self: *Self, name: []const u8, value: []const u8) !void {
-        try self.headers.append(self.allocator, HeaderPair{ .name = name, .value = value });
+        std.debug.assert(name.len > 0);
+        if (!isAllLowercaseHeaderName(name)) return error.InvalidHeaderName;
+        if (self.headers_count >= self.headers_storage.len) return error.TooManyResponseHeaders;
+
+        self.headers_storage[self.headers_count] = .{
+            .name = name,
+            .value = value,
+        };
+        self.headers_count += 1;
     }
 
-    pub fn setBody(self: *Self, body: []const u8) void {
+    pub fn headers(self: *const Self) []const HeaderPair {
+        return self.headers_storage[0..self.headers_count];
+    }
+
+    pub fn setBody(self: *Self, body: []const u8) !void {
+        std.debug.assert(body.len <= 1024 * 1024);
         self.body = body;
+        try self.ensureContentLength();
+    }
+
+    fn ensureContentLength(self: *Self) !void {
+        if (self.findHeader("content-length")) |value| {
+            const content_length = std.fmt.parseInt(usize, value, 10) catch {
+                return error.InvalidContentLength;
+            };
+            if (content_length != self.body.len) return error.InvalidContentLength;
+            return;
+        }
+
+        const content_length = try std.fmt.bufPrint(
+            &self.content_length_storage,
+            "{d}",
+            .{self.body.len},
+        );
+        try self.addHeader("content-length", content_length);
+    }
+
+    fn findHeader(self: *const Self, name: []const u8) ?[]const u8 {
+        for (self.headers()) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, name)) {
+                return header.value;
+            }
+        }
+        return null;
     }
 };
 
 /// Builder for constructing HTTP responses.
 pub const ResponseBuilder = struct {
-    allocator: std.mem.Allocator,
-
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
-        return Self{
-            .allocator = allocator,
-        };
+        _ = allocator;
+        return Self{};
     }
 
     /// Create a response with the given configuration.
     pub fn apply(self: *const Self, config: ResponseConfig) !Response {
+        _ = self;
         std.debug.assert(config.body.len <= 1024 * 1024); // 1MB max body size
 
-        var response = Response.init(self.allocator, config.status);
+        var response = Response.init(config.status);
 
         // Add content-type header if mime type is specified.
         if (config.mime) |mime_type| {
             try response.addHeader("content-type", mime_type.value());
         }
-
-        // Add content-length header.
-        var content_length_buf: [32]u8 = undefined;
-        const content_length_str = try std.fmt.bufPrint(&content_length_buf, "{d}", .{config.body.len});
-        const content_length_copy = try self.allocator.dupe(u8, content_length_str);
-        try response.addHeader("content-length", content_length_copy);
 
         // Add custom headers if provided.
         if (config.headers) |headers| {
@@ -281,7 +308,7 @@ pub const ResponseBuilder = struct {
             }
         }
 
-        response.setBody(config.body);
+        try response.setBody(config.body);
         return response;
     }
 
@@ -316,22 +343,57 @@ pub const ResponseBuilder = struct {
 /// Request handler function type.
 pub const HandlerFn = *const fn (ctx: *const Context) anyerror!Response;
 
+pub const RouteStyle = enum(u1) {
+    exact,
+    prefix,
+
+    fn rank(self: RouteStyle) u2 {
+        return switch (self) {
+            .exact => 1,
+            .prefix => 0,
+        };
+    }
+};
+
+pub const RouteLookup = union(enum) {
+    handler: HandlerFn,
+    method_not_allowed,
+    not_found,
+};
+
 /// Route definition for mapping paths to handlers.
 pub const Route = struct {
     method: Method,
     path: []const u8,
+    style: RouteStyle,
     handler: HandlerFn,
 
     const Self = @This();
 
-    pub fn init(method: Method, path: []const u8, handler: HandlerFn) Self {
+    pub fn init(
+        method: Method,
+        path: []const u8,
+        style: RouteStyle,
+        handler: HandlerFn,
+    ) Self {
         std.debug.assert(path.len > 0);
         std.debug.assert(path[0] == '/');
 
         return Self{
             .method = method,
             .path = path,
+            .style = style,
             .handler = handler,
+        };
+    }
+
+    fn matches(self: Self, path: []const u8) bool {
+        std.debug.assert(path.len > 0);
+        std.debug.assert(path[0] == '/');
+
+        return switch (self.style) {
+            .exact => std.mem.eql(u8, self.path, path),
+            .prefix => matchesPrefixPath(self.path, path),
         };
     }
 };
@@ -366,12 +428,47 @@ pub const Router = struct {
         try self.addRoute(.post, path, handler);
     }
 
-    /// Add a route for any HTTP method.
-    pub fn addRoute(self: *Self, method: Method, path: []const u8, handler: HandlerFn) !void {
-        std.debug.assert(path.len > 0);
-        std.debug.assert(path[0] == '/');
+    pub fn put(self: *Self, path: []const u8, handler: HandlerFn) !void {
+        try self.addRoute(.put, path, handler);
+    }
 
-        try self.routes.append(self.allocator, Route.init(method, path, handler));
+    pub fn delete(self: *Self, path: []const u8, handler: HandlerFn) !void {
+        try self.addRoute(.delete, path, handler);
+    }
+
+    pub fn head(self: *Self, path: []const u8, handler: HandlerFn) !void {
+        try self.addRoute(.head, path, handler);
+    }
+
+    pub fn options(self: *Self, path: []const u8, handler: HandlerFn) !void {
+        try self.addRoute(.options, path, handler);
+    }
+
+    pub fn patch(self: *Self, path: []const u8, handler: HandlerFn) !void {
+        try self.addRoute(.patch, path, handler);
+    }
+
+    /// Add an exact-match route for a specific HTTP method.
+    pub fn addRoute(self: *Self, method: Method, path: []const u8, handler: HandlerFn) !void {
+        try self.insertRoute(method, path, .exact, handler);
+    }
+
+    /// Add a prefix route using the longest-prefix selection model from h2o.
+    pub fn addPrefixRoute(
+        self: *Self,
+        method: Method,
+        path: []const u8,
+        handler: HandlerFn,
+    ) !void {
+        try self.insertRoute(method, path, .prefix, handler);
+    }
+
+    pub fn getPrefix(self: *Self, path: []const u8, handler: HandlerFn) !void {
+        try self.addPrefixRoute(.get, path, handler);
+    }
+
+    pub fn postPrefix(self: *Self, path: []const u8, handler: HandlerFn) !void {
+        try self.addPrefixRoute(.post, path, handler);
     }
 
     /// Set a fallback handler for unmatched requests.
@@ -381,19 +478,135 @@ pub const Router = struct {
 
     /// Find handler for the given method and path.
     pub fn findHandler(self: *const Self, method: Method, path: []const u8) ?HandlerFn {
+        return switch (self.lookup(method, path)) {
+            .handler => |handler| handler,
+            .method_not_allowed => null,
+            .not_found => null,
+        };
+    }
+
+    pub fn lookup(self: *const Self, method: Method, path: []const u8) RouteLookup {
         std.debug.assert(path.len > 0);
+        std.debug.assert(path[0] == '/');
+
+        var matched_path_len: ?usize = null;
+        var matched_path_style: ?RouteStyle = null;
 
         for (self.routes.items) |route| {
-            if (route.method == method) {
-                if (std.mem.eql(u8, route.path, path)) {
-                    return route.handler;
+            if (!route.matches(path)) {
+                continue;
+            }
+
+            if (matched_path_len == null) {
+                matched_path_len = route.path.len;
+                matched_path_style = route.style;
+            } else {
+                if (route.path.len != matched_path_len.?) {
+                    break;
                 }
+                if (route.style != matched_path_style.?) {
+                    break;
+                }
+            }
+
+            if (route.method == method) {
+                return .{ .handler = route.handler };
             }
         }
 
-        return self.fallback_handler;
+        if (matched_path_len != null) {
+            return .method_not_allowed;
+        }
+        if (self.fallback_handler) |handler| {
+            return .{ .handler = handler };
+        }
+        return .not_found;
+    }
+
+    fn insertRoute(
+        self: *Self,
+        method: Method,
+        path: []const u8,
+        style: RouteStyle,
+        handler: HandlerFn,
+    ) !void {
+        std.debug.assert(path.len > 0);
+        std.debug.assert(path[0] == '/');
+
+        const route = Route.init(method, path, style, handler);
+        try self.ensureUniqueRoute(route);
+        const slot = self.findInsertSlot(route);
+        try self.routes.insert(self.allocator, slot, route);
+    }
+
+    fn ensureUniqueRoute(self: *const Self, route: Route) !void {
+        for (self.routes.items) |existing| {
+            if (existing.method != route.method) continue;
+            if (existing.style != route.style) continue;
+            if (!std.mem.eql(u8, existing.path, route.path)) continue;
+            return error.DuplicateRoute;
+        }
+    }
+
+    fn findInsertSlot(self: *const Self, route: Route) usize {
+        for (self.routes.items, 0..) |existing, index| {
+            if (route.path.len > existing.path.len) {
+                return index;
+            }
+
+            if (route.path.len < existing.path.len) {
+                continue;
+            }
+
+            if (route.style.rank() > existing.style.rank()) {
+                return index;
+            }
+
+            if (route.style.rank() < existing.style.rank()) {
+                continue;
+            }
+
+            switch (std.mem.order(u8, route.path, existing.path)) {
+                .lt => return index,
+                .eq => {
+                    if (@intFromEnum(route.method) < @intFromEnum(existing.method)) {
+                        return index;
+                    }
+                },
+                .gt => {},
+            }
+        }
+
+        return self.routes.items.len;
     }
 };
+
+fn matchesPrefixPath(prefix: []const u8, path: []const u8) bool {
+    std.debug.assert(prefix.len > 0);
+    std.debug.assert(path.len > 0);
+    std.debug.assert(prefix[0] == '/');
+    std.debug.assert(path[0] == '/');
+
+    if (!std.mem.startsWith(u8, path, prefix)) {
+        return false;
+    }
+    if (prefix[prefix.len - 1] == '/') {
+        return true;
+    }
+    if (path.len == prefix.len) {
+        return true;
+    }
+    return path[prefix.len] == '/';
+}
+
+fn isAllLowercaseHeaderName(name: []const u8) bool {
+    for (name) |byte| {
+        if (std.ascii.isUpper(byte)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 test "status phrase lookup" {
     try std.testing.expectEqualStrings("OK", Status.ok.phrase());
@@ -443,6 +656,60 @@ test "router path matching" {
     try testing.expect(router.findHandler(.post, "/") == null);
 }
 
+test "router prefix routes prefer the longest match" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const root_handler: HandlerFn = struct {
+        fn handler(ctx: *const Context) !Response {
+            return ctx.response.text(.ok, "root");
+        }
+    }.handler;
+
+    const api_handler: HandlerFn = struct {
+        fn handler(ctx: *const Context) !Response {
+            return ctx.response.text(.ok, "api");
+        }
+    }.handler;
+
+    try router.getPrefix("/api", api_handler);
+    try router.get("/", root_handler);
+
+    const route = router.lookup(.get, "/api/users");
+    try testing.expect(route == .handler);
+    try testing.expect(route.handler == api_handler);
+    try testing.expect(router.findHandler(.get, "/") == root_handler);
+}
+
+test "router returns method not allowed before fallback" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const route_handler: HandlerFn = struct {
+        fn handler(ctx: *const Context) !Response {
+            return ctx.response.text(.ok, "route");
+        }
+    }.handler;
+
+    const fallback_handler: HandlerFn = struct {
+        fn handler(ctx: *const Context) !Response {
+            return ctx.response.text(.not_found, "fallback");
+        }
+    }.handler;
+
+    try router.get("/resource", route_handler);
+    router.setFallback(fallback_handler);
+
+    const lookup = router.lookup(.post, "/resource");
+    try testing.expect(lookup == .method_not_allowed);
+}
+
 test "response builder" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -454,4 +721,5 @@ test "response builder" {
 
     try testing.expectEqual(Status.ok, response.status);
     try testing.expectEqualStrings("<h1>Hello</h1>", response.body);
+    try testing.expectEqual(@as(usize, 2), response.headers().len);
 }
