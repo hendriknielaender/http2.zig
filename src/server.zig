@@ -274,7 +274,7 @@ pub const Server = struct {
         connection_slot: *ConnectionSlot,
     ) !void {
         if (backend_uses_evented) {
-            self.connection_group.@"async"(io, serveConnectionTask, .{
+            self.connection_group.async(io, serveConnectionTask, .{
                 self,
                 stream,
                 connection_slot,
