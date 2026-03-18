@@ -836,7 +836,7 @@ pub const Connection = struct {
             log.err("Received frame size {} exceeds SETTINGS_MAX_FRAME_SIZE {}, sending GOAWAY", .{ parsed.length, self.settings.max_frame_size });
             try self.send_goaway(self.last_stream_id, 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
             self.goaway_sent = true;
-            try self.flush_output();
+            try self.finishAfterGoaway();
             return error.FrameSizeError;
         }
         if (parsed.length + 9 > buffer.len) return error.BufferTooSmall;
@@ -1219,7 +1219,7 @@ pub const Connection = struct {
 
             self.dispatchFrameOptimized(frame) catch |err| {
                 if (self.goaway_sent) {
-                    try self.flush_output();
+                    try self.finishAfterGoaway();
                     return;
                 }
                 try self.flush_output();
@@ -1264,14 +1264,14 @@ pub const Connection = struct {
                     log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id, stream_id });
                     try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
                     self.goaway_sent = true;
-                    try self.flush_output();
+                    try self.finishAfterGoaway();
                     return error.ProtocolError;
                 }
             }
 
             self.dispatchFrameOptimized(frame) catch |err| {
                 if (self.goaway_sent) {
-                    try self.flush_output();
+                    try self.finishAfterGoaway();
                     return;
                 }
                 try self.flush_output();
@@ -1290,6 +1290,29 @@ pub const Connection = struct {
         try self.flush_output();
         log.debug("SIMD-optimized connection handler terminated gracefully.", .{});
     }
+
+    fn finishAfterGoaway(self: *@This()) !void {
+        try self.flush_output();
+        try self.drain_connection();
+    }
+
+    fn drain_connection(self: *@This()) !void {
+        var drain_buffer: [1024]u8 = undefined;
+        var drain_attempts: u32 = 0;
+        const max_drain_attempts = 100;
+
+        while (drain_attempts < max_drain_attempts) : (drain_attempts += 1) {
+            const bytes_read = self.reader.readSliceShort(&drain_buffer) catch |err| {
+                log.debug("Connection drain completed: {s}", .{@errorName(err)});
+                return;
+            };
+            if (bytes_read == 0) {
+                return;
+            }
+        }
+        log.debug("Connection drain completed after {} attempts", .{drain_attempts});
+    }
+
     /// Adjust frame handling and validation per RFC 9113.
     pub fn handle_connection(self: *@This()) !void {
         // Use optimized connection handler with SIMD frame parsing
@@ -2544,7 +2567,7 @@ pub const Connection = struct {
             self.update_send_window(@intCast(increment)) catch |err| {
                 if (err == error.FlowControlError) {
                     // GOAWAY was already sent by update_send_window, ensure it's flushed
-                    try self.flush_output();
+                    try self.finishAfterGoaway();
                     return;
                 }
                 return err;
