@@ -5,6 +5,10 @@ libhttp2.a.o
 
 zig-out/
 .zig-cache/
+.zig-global-cache/
+dist/
+release-assets/
+release-stage/
 
 *.pem
 *.crt

@@ -16,6 +16,8 @@ concurrency:
 
 env:
   ZIG_VERSION: 0.16.0-dev.2905+5d71e3051
+  ZLINT_VERSION: v0.7.9
+  BORINGSSL_CACHE_VERSION: v1
 
 defaults:
   run:
@@ -41,20 +43,144 @@ jobs:
       - name: Check formatting
         run: zig build fmt-check
 
-  build_test:
-    name: Build & Unit Test (${{ matrix.os }}, evented=${{ matrix.evented }})
-    runs-on: ${{ matrix.os }}
+  zlint:
+    name: zlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install zlint
+        run: |
+          case "$(uname -m)" in
+            x86_64) target="linux-x86_64" ;;
+            aarch64 | arm64) target="linux-aarch64" ;;
+            *)
+              echo "Unsupported zlint architecture: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          install_dir="${RUNNER_TEMP}/zlint-bin"
+          mkdir -p "${install_dir}"
+          curl --fail --location --silent --show-error --retry 3 --retry-delay 2 \
+            --output "${install_dir}/zlint" \
+            "https://github.com/DonIsaac/zlint/releases/download/${ZLINT_VERSION}/zlint-${target}"
+          chmod +x "${install_dir}/zlint"
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+
+      - name: Run zlint
+        run: zlint . --deny-warnings --format github
+
+  boringssl_linux:
+    name: Prepare BoringSSL (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Resolve BoringSSL revision
+        id: boringssl
+        run: |
+          revision="$(git submodule status -- boringssl | awk '{gsub(/^[ -+]/, "", $1); print $1}')"
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore BoringSSL cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-linux-${{ steps.boringssl.outputs.revision }}
+
+      - name: Build BoringSSL
+        run: |
+          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
+            echo "Using cached BoringSSL build."
+            exit 0
+          fi
+
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build boringssl/build --parallel
+
+      - name: Upload BoringSSL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boringssl-linux
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  boringssl_macos:
+    name: Prepare BoringSSL (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Resolve BoringSSL revision
+        id: boringssl
+        run: |
+          revision="$(git submodule status -- boringssl | awk '{gsub(/^[ -+]/, "", $1); print $1}')"
+          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore BoringSSL cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-macos-${{ steps.boringssl.outputs.revision }}
+
+      - name: Build BoringSSL
+        run: |
+          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
+            echo "Using cached BoringSSL build."
+            exit 0
+          fi
+
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build boringssl/build --parallel
+
+      - name: Upload BoringSSL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boringssl-macos
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  build_test_linux:
+    name: Build & Unit Test (ubuntu-latest, evented=${{ matrix.evented }})
+    needs: boringssl_linux
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            evented: false
-          - os: ubuntu-latest
-            evented: true
-          - os: macos-latest
-            evented: false
+        evented:
+          - false
+          - true
 
     steps:
       - name: Checkout source
@@ -68,10 +194,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build BoringSSL
-        run: |
-          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build boringssl/build --parallel
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
 
       - name: Build release artifacts
         run: zig build -Doptimize=ReleaseFast -Devented=${{ matrix.evented }}
@@ -79,8 +206,39 @@ jobs:
       - name: Run unit tests
         run: zig build test -Devented=${{ matrix.evented }}
 
+  build_test_macos:
+    name: Build & Unit Test (macos-latest)
+    needs: boringssl_macos
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-macos
+          path: boringssl/build
+
+      - name: Build release artifacts
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run unit tests
+        run: zig build test
+
   docs:
     name: Docs
+    needs: boringssl_linux
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -96,10 +254,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build BoringSSL
-        run: |
-          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build boringssl/build --parallel
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
 
       - name: Generate documentation
         run: zig build docs
@@ -114,6 +273,7 @@ jobs:
 
   conformance:
     name: HTTP/2 Conformance
+    needs: boringssl_linux
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -132,10 +292,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Build BoringSSL
-        run: |
-          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build boringssl/build --parallel
+      - name: Download BoringSSL build
+        uses: actions/download-artifact@v4
+        with:
+          name: boringssl-linux
+          path: boringssl/build
 
       - name: Build benchmark server
         run: zig build -Doptimize=ReleaseFast
