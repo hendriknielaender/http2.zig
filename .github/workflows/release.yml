@@ -70,54 +70,6 @@ jobs:
           retention-days: 7
           compression-level: 0
 
-  boringssl_macos:
-    name: Prepare BoringSSL (macOS)
-    runs-on: macos-latest
-    timeout-minutes: 20
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Resolve BoringSSL revision
-        id: boringssl
-        run: |
-          revision="$(git submodule status -- boringssl | awk '{gsub(/^[ -+]/, "", $1); print $1}')"
-          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore BoringSSL cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            boringssl/build/crypto
-            boringssl/build/ssl
-          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-macos-${{ steps.boringssl.outputs.revision }}
-
-      - name: Build BoringSSL
-        run: |
-          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
-            echo "Using cached BoringSSL build."
-            exit 0
-          fi
-
-          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build boringssl/build --parallel
-
-      - name: Upload BoringSSL artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: boringssl-macos
-          path: |
-            boringssl/build/crypto
-            boringssl/build/ssl
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
-
   verify:
     name: Verify release
     needs: boringssl_linux
@@ -294,7 +246,6 @@ jobs:
             docs \
             examples \
             src \
-            tools \
             | tar --null --files-from - -cf - \
             | tar -C "${stage_root}" -xf -
 
@@ -375,74 +326,11 @@ jobs:
           retention-days: 14
           compression-level: 0
 
-  package_native_macos:
-    name: Package native assets (macOS)
-    needs:
-      - verify
-      - boringssl_macos
-    runs-on: macos-latest
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Download BoringSSL build
-        uses: actions/download-artifact@v4
-        with:
-          name: boringssl-macos
-          path: boringssl/build
-
-      - name: Build installable release payload
-        run: zig build -Doptimize=ReleaseFast --prefix "$PWD/dist/install"
-
-      - name: Package native bundle
-        run: |
-          mkdir -p release-assets
-          version="${GITHUB_REF_NAME#v}"
-          case "${RUNNER_ARCH}" in
-            X64) arch="x86_64" ;;
-            ARM64) arch="aarch64" ;;
-            *)
-              echo "Unsupported runner architecture: ${RUNNER_ARCH}" >&2
-              exit 1
-              ;;
-          esac
-          bundle_root="http2-v${version}-macos-${arch}"
-          bundle_dir="release-assets/${bundle_root}"
-
-          mkdir -p "${bundle_dir}/bin" "${bundle_dir}/lib"
-          cp LICENSE README.md "${bundle_dir}/"
-          cp "$PWD/dist/install/bin/basic_tls_server" "${bundle_dir}/bin/"
-          cp "$PWD/dist/install/bin/benchmark" "${bundle_dir}/bin/"
-          cp "$PWD/dist/install/lib/libhttp2.a" "${bundle_dir}/lib/"
-
-          tar -C release-assets -czf "release-assets/${bundle_root}.tar.gz" "${bundle_root}"
-
-      - name: Upload native release assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-macos
-          path: release-assets/*.tar.gz
-          if-no-files-found: error
-          retention-days: 14
-          compression-level: 0
-
   publish:
     name: Publish GitHub release
     needs:
       - package_source
       - package_native_linux
-      - package_native_macos
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
