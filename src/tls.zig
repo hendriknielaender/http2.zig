@@ -193,6 +193,8 @@ pub const TlsServerContext = struct {
             return TlsError.HandshakeFailed;
         }
 
+        connection.handshake_state = .complete;
+
         return connection;
     }
 
@@ -412,6 +414,10 @@ pub const TlsServerConnection = struct {
         if (self.ssl == null) return;
 
         if (self.ssl) |ssl_val| {
+            if (self.handshake_state == .complete) {
+                _ = boringssl.SSL_shutdown(ssl_val);
+                _ = boringssl.ERR_clear_error();
+            }
             boringssl.SSL_free(ssl_val);
             self.ssl = null;
         }

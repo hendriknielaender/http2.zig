@@ -2307,7 +2307,7 @@ pub const Connection = struct {
         // Per RFC 9113 Section 6.9.2: Values above 2^31-1 MUST be treated as FLOW_CONTROL_ERROR
         const max_window_size: u32 = 2147483647;
         if (value > max_window_size) {
-            log.err("SETTINGS_INITIAL_WINDOW_SIZE too large {d}: FLOW_CONTROL_ERROR\n", .{value});
+            log.debug("SETTINGS_INITIAL_WINDOW_SIZE too large {d}: FLOW_CONTROL_ERROR\n", .{value});
             if (!self.goaway_sent) {
                 try self.send_goaway(0, 0x3, "SETTINGS_INITIAL_WINDOW_SIZE too large: FLOW_CONTROL_ERROR");
                 self.goaway_sent = true;
@@ -2775,6 +2775,45 @@ test "apply_frame_settings test" {
     try std.testing.expect(connection.settings.header_table_size == 4096);
     try std.testing.expect(connection.settings.max_concurrent_streams == 100);
     try std.testing.expect(connection.settings.initial_window_size == 65535);
+}
+
+test "apply_frame_settings rejects oversized initial window with GOAWAY" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    var buffer: [4096]u8 = undefined;
+    var test_io = TestIo.init(&.{}, &buffer);
+    const allocator = arena.allocator();
+
+    var connection = try Connection.init(allocator, &test_io.reader, &test_io.writer, false);
+    test_io.resetWriter(&buffer);
+
+    const frame = Frame{
+        .header = .{
+            .length = 6,
+            .frame_type = .SETTINGS,
+            .flags = FrameFlags.init(0),
+            .reserved = false,
+            .stream_id = 0,
+        },
+        .payload = &[_]u8{
+            0x00, 0x04,
+            0x80, 0x00,
+            0x00, 0x00,
+        },
+    };
+
+    try connection.apply_frame_settings(frame);
+
+    try std.testing.expect(connection.goaway_sent);
+    try std.testing.expectEqual(@as(u32, 65535), connection.settings.initial_window_size);
+
+    const written = test_io.written();
+    try std.testing.expect(written.len >= 17);
+    try std.testing.expectEqual(@intFromEnum(FrameType.GOAWAY), written[3]);
+
+    const goaway_error_code = std.mem.readInt(u32, written[13..17], .big);
+    try std.testing.expectEqual(@as(u32, 0x3), goaway_error_code);
 }
 
 test "default settings stream" {
