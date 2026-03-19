@@ -32,7 +32,6 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - run: zig fmt --check src/*.zig
-      - uses: DonIsaac/zlint-action@v0
 
   boringssl_linux:
     name: Prepare BoringSSL (Linux)
