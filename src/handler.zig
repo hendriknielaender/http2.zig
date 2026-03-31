@@ -89,15 +89,27 @@ pub const Method = enum {
     options,
     patch,
 
-    pub fn fromBytes(bytes: []const u8) ?Method {
-        if (std.mem.eql(u8, bytes, "GET")) return .get;
-        if (std.mem.eql(u8, bytes, "POST")) return .post;
-        if (std.mem.eql(u8, bytes, "PUT")) return .put;
-        if (std.mem.eql(u8, bytes, "DELETE")) return .delete;
-        if (std.mem.eql(u8, bytes, "HEAD")) return .head;
-        if (std.mem.eql(u8, bytes, "OPTIONS")) return .options;
-        if (std.mem.eql(u8, bytes, "PATCH")) return .patch;
+    pub fn fromBytes(method_bytes: []const u8) ?Method {
+        if (std.mem.eql(u8, method_bytes, "GET")) return .get;
+        if (std.mem.eql(u8, method_bytes, "POST")) return .post;
+        if (std.mem.eql(u8, method_bytes, "PUT")) return .put;
+        if (std.mem.eql(u8, method_bytes, "DELETE")) return .delete;
+        if (std.mem.eql(u8, method_bytes, "HEAD")) return .head;
+        if (std.mem.eql(u8, method_bytes, "OPTIONS")) return .options;
+        if (std.mem.eql(u8, method_bytes, "PATCH")) return .patch;
         return null;
+    }
+
+    pub fn bytes(self: Method) []const u8 {
+        return switch (self) {
+            .get => "GET",
+            .post => "POST",
+            .put => "PUT",
+            .delete => "DELETE",
+            .head => "HEAD",
+            .options => "OPTIONS",
+            .patch => "PATCH",
+        };
     }
 };
 
@@ -343,261 +355,68 @@ pub const ResponseBuilder = struct {
 /// Request handler function type.
 pub const HandlerFn = *const fn (ctx: *const Context) anyerror!Response;
 
-pub const RouteStyle = enum(u1) {
-    exact,
-    prefix,
+pub const RequestDispatcherFn = *const fn (
+    state: ?*const anyopaque,
+    ctx: *const Context,
+) anyerror!Response;
 
-    fn rank(self: RouteStyle) u2 {
-        return switch (self) {
-            .exact => 1,
-            .prefix => 0,
-        };
-    }
-};
-
-pub const RouteLookup = union(enum) {
-    handler: HandlerFn,
-    method_not_allowed,
-    not_found,
-};
-
-/// Route definition for mapping paths to handlers.
-pub const Route = struct {
-    method: Method,
-    path: []const u8,
-    style: RouteStyle,
-    handler: HandlerFn,
+/// Request dispatcher hook for plugging in any router or application policy.
+pub const RequestDispatcher = struct {
+    state: ?*const anyopaque,
+    dispatch_fn: RequestDispatcherFn,
 
     const Self = @This();
 
-    pub fn init(
-        method: Method,
-        path: []const u8,
-        style: RouteStyle,
-        handler: HandlerFn,
+    pub fn init(state: ?*const anyopaque, dispatch_fn: RequestDispatcherFn) Self {
+        if (state) |non_null_state| {
+            std.debug.assert(@intFromPtr(non_null_state) != 0);
+        }
+
+        return .{
+            .state = state,
+            .dispatch_fn = dispatch_fn,
+        };
+    }
+
+    pub fn fromHandler(comptime handler: HandlerFn) Self {
+        const Adapter = struct {
+            fn dispatch(_: ?*const anyopaque, ctx: *const Context) anyerror!Response {
+                return handler(ctx);
+            }
+        };
+
+        return .{
+            .state = null,
+            .dispatch_fn = Adapter.dispatch,
+        };
+    }
+
+    pub fn bind(
+        comptime DispatcherState: type,
+        state: *const DispatcherState,
+        comptime dispatch_fn: *const fn (
+            state: *const DispatcherState,
+            ctx: *const Context,
+        ) anyerror!Response,
     ) Self {
-        std.debug.assert(path.len > 0);
-        std.debug.assert(path[0] == '/');
+        const Adapter = struct {
+            fn dispatch(raw_state: ?*const anyopaque, ctx: *const Context) anyerror!Response {
+                std.debug.assert(raw_state != null);
+                const typed_state: *const DispatcherState = @ptrCast(@alignCast(raw_state.?));
+                return dispatch_fn(typed_state, ctx);
+            }
+        };
 
-        return Self{
-            .method = method,
-            .path = path,
-            .style = style,
-            .handler = handler,
+        return .{
+            .state = state,
+            .dispatch_fn = Adapter.dispatch,
         };
     }
 
-    fn matches(self: Self, path: []const u8) bool {
-        std.debug.assert(path.len > 0);
-        std.debug.assert(path[0] == '/');
-
-        return switch (self.style) {
-            .exact => std.mem.eql(u8, self.path, path),
-            .prefix => matchesPrefixPath(self.path, path),
-        };
+    pub fn call(self: Self, ctx: *const Context) anyerror!Response {
+        return self.dispatch_fn(self.state, ctx);
     }
 };
-
-/// Simple router for matching requests to handlers.
-pub const Router = struct {
-    routes: std.ArrayList(Route),
-    allocator: std.mem.Allocator,
-    fallback_handler: ?HandlerFn,
-
-    const Self = @This();
-
-    pub fn init(allocator: std.mem.Allocator) Self {
-        return Self{
-            .routes = .empty,
-            .allocator = allocator,
-            .fallback_handler = null,
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.routes.deinit(self.allocator);
-    }
-
-    /// Add a route for GET requests.
-    pub fn get(self: *Self, path: []const u8, handler: HandlerFn) !void {
-        try self.addRoute(.get, path, handler);
-    }
-
-    /// Add a route for POST requests.
-    pub fn post(self: *Self, path: []const u8, handler: HandlerFn) !void {
-        try self.addRoute(.post, path, handler);
-    }
-
-    pub fn put(self: *Self, path: []const u8, handler: HandlerFn) !void {
-        try self.addRoute(.put, path, handler);
-    }
-
-    pub fn delete(self: *Self, path: []const u8, handler: HandlerFn) !void {
-        try self.addRoute(.delete, path, handler);
-    }
-
-    pub fn head(self: *Self, path: []const u8, handler: HandlerFn) !void {
-        try self.addRoute(.head, path, handler);
-    }
-
-    pub fn options(self: *Self, path: []const u8, handler: HandlerFn) !void {
-        try self.addRoute(.options, path, handler);
-    }
-
-    pub fn patch(self: *Self, path: []const u8, handler: HandlerFn) !void {
-        try self.addRoute(.patch, path, handler);
-    }
-
-    /// Add an exact-match route for a specific HTTP method.
-    pub fn addRoute(self: *Self, method: Method, path: []const u8, handler: HandlerFn) !void {
-        try self.insertRoute(method, path, .exact, handler);
-    }
-
-    /// Add a prefix route using the longest-prefix selection model.
-    pub fn addPrefixRoute(
-        self: *Self,
-        method: Method,
-        path: []const u8,
-        handler: HandlerFn,
-    ) !void {
-        try self.insertRoute(method, path, .prefix, handler);
-    }
-
-    pub fn getPrefix(self: *Self, path: []const u8, handler: HandlerFn) !void {
-        try self.addPrefixRoute(.get, path, handler);
-    }
-
-    pub fn postPrefix(self: *Self, path: []const u8, handler: HandlerFn) !void {
-        try self.addPrefixRoute(.post, path, handler);
-    }
-
-    /// Set a fallback handler for unmatched requests.
-    pub fn setFallback(self: *Self, handler: HandlerFn) void {
-        self.fallback_handler = handler;
-    }
-
-    /// Find handler for the given method and path.
-    pub fn findHandler(self: *const Self, method: Method, path: []const u8) ?HandlerFn {
-        return switch (self.lookup(method, path)) {
-            .handler => |handler| handler,
-            .method_not_allowed => null,
-            .not_found => null,
-        };
-    }
-
-    pub fn lookup(self: *const Self, method: Method, path: []const u8) RouteLookup {
-        std.debug.assert(path.len > 0);
-        std.debug.assert(path[0] == '/');
-
-        var matched_path_len: ?usize = null;
-        var matched_path_style: ?RouteStyle = null;
-
-        for (self.routes.items) |route| {
-            if (!route.matches(path)) {
-                continue;
-            }
-
-            if (matched_path_len == null) {
-                matched_path_len = route.path.len;
-                matched_path_style = route.style;
-            } else {
-                if (route.path.len != matched_path_len.?) {
-                    break;
-                }
-                if (route.style != matched_path_style.?) {
-                    break;
-                }
-            }
-
-            if (route.method == method) {
-                return .{ .handler = route.handler };
-            }
-        }
-
-        if (matched_path_len != null) {
-            return .method_not_allowed;
-        }
-        if (self.fallback_handler) |handler| {
-            return .{ .handler = handler };
-        }
-        return .not_found;
-    }
-
-    fn insertRoute(
-        self: *Self,
-        method: Method,
-        path: []const u8,
-        style: RouteStyle,
-        handler: HandlerFn,
-    ) !void {
-        std.debug.assert(path.len > 0);
-        std.debug.assert(path[0] == '/');
-
-        const route = Route.init(method, path, style, handler);
-        try self.ensureUniqueRoute(route);
-        const slot = self.findInsertSlot(route);
-        try self.routes.insert(self.allocator, slot, route);
-    }
-
-    fn ensureUniqueRoute(self: *const Self, route: Route) !void {
-        for (self.routes.items) |existing| {
-            if (existing.method != route.method) continue;
-            if (existing.style != route.style) continue;
-            if (!std.mem.eql(u8, existing.path, route.path)) continue;
-            return error.DuplicateRoute;
-        }
-    }
-
-    fn findInsertSlot(self: *const Self, route: Route) usize {
-        for (self.routes.items, 0..) |existing, index| {
-            if (route.path.len > existing.path.len) {
-                return index;
-            }
-
-            if (route.path.len < existing.path.len) {
-                continue;
-            }
-
-            if (route.style.rank() > existing.style.rank()) {
-                return index;
-            }
-
-            if (route.style.rank() < existing.style.rank()) {
-                continue;
-            }
-
-            switch (std.mem.order(u8, route.path, existing.path)) {
-                .lt => return index,
-                .eq => {
-                    if (@intFromEnum(route.method) < @intFromEnum(existing.method)) {
-                        return index;
-                    }
-                },
-                .gt => {},
-            }
-        }
-
-        return self.routes.items.len;
-    }
-};
-
-fn matchesPrefixPath(prefix: []const u8, path: []const u8) bool {
-    std.debug.assert(prefix.len > 0);
-    std.debug.assert(path.len > 0);
-    std.debug.assert(prefix[0] == '/');
-    std.debug.assert(path[0] == '/');
-
-    if (!std.mem.startsWith(u8, path, prefix)) {
-        return false;
-    }
-    if (prefix[prefix.len - 1] == '/') {
-        return true;
-    }
-    if (path.len == prefix.len) {
-        return true;
-    }
-    return path[prefix.len] == '/';
-}
 
 fn isAllLowercaseHeaderName(name: []const u8) bool {
     for (name) |byte| {
@@ -624,6 +443,12 @@ test "method parsing" {
     try std.testing.expect(Method.fromBytes("INVALID") == null);
 }
 
+test "method bytes" {
+    try std.testing.expectEqualStrings("GET", Method.get.bytes());
+    try std.testing.expectEqualStrings("POST", Method.post.bytes());
+    try std.testing.expectEqualStrings("PATCH", Method.patch.bytes());
+}
+
 test "header map operations" {
     var headers = HeaderMap.init();
     headers.put("content-type", "text/html");
@@ -634,80 +459,43 @@ test "header map operations" {
     try std.testing.expect(headers.get("nonexistent") == null);
 }
 
-test "router path matching" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var router = Router.init(allocator);
-    defer router.deinit();
+test "request dispatcher wraps a stateless handler" {
+    const allocator = std.testing.allocator;
 
     const test_handler: HandlerFn = struct {
         fn handler(ctx: *const Context) !Response {
-            return ctx.response.text(.ok, "test");
+            return ctx.response.text(.ok, "stateless");
         }
     }.handler;
 
-    try router.get("/", test_handler);
-    try router.get("/test", test_handler);
+    const dispatcher = RequestDispatcher.fromHandler(test_handler);
+    var context = Context.init(allocator, .get, "/", "", "");
+    var response = try dispatcher.call(&context);
+    defer response.deinit();
 
-    try testing.expect(router.findHandler(.get, "/") != null);
-    try testing.expect(router.findHandler(.get, "/test") != null);
-    try testing.expect(router.findHandler(.get, "/nonexistent") == null);
-    try testing.expect(router.findHandler(.post, "/") == null);
+    try std.testing.expectEqual(Status.ok, response.status);
+    try std.testing.expectEqualStrings("stateless", response.body);
 }
 
-test "router prefix routes prefer the longest match" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
+test "request dispatcher binds typed state" {
+    const allocator = std.testing.allocator;
 
-    var router = Router.init(allocator);
-    defer router.deinit();
+    const App = struct {
+        body: []const u8,
 
-    const root_handler: HandlerFn = struct {
-        fn handler(ctx: *const Context) !Response {
-            return ctx.response.text(.ok, "root");
+        fn dispatch(self: *const @This(), ctx: *const Context) !Response {
+            return ctx.response.text(.ok, self.body);
         }
-    }.handler;
+    };
 
-    const api_handler: HandlerFn = struct {
-        fn handler(ctx: *const Context) !Response {
-            return ctx.response.text(.ok, "api");
-        }
-    }.handler;
+    const app = App{ .body = "bound" };
+    const dispatcher = RequestDispatcher.bind(App, &app, App.dispatch);
+    var context = Context.init(allocator, .get, "/", "", "");
+    var response = try dispatcher.call(&context);
+    defer response.deinit();
 
-    try router.getPrefix("/api", api_handler);
-    try router.get("/", root_handler);
-
-    const route = router.lookup(.get, "/api/users");
-    try testing.expect(route == .handler);
-    try testing.expect(route.handler == api_handler);
-    try testing.expect(router.findHandler(.get, "/") == root_handler);
-}
-
-test "router returns method not allowed before fallback" {
-    const testing = std.testing;
-    const allocator = testing.allocator;
-
-    var router = Router.init(allocator);
-    defer router.deinit();
-
-    const route_handler: HandlerFn = struct {
-        fn handler(ctx: *const Context) !Response {
-            return ctx.response.text(.ok, "route");
-        }
-    }.handler;
-
-    const fallback_handler: HandlerFn = struct {
-        fn handler(ctx: *const Context) !Response {
-            return ctx.response.text(.not_found, "fallback");
-        }
-    }.handler;
-
-    try router.get("/resource", route_handler);
-    router.setFallback(fallback_handler);
-
-    const lookup = router.lookup(.post, "/resource");
-    try testing.expect(lookup == .method_not_allowed);
+    try std.testing.expectEqual(Status.ok, response.status);
+    try std.testing.expectEqualStrings("bound", response.body);
 }
 
 test "response builder" {

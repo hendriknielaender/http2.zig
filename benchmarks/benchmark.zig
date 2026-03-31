@@ -6,9 +6,15 @@ pub const std_options: std.Options = .{
     .log_level = .warn,
 };
 
-/// Simple Hello World handler for benchmarking
-fn helloHandler(ctx: *const http2.Context) !http2.Response {
-    return ctx.response.text(.ok, "Hello, World!");
+/// Simple request dispatcher for benchmarking.
+fn benchmarkHandler(ctx: *const http2.Context) !http2.Response {
+    if (ctx.method == .get) {
+        if (std.mem.eql(u8, ctx.path, "/")) {
+            return ctx.response.text(.ok, "Hello, World!");
+        }
+    }
+
+    return ctx.response.text(.not_found, "Not Found");
 }
 
 /// High-performance HTTP/2 over HTTPS benchmark server
@@ -35,16 +41,10 @@ pub fn main() !void {
     else
         (if (use_tls) @as(u16, 8443) else @as(u16, 3000));
 
-    // Set up simple router for benchmarking
-    var router = http2.Router.init(allocator);
-    defer router.deinit();
-
-    try router.get("/", helloHandler);
-
     // Configure server for benchmarking with high concurrency
     const config = http2.Server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", port),
-        .router = &router,
+        .dispatcher = http2.RequestDispatcher.fromHandler(benchmarkHandler),
         .max_connections = http2.memory_budget.MemBudget.max_conns,
         .buffer_size = 32 * 1024,
     };

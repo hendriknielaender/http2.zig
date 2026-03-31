@@ -224,7 +224,7 @@ pub const Connection = struct {
     ]u8;
 
     allocator: std.mem.Allocator,
-    router: ?*const handler.Router,
+    request_dispatcher: ?handler.RequestDispatcher,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     settings: Settings,
@@ -277,7 +277,7 @@ pub const Connection = struct {
 
         target.* = .{
             .allocator = allocator,
-            .router = null,
+            .request_dispatcher = null,
             .reader = reader,
             .writer = writer,
             .settings = Settings.default(),
@@ -381,9 +381,11 @@ pub const Connection = struct {
         try target.flush_output();
     }
 
-    pub fn bindRouter(self: *@This(), router: *const handler.Router) void {
-        assert(@intFromPtr(router) != 0);
-        self.router = router;
+    pub fn bindRequestDispatcher(
+        self: *@This(),
+        request_dispatcher: handler.RequestDispatcher,
+    ) void {
+        self.request_dispatcher = request_dispatcher;
     }
 
     fn flush_output(self: *@This()) !void {
@@ -1996,8 +1998,8 @@ pub const Connection = struct {
     }
 
     fn build_response(self: *@This(), stream: *DefaultStream.StreamInstance) !handler.Response {
-        if (self.router) |router| {
-            return self.dispatch_route(router, stream) catch |err| switch (err) {
+        if (self.request_dispatcher) |request_dispatcher| {
+            return self.dispatch_request(request_dispatcher, stream) catch |err| switch (err) {
                 error.InvalidRequestTarget,
                 error.MissingMethod,
                 error.MissingPath,
@@ -2015,9 +2017,9 @@ pub const Connection = struct {
         return builder.html(.ok, default_response_body);
     }
 
-    fn dispatch_route(
+    fn dispatch_request(
         self: *@This(),
-        router: *const handler.Router,
+        request_dispatcher: handler.RequestDispatcher,
         stream: *DefaultStream.StreamInstance,
     ) !handler.Response {
         const method = try self.requestMethod(stream);
@@ -2032,13 +2034,12 @@ pub const Connection = struct {
         );
         self.copyRequestHeaders(&context, stream);
 
-        return switch (router.lookup(method, target.normalized_path)) {
-            .handler => |route_handler| route_handler(&context) catch |err| {
-                log.err("Handler failed on stream {d}: {s}\n", .{ stream.id, @errorName(err) });
-                return self.simpleResponse(.internal_server_error, "Internal Server Error");
-            },
-            .method_not_allowed => self.simpleResponse(.method_not_allowed, "Method Not Allowed"),
-            .not_found => self.simpleResponse(.not_found, "Not Found"),
+        return request_dispatcher.call(&context) catch |err| {
+            log.err("Request dispatcher failed on stream {d}: {s}\n", .{
+                stream.id,
+                @errorName(err),
+            });
+            return self.simpleResponse(.internal_server_error, "Internal Server Error");
         };
     }
 
@@ -2463,7 +2464,9 @@ pub const Connection = struct {
     /// Handle SETTINGS_HEADER_TABLE_SIZE
     fn apply_frame_settings_header_table_size(self: *@This(), value: u32) !void {
         self.settings.header_table_size = value;
-        try self.hpack_encoder_table.updateMaxSize(value);
+        // The peer is advertising the largest dynamic table size it is willing to decode.
+        // We keep our encoder bounded by local static storage, while accepting larger peer limits.
+        self.hpack_encoder_table.setMaxAllowedSize(value);
     }
 
     /// Handle SETTINGS_ENABLE_PUSH

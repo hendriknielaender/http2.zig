@@ -300,6 +300,16 @@ pub const Hpack = struct {
             self.compactStorage();
         }
 
+        pub fn setMaxAllowedSize(self: *DynamicTable, new_size: usize) void {
+            self.max_allowed_size = new_size;
+            self.max_size = @min(new_size, MAX_DYNAMIC_TABLE_SIZE);
+
+            while (self.current_size > self.max_size and self.count > 0) {
+                self.evictOldestEntry();
+            }
+            self.compactStorage();
+        }
+
         fn ensureStorageCapacity(self: *DynamicTable, bytes_needed: usize) !void {
             if (bytes_needed > self.storage.len) {
                 return error.DynamicTableStorageExhausted;
@@ -830,6 +840,20 @@ test "Dynamic table indexing conforms to HPACK specification" {
         try std.testing.expectEqualStrings(field1.name, decoded_field.header.name);
         try std.testing.expectEqualStrings(field1.value, decoded_field.header.value);
     }
+}
+
+test "Dynamic table accepts peer limit larger than local storage cap" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
+    defer dynamic_table.deinit();
+
+    dynamic_table.setMaxAllowedSize(65536);
+
+    try std.testing.expectEqual(@as(usize, 65536), dynamic_table.max_allowed_size);
+    try std.testing.expectEqual(@as(usize, 4096), dynamic_table.max_size);
 }
 test "HPACK decoding of RFC 7541 C.3.1 First Request" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);

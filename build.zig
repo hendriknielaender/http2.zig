@@ -90,6 +90,34 @@ fn add_examples(
     run_basic.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run basic TLS server example");
     run_step.dependOn(&run_basic.step);
+
+    const turboapi_core_dep = b.dependency("turboapi_core", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const turboapi_core_module = turboapi_core_dep.module("turboapi-core");
+
+    // turboapi-core Example
+    const turboapi_module = b.createModule(.{
+        .root_source_file = b.path("examples/turboapi.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    turboapi_module.addImport("http2", http2_module);
+    turboapi_module.addImport("turboapi-core", turboapi_core_module);
+    turboapi_module.addOptions("build_options", build_options);
+
+    const turboapi = b.addExecutable(.{
+        .name = "turboapi_server",
+        .root_module = turboapi_module,
+    });
+    linkBoringSsl(b, turboapi);
+    b.installArtifact(turboapi);
+
+    const run_turboapi = b.addRunArtifact(turboapi);
+    run_turboapi.step.dependOn(b.getInstallStep());
+    const run_turboapi_step = b.step("run-turboapi", "Run turboapi-core example");
+    run_turboapi_step.dependOn(&run_turboapi.step);
 }
 
 /// Add benchmark application
