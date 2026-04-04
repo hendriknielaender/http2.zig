@@ -98,7 +98,7 @@ pub const Server = struct {
 
     pub const Config = struct {
         address: std.Io.net.IpAddress,
-        router: *handler.Router,
+        dispatcher: handler.RequestDispatcher,
         max_connections: u32 = 1000,
         buffer_size: u32 = 32 * 1024,
     };
@@ -412,7 +412,7 @@ pub const Server = struct {
             reader,
             writer,
         );
-        h2_connection.bindRouter(self.config.router);
+        h2_connection.bindRequestDispatcher(self.config.dispatcher);
         defer {
             self.recordCompletedResponses(&h2_connection);
             h2_connection.deinit();
@@ -433,7 +433,7 @@ pub const Server = struct {
 };
 
 fn assertConfig(config: Server.Config) void {
-    std.debug.assert(@intFromPtr(config.router) != 0);
+    _ = config.dispatcher;
     std.debug.assert(config.max_connections > 0);
     std.debug.assert(config.max_connections <= 10000);
     std.debug.assert(config.buffer_size >= 1024);
@@ -573,17 +573,18 @@ fn waitForActiveConnection(server: *const Server) !void {
     }
 }
 
+fn testRequestHandler(ctx: *const handler.Context) !handler.Response {
+    return ctx.response.text(.ok, "test");
+}
+
 test "server initialization keeps stats at zero" {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var router = handler.Router.init(allocator);
-    defer router.deinit();
-
     var server = try Server.init(allocator, .{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", 0),
-        .router = &router,
+        .dispatcher = handler.RequestDispatcher.fromHandler(testRequestHandler),
     });
     defer server.deinit();
 
@@ -598,12 +599,9 @@ test "stop cancels idle async connections" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var router = handler.Router.init(allocator);
-    defer router.deinit();
-
     var server = try Server.init(allocator, .{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", 0),
-        .router = &router,
+        .dispatcher = handler.RequestDispatcher.fromHandler(testRequestHandler),
         .max_connections = 8,
         .buffer_size = 16 * 1024,
     });

@@ -35,7 +35,7 @@ pub const tls = @import("tls.zig");
 pub const handler = @import("handler.zig");
 pub const Context = handler.Context;
 pub const Response = handler.Response;
-pub const Router = handler.Router;
+pub const RequestDispatcher = handler.RequestDispatcher;
 pub const Status = handler.Status;
 pub const Mime = handler.Mime;
 pub const Method = handler.Method;
@@ -59,8 +59,8 @@ pub const Server = struct {
     pub const Config = struct {
         /// Address to bind to
         address: std.Io.net.IpAddress,
-        /// Request router for handling HTTP requests
-        router: *Router,
+        /// Request dispatcher for application routing or request handling.
+        dispatcher: RequestDispatcher,
         /// Maximum concurrent connections
         max_connections: u32 = 1000,
         /// Buffer size per connection
@@ -69,12 +69,10 @@ pub const Server = struct {
 
     /// Initialize a new HTTP/2 server
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
-        std.debug.assert(@intFromPtr(config.router) != 0);
-
         return Self{
             .inner = try TransportServer.init(allocator, .{
                 .address = config.address,
-                .router = config.router,
+                .dispatcher = config.dispatcher,
                 .max_connections = config.max_connections,
                 .buffer_size = config.buffer_size,
             }),
@@ -84,13 +82,12 @@ pub const Server = struct {
 
     /// Initialize a new HTTP/2 server with TLS support
     pub fn initWithTLS(allocator: std.mem.Allocator, config: Config, tls_ctx: *tls.TlsServerContext) !Self {
-        std.debug.assert(@intFromPtr(config.router) != 0);
         std.debug.assert(@intFromPtr(tls_ctx) != 0);
 
         return Self{
             .inner = try TransportServer.initWithTLS(allocator, .{
                 .address = config.address,
-                .router = config.router,
+                .dispatcher = config.dispatcher,
                 .max_connections = config.max_connections,
                 .buffer_size = config.buffer_size,
             }, tls_ctx),
@@ -196,21 +193,15 @@ test "HTTP/2 server creation" {
     try init(allocator);
     defer deinit();
 
-    // Create a test router
-    var router = Router.init(allocator);
-    defer router.deinit();
-
     const test_handler: handler.HandlerFn = struct {
         fn handler(ctx: *const Context) !Response {
             return ctx.response.text(.ok, "test");
         }
     }.handler;
 
-    try router.get("/", test_handler);
-
     const config = Server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", 3000),
-        .router = &router,
+        .dispatcher = RequestDispatcher.fromHandler(test_handler),
     };
 
     var server = try Server.init(allocator, config);

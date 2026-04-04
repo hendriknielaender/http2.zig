@@ -24,7 +24,7 @@ Cross-platform • Zero allocations
 - 🌍 **Cross-platform** support via Zig std.Io backends
 - 💾 **Zero runtime allocations** - all memory allocated at compile time
 - 🔒 **Lock-free** atomic operations for maximum concurrency
-- 📦 **Simple API** - just configure and run
+- 🧩 **Bring your own router** - plug in any dispatcher or router you want
 - ✅ **HTTP/2 RFC 7540** compliant
 
 ## Quick Start
@@ -63,11 +63,13 @@ exe.root_module.addImport("http2", http2_dep.module("http2"));
 const std = @import("std");
 const http2 = @import("http2");
 
-fn indexHandler(ctx: *const http2.Context) !http2.Response {
-    return ctx.response.text(.ok, "hello from http2.zig\n");
-}
+fn handleRequest(ctx: *const http2.Context) !http2.Response {
+    if (ctx.method == .get) {
+        if (std.mem.eql(u8, ctx.path, "/")) {
+            return ctx.response.text(.ok, "hello from http2.zig\n");
+        }
+    }
 
-fn notFoundHandler(ctx: *const http2.Context) !http2.Response {
     return ctx.response.text(.not_found, "not found\n");
 }
 
@@ -80,28 +82,111 @@ pub fn main() !void {
     try http2.init(allocator);
     defer http2.deinit();
 
-    // Configure the request router
-    var router = http2.Router.init(allocator);
-    defer router.deinit();
-
-    try router.get("/", indexHandler);
-    router.setFallback(notFoundHandler);
-
     // Configure and create server
     const config = http2.Server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", 3000),
-        .router = &router,
+        .dispatcher = http2.RequestDispatcher.fromHandler(handleRequest),
     };
 
     var server = try http2.Server.init(allocator, config);
     defer server.deinit();
 
-    std.log.info("HTTP/2 server listening on {}", .{config.address});
+    std.log.info("HTTP/2 server listening on {f}", .{config.address});
 
     // Run the server
     try server.run();
 }
 ```
+
+### Bring Your Own Router With turboapi-core
+
+The core library stays router-agnostic. If you want radix-tree routing, path params, and HTTP
+helpers, add `turboapi-core` to your application:
+
+```bash
+zig fetch --save=turboapi_core "git+https://github.com/justrach/turboapi-core.git#main"
+```
+
+Wire it into `build.zig`:
+
+```zig
+const core_dep = b.dependency("turboapi_core", .{
+    .target = target,
+    .optimize = optimize,
+});
+const core_mod = core_dep.module("turboapi-core");
+exe.root_module.addImport("turboapi-core", core_mod);
+```
+
+Then bridge your router into `http2.zig` with a typed dispatcher:
+
+```zig
+const std = @import("std");
+const core = @import("turboapi-core");
+const http2 = @import("http2");
+
+const App = struct {
+    router: core.Router,
+
+    fn init(target: *App, allocator: std.mem.Allocator) !void {
+        target.* = .{
+            .router = core.Router.init(allocator),
+        };
+        errdefer target.deinit();
+
+        try target.router.addRoute("GET", "/", "index");
+        try target.router.addRoute("GET", "/users/{id}", "user_show");
+    }
+
+    fn deinit(self: *App) void {
+        self.router.deinit();
+    }
+
+    fn dispatch(self: *const App, ctx: *const http2.Context) !http2.Response {
+        if (self.router.findRoute(ctx.method.bytes(), ctx.path)) |match_result| {
+            var match = match_result;
+            defer match.deinit();
+
+            if (std.mem.eql(u8, match.handler_key, "index")) {
+                return ctx.response.text(.ok, "hello\n");
+            }
+            if (std.mem.eql(u8, match.handler_key, "user_show")) {
+                _ = match.params.get("id");
+                return ctx.response.text(.ok, "user\n");
+            }
+        }
+
+        return ctx.response.text(.not_found, "not found\n");
+    }
+};
+
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    try http2.init(allocator);
+    defer http2.deinit();
+
+    var app: App = undefined;
+    try App.init(&app, allocator);
+    defer app.deinit();
+
+    const config = http2.Server.Config{
+        .address = try std.Io.net.IpAddress.parse("127.0.0.1", 3000),
+        .dispatcher = http2.RequestDispatcher.bind(App, &app, App.dispatch),
+    };
+
+    var server = try http2.Server.init(allocator, config);
+    defer server.deinit();
+    try server.run();
+}
+```
+
+Repository examples:
+
+- `examples/basic_tls.zig` shows the same dispatcher API with a small custom Zig router.
+- `examples/turboapi.zig` shows the `turboapi-core` integration with TLS.
 
 ## Performance
 
@@ -116,8 +201,8 @@ pub const Server.Config = struct {
     /// Address to bind to
     address: std.Io.net.IpAddress,
 
-    /// Request router for handling HTTP requests
-    router: *Router,
+    /// Request dispatcher for application routing or request handling
+    dispatcher: RequestDispatcher,
     
     /// Maximum concurrent connections (default: 1000)
     max_connections: u32 = 1000,
@@ -127,25 +212,25 @@ pub const Server.Config = struct {
 };
 ```
 
-### Router
+### Request Dispatcher
 
-The server expects a router in `Server.Config`, and requests are dispatched through it.
+`http2.zig` no longer ships with a built-in router. Instead, `Server.Config` takes a
+`RequestDispatcher`, which is just a function pointer plus optional typed state.
+
+For stateless handling:
 
 ```zig
-try router.get("/", indexHandler);
-try router.post("/api/messages", createMessageHandler);
-try router.getPrefix("/assets", staticAssetsHandler);
-router.setFallback(notFoundHandler);
+.dispatcher = http2.RequestDispatcher.fromHandler(handleRequest),
 ```
 
-Current routing behavior:
+For stateful apps, middleware stacks, or third-party routers:
 
-- `get`, `post`, `put`, `delete`, `head`, `options`, and `patch` register exact routes.
-- `getPrefix` and `postPrefix` register prefix routes.
-- Prefix routes are ordered by longest path first.
-- Prefix matching is segment-aware: `/api` matches `/api` and `/api/users`, but not `/apix`.
-- A matching path with the wrong method returns `405 Method Not Allowed`.
-- A missing path falls through to the fallback handler when configured; otherwise it returns `404 Not Found`.
+```zig
+.dispatcher = http2.RequestDispatcher.bind(App, &app, App.dispatch),
+```
+
+This keeps transport, request parsing, and response building inside `http2.zig`, while letting the
+application decide how routing, params, middleware, and fallback behavior should work.
 
 The request context passed to handlers exposes:
 
@@ -207,11 +292,14 @@ zig build -Doptimize=ReleaseFast
 ### Running Examples
 
 ```bash
-# Run the hello world example
-zig build run-hello
+# Run the basic TLS example with the local Zig router
+zig build run
+
+# Run the turboapi-core example
+zig build run-turboapi
 
 # Run the benchmark server
-cd benchmarks && zig build run
+zig build benchmark
 ```
 
 ### Benchmarking
