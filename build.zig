@@ -10,7 +10,7 @@ const std = @import("std");
 
 // Project metadata
 const project_name = "http2";
-const project_version = "0.0.3";
+const project_version = "0.0.5";
 
 pub fn build(b: *std.Build) void {
     // Standard target and optimization options
