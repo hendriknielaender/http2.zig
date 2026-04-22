@@ -10,7 +10,7 @@ const build_options = @import("build_options");
 
 const connection_module = @import("connection.zig");
 const handler = @import("handler.zig");
-const tls = @import("tls.zig");
+const transport = @import("transport.zig");
 
 const Connection = connection_module.Connection;
 const ServerStats = @import("http2.zig").ServerStats;
@@ -85,7 +85,6 @@ pub const Server = struct {
     config: Config,
     connection_slots: []ConnectionSlot,
     io_buffer_storage: []u8,
-    tls_ctx: ?*tls.TlsServerContext,
     running: std.atomic.Value(bool),
     bound_port: std.atomic.Value(u16),
     listener_closed: std.atomic.Value(bool),
@@ -124,11 +123,7 @@ pub const Server = struct {
         }
     };
 
-    fn initWithOptionalTls(
-        allocator: std.mem.Allocator,
-        config: Config,
-        tls_ctx: ?*tls.TlsServerContext,
-    ) !Self {
+    pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         assertConfig(config);
 
         var backend: Backend = undefined;
@@ -152,7 +147,6 @@ pub const Server = struct {
             .config = config,
             .connection_slots = connection_slots,
             .io_buffer_storage = io_buffer_storage,
-            .tls_ctx = tls_ctx,
             .running = .init(false),
             .bound_port = .init(0),
             .listener_closed = .init(true),
@@ -161,19 +155,6 @@ pub const Server = struct {
             .next_connection_slot = .init(0),
             .stats = Stats.init(),
         };
-    }
-
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
-        return initWithOptionalTls(allocator, config, null);
-    }
-
-    pub fn initWithTLS(
-        allocator: std.mem.Allocator,
-        config: Config,
-        tls_ctx: *tls.TlsServerContext,
-    ) !Self {
-        std.debug.assert(@intFromPtr(tls_ctx) != 0);
-        return initWithOptionalTls(allocator, config, tls_ctx);
     }
 
     pub fn deinit(self: *Self) void {
@@ -283,8 +264,8 @@ pub const Server = struct {
         }
 
         // The threaded backend consumes a worker while a connection blocks in
-        // TLS or socket I/O, so a connection task requires concurrency rather
-        // than mere asynchrony.
+        // socket I/O, so a connection task requires concurrency rather than
+        // mere asynchrony.
         try self.connection_group.concurrent(io, serveConnectionTask, .{
             self,
             stream,
@@ -354,21 +335,9 @@ pub const Server = struct {
             self.releaseConnectionSlot(connection_slot);
         }
 
-        self.serveAcceptedStream(io, stream, connection_slot) catch |err| {
+        self.servePlainConnection(io, stream, connection_slot) catch |err| {
             logConnectionError(err);
         };
-    }
-
-    fn serveAcceptedStream(
-        self: *Self,
-        io: std.Io,
-        stream: std.Io.net.Stream,
-        connection_slot: *ConnectionSlot,
-    ) !void {
-        if (self.tls_ctx) |tls_ctx| {
-            return self.serveTlsConnection(tls_ctx, stream, connection_slot);
-        }
-        return self.servePlainConnection(io, stream, connection_slot);
     }
 
     fn servePlainConnection(
@@ -379,56 +348,26 @@ pub const Server = struct {
     ) !void {
         var reader = stream.reader(io, connection_slot.read_buffer);
         var writer = stream.writer(io, connection_slot.write_buffer);
-        try self.runHttp2Connection(&reader.interface, &writer.interface, connection_slot);
-    }
 
-    fn serveTlsConnection(
-        self: *Self,
-        tls_ctx: *tls.TlsServerContext,
-        stream: std.Io.net.Stream,
-        connection_slot: *ConnectionSlot,
-    ) !void {
-        var tls_connection = try tls_ctx.accept(stream.socket.handle);
-        defer tls_connection.deinit();
+        var completed_responses: u32 = 0;
+        defer self.recordCompletedResponses(completed_responses);
 
-        try self.runHttp2Connection(
-            tls_connection.reader(),
-            tls_connection.writer(),
-            connection_slot,
-        );
-    }
-
-    fn runHttp2Connection(
-        self: *Self,
-        reader: *std.Io.Reader,
-        writer: *std.Io.Writer,
-        connection_slot: *ConnectionSlot,
-    ) !void {
-        var h2_connection: Connection = undefined;
-        try Connection.initServerInPlace(
-            &h2_connection,
-            &connection_slot.stream_storage,
+        _ = try transport.serveConnection(
             self.allocator,
-            reader,
-            writer,
+            &reader.interface,
+            &writer.interface,
+            .{
+                .dispatcher = self.config.dispatcher,
+                .stream_storage = &connection_slot.stream_storage,
+                .completed_responses_out = &completed_responses,
+            },
         );
-        h2_connection.bindRequestDispatcher(self.config.dispatcher);
-        defer {
-            self.recordCompletedResponses(&h2_connection);
-            h2_connection.deinit();
-        }
-
-        try h2_connection.handle_connection();
     }
 
-    fn recordCompletedResponses(self: *Self, h2_connection: *Connection) void {
-        const completed_responses = h2_connection.takeCompletedResponses();
-
-        if (completed_responses == 0) {
-            return;
+    fn recordCompletedResponses(self: *Self, completed_responses: u32) void {
+        if (completed_responses != 0) {
+            _ = self.stats.requests_processed.fetchAdd(completed_responses, .acq_rel);
         }
-
-        _ = self.stats.requests_processed.fetchAdd(completed_responses, .acq_rel);
     }
 };
 
@@ -485,14 +424,6 @@ fn initConnectionSlots(
 
 fn logListening(self: *const Server) void {
     const label = backendLabel();
-
-    if (self.tls_ctx) |_| {
-        log.info("HTTP/2 over TLS listening on {f} via {s}", .{
-            self.listener.?.socket.address,
-            label,
-        });
-        return;
-    }
 
     log.info("HTTP/2 listening on {f} via {s}", .{
         self.listener.?.socket.address,

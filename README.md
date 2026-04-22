@@ -185,8 +185,36 @@ pub fn main() !void {
 
 Repository examples:
 
-- `examples/basic_tls.zig` shows the same dispatcher API with a small custom Zig router.
-- `examples/turboapi.zig` shows the `turboapi-core` integration with TLS.
+- `examples/basic_tls.zig` shows the same dispatcher API with a small custom Zig router over TLS.
+- `examples/turboapi.zig` shows the `turboapi-core` integration over TLS.
+
+### TLS With http2-boring
+
+The core module does not own TLS or link BoringSSL. A TLS adapter package, such as
+`http2-boring`, configures BoringSSL, completes the TLS handshake, verifies ALPN `h2`, and then
+passes the decrypted application-data stream into the core connection entry point:
+
+```zig
+try http2.serveConnection(
+    allocator,
+    tls_conn.reader(),
+    tls_conn.writer(),
+    .{
+        .dispatcher = dispatcher,
+    },
+);
+```
+
+The repository examples and benchmarks use this shape through `examples/tls_server.zig`;
+the core library target remains TLS-provider agnostic.
+By default, the build fetches the `boring` release package and loads
+`http2-boring` from that package. Override it with
+`-Dhttp2-boring-root=/path/to/http2-boring` when testing a local adapter checkout.
+The `boring` release source archive does not include the BoringSSL submodule, so
+this build passes the local `boringssl` checkout as its source by default; use
+`-Dboringssl-source-path=/path/to/boringssl` to point at another checkout.
+For pooled servers, the adapter can pass caller-owned stream storage through
+`http2.ServeConnectionOptions.stream_storage` to avoid per-connection stream-storage allocation.
 
 ## Performance
 
@@ -292,7 +320,10 @@ zig build -Doptimize=ReleaseFast
 ### Running Examples
 
 ```bash
-# Run the basic TLS example with the local Zig router
+# Generate local cert.pem/key.pem if needed
+make cert
+
+# Run the basic HTTP/2 over TLS example with the local Zig router
 zig build run
 
 # Run the turboapi-core example
