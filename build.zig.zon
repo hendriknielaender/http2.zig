@@ -1,6 +1,6 @@
 .{
     .name = .http2,
-    .version = "0.0.5",
+    .version = "0.0.6",
     .fingerprint = 0x3f2d14a09a69408f,
     .dependencies = .{
         .boring = .{

@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ZIG_VERSION: 0.16.0-dev.2905+5d71e3051
+  ZIG_VERSION: 0.16.0
   ZLINT_VERSION: v0.7.9
   BORINGSSL_CACHE_VERSION: v1
 

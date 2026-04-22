@@ -12,7 +12,7 @@
 Cross-platform • Zero allocations
 
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
-[![Zig 0.15.2](https://img.shields.io/badge/zig-0.15.2-orange.svg)](https://ziglang.org)
+[![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-orange.svg)](https://ziglang.org)
 [![std.Io](https://img.shields.io/badge/powered%20by-std.Io-brightgreen.svg)](https://ziglang.org/)
 
 </div>
@@ -302,7 +302,7 @@ pub const ServerStats = struct {
 
 ### Requirements
 
-- Zig v0.16.0-dev.2905+5d71e3051
+- Zig v0.16.0
 
 ### Build Commands
 

@@ -1,7 +1,7 @@
 const std = @import("std");
 
 /// Native std.Io fixed reader/writer pair for unit tests.
-/// This keeps test fixtures on the Zig 0.15.2 API without `adaptToNewApi`.
+/// This keeps test fixtures on native std.Io fixed buffers without adapters.
 pub const FixedIo = struct {
     reader: std.Io.Reader,
     writer: std.Io.Writer,
