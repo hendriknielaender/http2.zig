@@ -128,7 +128,18 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      - name: Check evented backend support
+        id: evented_support
+        run: |
+          if [[ "${RUNNER_OS}" == "Linux" && "${ZIG_VERSION}" == "0.16.0-dev.2905+5d71e3051" ]]; then
+            echo "supported=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning title=Experimental Linux evented lane skipped::The pinned Zig ${ZIG_VERSION} std.Io.Evented backend does not compile on ubuntu-latest. Skipping evented build and unit tests until the toolchain is upgraded."
+          else
+            echo "supported=true" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Download BoringSSL build
+        if: steps.evented_support.outputs.supported == 'true'
         uses: actions/download-artifact@v4
         with:
           name: boringssl-linux
@@ -136,19 +147,22 @@ jobs:
 
       - name: Build release artifacts with evented backend
         id: evented_build
+        if: steps.evented_support.outputs.supported == 'true'
         continue-on-error: true
         run: zig build -Doptimize=ReleaseFast -Devented=true
 
       - name: Run unit tests with evented backend
         id: evented_test
-        if: steps.evented_build.outcome == 'success'
+        if: steps.evented_support.outputs.supported == 'true' && steps.evented_build.outcome == 'success'
         continue-on-error: true
         run: zig build test -Devented=true
 
       - name: Summarize experimental backend result
         if: always()
         run: |
-          if [[ "${{ steps.evented_build.outcome }}" != "success" ]]; then
+          if [[ "${{ steps.evented_support.outputs.supported }}" != "true" ]]; then
+            echo "Experimental evented backend checks skipped for pinned Zig ${ZIG_VERSION} on ${RUNNER_OS}."
+          elif [[ "${{ steps.evented_build.outcome }}" != "success" ]]; then
             echo "::warning title=Experimental Linux evented lane failed::The pinned Zig toolchain does not currently compile std.Io.Evented on ubuntu-latest. This lane is informative only and does not block CI."
           elif [[ "${{ steps.evented_test.outcome }}" != "success" ]]; then
             echo "::warning title=Experimental Linux evented tests failed::The experimental std.Io.Evented lane built but unit tests failed. This lane is informative only and does not block CI."
