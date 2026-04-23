@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZIG_VERSION: 0.16.0-dev.2905+5d71e3051
-  BORINGSSL_CACHE_VERSION: v1
+  ZIG_VERSION: 0.16.0
+  BORINGSSL_CACHE_VERSION: v2
 
 defaults:
   run:
@@ -33,56 +33,8 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - run: zig fmt --check src/*.zig
 
-  boringssl_linux:
-    name: Prepare BoringSSL (Linux)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Resolve BoringSSL revision
-        id: boringssl
-        run: |
-          revision="$(git submodule status -- boringssl | awk '{gsub(/^[ -+]/, "", $1); print $1}')"
-          echo "revision=${revision}" >> "${GITHUB_OUTPUT}"
-
-      - name: Restore BoringSSL cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            boringssl/build/crypto
-            boringssl/build/ssl
-          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-linux-${{ steps.boringssl.outputs.revision }}
-
-      - name: Build BoringSSL
-        run: |
-          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
-            echo "Using cached BoringSSL build."
-            exit 0
-          fi
-
-          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build boringssl/build --parallel
-
-      - name: Upload BoringSSL artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: boringssl-linux
-          path: |
-            boringssl/build/crypto
-            boringssl/build/ssl
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
-
   build_test_linux:
-    name: Build & Unit Test (ubuntu-latest, evented=false)
-    needs: boringssl_linux
+    name: Build & Unit Test (ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -98,67 +50,36 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Download BoringSSL build
-        uses: actions/download-artifact@v4
+      - name: Resolve BoringSSL revision
+        id: boringssl
+        run: echo "revision=$(git -C boringssl rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore BoringSSL library cache
+        uses: actions/cache@v4
         with:
-          name: boringssl-linux
-          path: boringssl/build
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-release-${{ steps.boringssl.outputs.revision }}
+
+      - name: Build BoringSSL library cache
+        run: |
+          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
+            echo "Using cached BoringSSL libraries."
+            exit 0
+          fi
+
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build boringssl/build --target ssl crypto --parallel
 
       - name: Build release artifacts
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dboringssl-lib-path=boringssl/build
 
       - name: Run unit tests
-        run: zig build test
-
-  experimental_evented_linux:
-    name: Build & Unit Test (ubuntu-latest, evented=true)
-    needs: boringssl_linux
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Download BoringSSL build
-        uses: actions/download-artifact@v4
-        with:
-          name: boringssl-linux
-          path: boringssl/build
-
-      - name: Build release artifacts with evented backend
-        id: evented_build
-        continue-on-error: true
-        run: zig build -Doptimize=ReleaseFast -Devented=true
-
-      - name: Run unit tests with evented backend
-        id: evented_test
-        if: steps.evented_build.outcome == 'success'
-        continue-on-error: true
-        run: zig build test -Devented=true
-
-      - name: Summarize experimental backend result
-        if: always()
-        run: |
-          if [[ "${{ steps.evented_build.outcome }}" != "success" ]]; then
-            echo "::warning title=Experimental Linux evented lane failed::The pinned Zig toolchain does not currently compile std.Io.Evented on ubuntu-latest. This lane is informative only and does not block CI."
-          elif [[ "${{ steps.evented_test.outcome }}" != "success" ]]; then
-            echo "::warning title=Experimental Linux evented tests failed::The experimental std.Io.Evented lane built but unit tests failed. This lane is informative only and does not block CI."
-          else
-            echo "Experimental evented backend checks passed."
-          fi
+        run: zig build test -Dboringssl-lib-path=boringssl/build
 
   docs:
     name: Docs
-    needs: boringssl_linux
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -173,12 +94,6 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-
-      - name: Download BoringSSL build
-        uses: actions/download-artifact@v4
-        with:
-          name: boringssl-linux
-          path: boringssl/build
 
       - name: Generate documentation
         run: zig build docs
@@ -193,7 +108,7 @@ jobs:
 
   conformance:
     name: HTTP/2 Conformance
-    needs: boringssl_linux
+    needs: build_test_linux
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -212,14 +127,30 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
-      - name: Download BoringSSL build
-        uses: actions/download-artifact@v4
+      - name: Resolve BoringSSL revision
+        id: boringssl
+        run: echo "revision=$(git -C boringssl rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore BoringSSL library cache
+        uses: actions/cache@v4
         with:
-          name: boringssl-linux
-          path: boringssl/build
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-release-${{ steps.boringssl.outputs.revision }}
+
+      - name: Build BoringSSL library cache
+        run: |
+          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
+            echo "Using cached BoringSSL libraries."
+            exit 0
+          fi
+
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build boringssl/build --target ssl crypto --parallel
 
       - name: Build benchmark server
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dboringssl-lib-path=boringssl/build
 
       - name: Generate test certificate
         run: |

@@ -10,20 +10,46 @@ const std = @import("std");
 
 // Project metadata
 const project_name = "http2";
-const project_version = "0.0.5";
+const project_version = "0.0.6";
 
 pub fn build(b: *std.Build) void {
     // Standard target and optimization options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const evented = b.option(
-        bool,
-        "evented",
-        "Enable the experimental std.Io.Evented backend.",
-    ) orelse false;
+    const http2_boring_root = b.option(
+        []const u8,
+        "http2-boring-root",
+        "Optional path to a local http2-boring adapter checkout.",
+    );
+    const boringssl_source_path = b.option(
+        []const u8,
+        "boringssl-source-path",
+        "Path to a BoringSSL source checkout for the boring package.",
+    ) orelse "boringssl";
+    const boringssl_lib_path = b.option(
+        []const u8,
+        "boringssl-lib-path",
+        "Path to a BoringSSL CMake build root for the boring package.",
+    );
 
-    const build_options = b.addOptions();
-    build_options.addOption(bool, "use_evented_backend", evented);
+    const boring_dependency = if (boringssl_lib_path) |lib_path|
+        b.dependency("boring", .{
+            .target = target,
+            .optimize = optimize,
+            .@"boringssl-source-path" = boringssl_source_path,
+            .@"boringssl-lib-path" = lib_path,
+        })
+    else
+        b.dependency("boring", .{
+            .target = target,
+            .optimize = optimize,
+            .@"boringssl-source-path" = boringssl_source_path,
+        });
+    const boring_module = boring_dependency.module("boring");
+    const http2_boring_source: std.Build.LazyPath = if (http2_boring_root) |root|
+        .{ .cwd_relative = b.pathJoin(&.{ root, "src/http2_boring.zig" }) }
+    else
+        boring_dependency.path("http2-boring/src/http2_boring.zig");
 
     // Create module for use in other projects
     const http2_module = b.addModule("http2", .{
@@ -31,9 +57,24 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .link_libcpp = true,
     });
-    http2_module.addOptions("build_options", build_options);
+
+    const http2_boring_module = add_http2_boring_module(
+        b,
+        target,
+        optimize,
+        http2_module,
+        boring_module,
+        http2_boring_source,
+    );
+    const tls_server_module = add_tls_server_module(
+        b,
+        target,
+        optimize,
+        http2_module,
+        http2_boring_module,
+        boring_module,
+    );
 
     // Core HTTP/2 library
     const http2_lib = b.addLibrary(.{
@@ -42,17 +83,32 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
         .version = std.SemanticVersion.parse(project_version) catch unreachable,
     });
-    linkBoringSsl(b, http2_lib);
     b.installArtifact(http2_lib);
 
     // Example applications
-    add_examples(b, target, optimize, http2_module, build_options);
+    add_examples(
+        b,
+        target,
+        optimize,
+        http2_module,
+        http2_boring_module,
+        boring_module,
+        tls_server_module,
+    );
 
     // Benchmark application
-    add_benchmark(b, target, optimize, http2_module, build_options);
+    add_benchmark(
+        b,
+        target,
+        optimize,
+        http2_module,
+        http2_boring_module,
+        boring_module,
+        tls_server_module,
+    );
 
     // Test suite
-    add_tests(b, target, optimize, build_options);
+    add_tests(b, target, optimize);
 
     // Documentation
     add_documentation(b, http2_lib);
@@ -67,7 +123,9 @@ fn add_examples(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     http2_module: *std.Build.Module,
-    build_options: *std.Build.Step.Options,
+    http2_boring_module: *std.Build.Module,
+    boring_module: *std.Build.Module,
+    tls_server_module: *std.Build.Module,
 ) void {
     // Basic TLS Example
     const basic_tls_module = b.createModule(.{
@@ -76,13 +134,14 @@ fn add_examples(
         .optimize = optimize,
     });
     basic_tls_module.addImport("http2", http2_module);
-    basic_tls_module.addOptions("build_options", build_options);
+    basic_tls_module.addImport("http2-boring", http2_boring_module);
+    basic_tls_module.addImport("boring", boring_module);
+    basic_tls_module.addImport("tls-server", tls_server_module);
 
     const basic_tls = b.addExecutable(.{
         .name = "basic_tls_server",
         .root_module = basic_tls_module,
     });
-    linkBoringSsl(b, basic_tls);
     b.installArtifact(basic_tls);
 
     // Run step for basic TLS example
@@ -104,14 +163,15 @@ fn add_examples(
         .optimize = optimize,
     });
     turboapi_module.addImport("http2", http2_module);
+    turboapi_module.addImport("http2-boring", http2_boring_module);
+    turboapi_module.addImport("boring", boring_module);
+    turboapi_module.addImport("tls-server", tls_server_module);
     turboapi_module.addImport("turboapi-core", turboapi_core_module);
-    turboapi_module.addOptions("build_options", build_options);
 
     const turboapi = b.addExecutable(.{
         .name = "turboapi_server",
         .root_module = turboapi_module,
     });
-    linkBoringSsl(b, turboapi);
     b.installArtifact(turboapi);
 
     const run_turboapi = b.addRunArtifact(turboapi);
@@ -126,7 +186,9 @@ fn add_benchmark(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     http2_module: *std.Build.Module,
-    build_options: *std.Build.Step.Options,
+    http2_boring_module: *std.Build.Module,
+    boring_module: *std.Build.Module,
+    tls_server_module: *std.Build.Module,
 ) void {
     // Benchmark server
     const benchmark_module = b.createModule(.{
@@ -135,20 +197,60 @@ fn add_benchmark(
         .optimize = optimize,
     });
     benchmark_module.addImport("http2", http2_module);
-    benchmark_module.addOptions("build_options", build_options);
+    benchmark_module.addImport("http2-boring", http2_boring_module);
+    benchmark_module.addImport("boring", boring_module);
+    benchmark_module.addImport("tls-server", tls_server_module);
 
     const benchmark = b.addExecutable(.{
         .name = "benchmark",
         .root_module = benchmark_module,
     });
-    linkBoringSsl(b, benchmark);
     b.installArtifact(benchmark);
 
     // Run step for benchmark
     const run_benchmark = b.addRunArtifact(benchmark);
     run_benchmark.step.dependOn(b.getInstallStep());
-    const benchmark_step = b.step("benchmark", "Run HTTP/2 benchmark server");
+    const benchmark_step = b.step("benchmark", "Run HTTP/2 TLS benchmark server");
     benchmark_step.dependOn(&run_benchmark.step);
+}
+
+fn add_http2_boring_module(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    http2_module: *std.Build.Module,
+    boring_module: *std.Build.Module,
+    root_source_file: std.Build.LazyPath,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = root_source_file,
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("boring", boring_module);
+    module.addImport("http2", http2_module);
+
+    return module;
+}
+
+fn add_tls_server_module(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    http2_module: *std.Build.Module,
+    http2_boring_module: *std.Build.Module,
+    boring_module: *std.Build.Module,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("examples/tls_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("http2", http2_module);
+    module.addImport("http2-boring", http2_boring_module);
+    module.addImport("boring", boring_module);
+
+    return module;
 }
 
 /// Add comprehensive test suite
@@ -156,7 +258,6 @@ fn add_tests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    build_options: *std.Build.Step.Options,
 ) void {
     // Unit tests for core modules
     const test_modules = [_][]const u8{
@@ -170,6 +271,7 @@ fn add_tests(
         "src/http2.zig",
         "src/memory_budget.zig",
         "src/server.zig",
+        "src/transport.zig",
     };
 
     var all_tests_step = b.step("test", "Run all unit tests");
@@ -180,15 +282,11 @@ fn add_tests(
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .link_libcpp = true,
         });
-        test_module.addOptions("build_options", build_options);
 
         const module_test = b.addTest(.{
             .root_module = test_module,
         });
-        linkBoringSsl(b, module_test);
-
         const run_test = b.addRunArtifact(module_test);
         all_tests_step.dependOn(&run_test.step);
     }
@@ -233,13 +331,4 @@ fn add_code_quality_checks(b: *std.Build) void {
     });
     const fmt_fix_step = b.step("fmt", "Fix code formatting");
     fmt_fix_step.dependOn(&fmt_fix.step);
-}
-
-fn linkBoringSsl(b: *std.Build, artifact: *std.Build.Step.Compile) void {
-    artifact.root_module.link_libc = true;
-    artifact.root_module.link_libcpp = true;
-    artifact.root_module.addIncludePath(b.path("boringssl/include"));
-    artifact.root_module.addLibraryPath(b.path("boringssl/build"));
-    artifact.root_module.addObjectFile(b.path("boringssl/build/ssl/libssl.a"));
-    artifact.root_module.addObjectFile(b.path("boringssl/build/crypto/libcrypto.a"));
 }

@@ -55,11 +55,6 @@ test: build
 	@echo "Running unit tests..."
 	@$(ZIG) build test
 
-# Test TLS module specifically
-test-tls: build-boringssl
-	@echo "Testing TLS module..."
-	@$(ZIG) test src/tls.zig -I./boringssl/include -L./boringssl/build/ssl -L./boringssl/build/crypto -lssl -lcrypto -lc++
-
 # Format code
 fmt:
 	@echo "Formatting code..."
@@ -72,24 +67,4 @@ clean:
 	@rm -rf zig-out/
 	@echo "Clean complete"
 
-# Initialize git submodules
-update:
-	git submodule update --init --recursive
-
-# Build BoringSSL library
-build-boringssl:
-	@echo "Building BoringSSL..."
-	@cd boringssl && cmake -DCMAKE_BUILD_TYPE=Release -B build && make -C build
-
-# Build BoringSSL unoptimized
-build-boringssl-unoptimized:
-	@echo "Building BoringSSL (unoptimized)..."
-	@cd boringssl && cmake -B build && make -C build
-
-# Create BoringSSL bindings
-create-bindings: build-boringssl
-	@echo "Creating BoringSSL bindings..."
-	@mkdir -p boringssl
-	@$(ZIG) translate-c -I boringssl/include boringssl/include/openssl/ssl.h > src/bindings/boringssl-bindings.zig
-
-.PHONY: all build run test test-h2spec test-tls fmt clean cert update build-boringssl build-boringssl-unoptimized create-bindings
+.PHONY: all build run test test-h2spec fmt clean cert

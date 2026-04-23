@@ -6,6 +6,7 @@ libhttp2.a.o
 zig-out/
 .zig-cache/
 .zig-global-cache/
+zig-pkg/
 dist/
 release-assets/
 release-stage/

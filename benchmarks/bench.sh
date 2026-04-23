@@ -18,15 +18,8 @@ fi
 PORT=${PORT:-8443}
 REQUESTS=${REQUESTS:-500000}
 CONCURRENCY=${CONCURRENCY:-512}
-TLS=${TLS:-true}
-
-if [ "$TLS" = "true" ]; then
-    OHA_FLAGS=${OHA_FLAGS:-' --http2 --insecure'}
-    HOST="https://127.0.0.1:${PORT}"
-else
-    OHA_FLAGS=${OHA_FLAGS:-' --http2'}
-    HOST="http://127.0.0.1:${PORT}"
-fi
+OHA_FLAGS=${OHA_FLAGS:-' --http2 --insecure'}
+HOST="https://127.0.0.1:${PORT}"
 
 # Make sure oha is available -------------------------------------------------
 if ! command -v $OHA_CMD >/dev/null 2>&1; then
@@ -35,18 +28,14 @@ if ! command -v $OHA_CMD >/dev/null 2>&1; then
 fi
 
 # Quick ping to fail fast if the server is not running -----------------------
-if [ "$TLS" = "true" ]; then
-    PING_FLAGS="--http2 --insecure"
-else
-    PING_FLAGS="--http2"
-fi
+PING_FLAGS="--http2 --insecure"
 
 if ! $OHA_CMD $PING_FLAGS -n 1 "${HOST}" >/dev/null 2>&1; then
   echo "❌  Server not responding on ${HOST}. Start it with 'zig build benchmark'." >&2
   exit 1
 fi
 
-echo "🚀  Benchmarking ${HOST} (TLS=${TLS}, PORT=${PORT})"
+echo "🚀  Benchmarking ${HOST} (TLS via http2-boring, PORT=${PORT})"
 echo "🔧  Using flags: ${OHA_FLAGS}"
 set -x
 $OHA_CMD ${OHA_FLAGS} -n ${REQUESTS} -c ${CONCURRENCY} "${HOST}"

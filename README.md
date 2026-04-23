@@ -12,7 +12,7 @@
 Cross-platform • Zero allocations
 
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
-[![Zig 0.15.2](https://img.shields.io/badge/zig-0.15.2-orange.svg)](https://ziglang.org)
+[![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-orange.svg)](https://ziglang.org)
 [![std.Io](https://img.shields.io/badge/powered%20by-std.Io-brightgreen.svg)](https://ziglang.org/)
 
 </div>
@@ -185,8 +185,36 @@ pub fn main() !void {
 
 Repository examples:
 
-- `examples/basic_tls.zig` shows the same dispatcher API with a small custom Zig router.
-- `examples/turboapi.zig` shows the `turboapi-core` integration with TLS.
+- `examples/basic_tls.zig` shows the same dispatcher API with a small custom Zig router over TLS.
+- `examples/turboapi.zig` shows the `turboapi-core` integration over TLS.
+
+### TLS With http2-boring
+
+The core module does not own TLS or link BoringSSL. A TLS adapter package, such as
+`http2-boring`, configures BoringSSL, completes the TLS handshake, verifies ALPN `h2`, and then
+passes the decrypted application-data stream into the core connection entry point:
+
+```zig
+try http2.serveConnection(
+    allocator,
+    tls_conn.reader(),
+    tls_conn.writer(),
+    .{
+        .dispatcher = dispatcher,
+    },
+);
+```
+
+The repository examples and benchmarks use this shape through `examples/tls_server.zig`;
+the core library target remains TLS-provider agnostic.
+By default, the build fetches the `boring` release package and loads
+`http2-boring` from that package. Override it with
+`-Dhttp2-boring-root=/path/to/http2-boring` when testing a local adapter checkout.
+The `boring` release source archive does not include the BoringSSL submodule, so
+this build passes the local `boringssl` checkout as its source by default; use
+`-Dboringssl-source-path=/path/to/boringssl` to point at another checkout.
+For pooled servers, the adapter can pass caller-owned stream storage through
+`http2.ServeConnectionOptions.stream_storage` to avoid per-connection stream-storage allocation.
 
 ## Performance
 
@@ -274,7 +302,7 @@ pub const ServerStats = struct {
 
 ### Requirements
 
-- Zig v0.16.0-dev.2905+5d71e3051
+- Zig v0.16.0
 
 ### Build Commands
 
@@ -292,7 +320,10 @@ zig build -Doptimize=ReleaseFast
 ### Running Examples
 
 ```bash
-# Run the basic TLS example with the local Zig router
+# Generate local cert.pem/key.pem if needed
+make cert
+
+# Run the basic HTTP/2 over TLS example with the local Zig router
 zig build run
 
 # Run the turboapi-core example

@@ -14,29 +14,18 @@ fi
 PORT=${PORT:-8443}
 REQUESTS=${REQUESTS:-500000}
 CONCURRENCY=${CONCURRENCY:-50}
-TLS=${TLS:-true}
-
-if [ "$TLS" = "true" ]; then
-    H2LOAD_FLAGS=${H2LOAD_FLAGS:-''}
-    HOST="https://127.0.0.1:${PORT}"
-else
-    H2LOAD_FLAGS=${H2LOAD_FLAGS:-'--h2-prior-knowledge'}
-    HOST="http://127.0.0.1:${PORT}"
-fi
+H2LOAD_FLAGS=${H2LOAD_FLAGS:-''}
+HOST="https://127.0.0.1:${PORT}"
 
 # Quick ping to fail fast if the server is not running -----------------------
-if [ "$TLS" = "true" ]; then
-    PING_FLAGS=""
-else
-    PING_FLAGS="--h2-prior-knowledge"
-fi
+PING_FLAGS=""
 
 if ! $H2LOAD_CMD $PING_FLAGS -n 1 -c 1 "${HOST}/" >/dev/null 2>&1; then
   echo "❌  Server not responding on ${HOST}. Start it with 'zig build benchmark'." >&2
   exit 1
 fi
 
-echo "🚀  Benchmarking ${HOST} with h2load (TLS=${TLS}, PORT=${PORT})"
+echo "🚀  Benchmarking ${HOST} with h2load (TLS via http2-boring, PORT=${PORT})"
 echo "🔧  Using flags: ${H2LOAD_FLAGS}"
 set -x
 $H2LOAD_CMD ${H2LOAD_FLAGS} -n ${REQUESTS} -c ${CONCURRENCY} "${HOST}/"

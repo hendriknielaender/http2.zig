@@ -1,5 +1,6 @@
 const std = @import("std");
 const http2 = @import("http2");
+const tls_server = @import("tls-server");
 const log = std.log.scoped(.benchmark);
 
 pub const std_options: std.Options = .{
@@ -17,7 +18,7 @@ fn benchmarkHandler(ctx: *const http2.Context) !http2.Response {
     return ctx.response.text(.not_found, "Not Found");
 }
 
-/// High-performance HTTP/2 over HTTPS benchmark server
+/// High-performance HTTP/2 over TLS benchmark server.
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
@@ -27,53 +28,30 @@ pub fn main() !void {
     try http2.init(allocator);
     defer http2.deinit();
 
-    // Get port and TLS mode from environment
+    // Get port from environment.
     const port_env = if (std.c.getenv("PORT")) |value| std.mem.span(value) else null;
-    const tls_env = if (std.c.getenv("TLS")) |value| std.mem.span(value) else null;
-    const use_tls = if (tls_env) |env_val|
-        std.mem.eql(u8, env_val, "1") or std.mem.eql(u8, env_val, "true")
-    else
-        true;
 
     const port: u16 = if (port_env) |env_val|
-        std.fmt.parseInt(u16, env_val, 10) catch
-            (if (use_tls) @as(u16, 8443) else @as(u16, 3000))
+        std.fmt.parseInt(u16, env_val, 10) catch 8443
     else
-        (if (use_tls) @as(u16, 8443) else @as(u16, 3000));
+        8443;
 
     // Configure server for benchmarking with high concurrency
-    const config = http2.Server.Config{
+    const config = tls_server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", port),
         .dispatcher = http2.RequestDispatcher.fromHandler(benchmarkHandler),
         .max_connections = http2.memory_budget.MemBudget.max_conns,
-        .buffer_size = 32 * 1024,
     };
 
-    // Initialize TLS context if needed
-    var tls_ctx: ?http2.tls.TlsServerContext = if (use_tls)
-        try http2.tls.TlsServerContext.init(allocator, "cert.pem", "key.pem")
-    else
-        null;
-    defer if (tls_ctx) |*ctx| ctx.deinit();
-
-    var server = if (use_tls and tls_ctx != null)
-        try http2.Server.initWithTLS(allocator, config, &tls_ctx.?)
-    else
-        try http2.Server.init(allocator, config);
-
+    var server = try tls_server.Server.init(allocator, config);
     defer server.deinit();
 
-    if (use_tls) {
-        log.info("HTTP/2 over HTTPS benchmark server ready on port {}", .{port});
-        log.info("TLS with ALPN h2 negotiation enabled for performance testing", .{});
-    } else {
-        log.info("HTTP/2 benchmark server ready on port {}", .{port});
-    }
-    log.info("Event-driven architecture with Zig std.Io backend", .{});
+    log.info("HTTP/2 over TLS benchmark server ready on port {}", .{port});
+    log.info("BoringSSL TLS is provided by http2-boring", .{});
 
     // Create a context for the monitor thread
     const MonitorContext = struct {
-        server: *http2.Server,
+        server: *tls_server.Server,
         ready: std.atomic.Value(bool),
         running: std.atomic.Value(bool),
     };
@@ -101,7 +79,7 @@ pub fn main() !void {
 
 fn monitorPerformance(ctx: *const anyopaque) void {
     const MonitorContext = struct {
-        server: *http2.Server,
+        server: *tls_server.Server,
         ready: std.atomic.Value(bool),
         running: std.atomic.Value(bool),
     };

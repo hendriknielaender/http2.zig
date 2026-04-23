@@ -28,8 +28,10 @@ pub const budget_assertions = @import("budget_assertions.zig");
 pub const error_types = @import("error.zig");
 pub const Http2Error = error_types.Http2Error;
 
-// TLS Support
-pub const tls = @import("tls.zig");
+// Transport integration
+pub const transport = @import("transport.zig");
+pub const ServeConnectionOptions = transport.ServeConnectionOptions;
+pub const serveConnection = transport.serveConnection;
 
 // Handler API
 pub const handler = @import("handler.zig");
@@ -80,21 +82,6 @@ pub const Server = struct {
         };
     }
 
-    /// Initialize a new HTTP/2 server with TLS support
-    pub fn initWithTLS(allocator: std.mem.Allocator, config: Config, tls_ctx: *tls.TlsServerContext) !Self {
-        std.debug.assert(@intFromPtr(tls_ctx) != 0);
-
-        return Self{
-            .inner = try TransportServer.initWithTLS(allocator, .{
-                .address = config.address,
-                .dispatcher = config.dispatcher,
-                .max_connections = config.max_connections,
-                .buffer_size = config.buffer_size,
-            }, tls_ctx),
-            .allocator = allocator,
-        };
-    }
-
     /// Clean up server resources
     pub fn deinit(self: *Self) void {
         self.inner.deinit();
@@ -127,12 +114,6 @@ pub const AsyncServer = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         return Self{
             .inner = try TransportServer.init(allocator, config),
-        };
-    }
-
-    pub fn initWithTLS(allocator: std.mem.Allocator, config: Config, tls_ctx: *tls.TlsServerContext) !Self {
-        return Self{
-            .inner = try TransportServer.initWithTLS(allocator, config, tls_ctx),
         };
     }
 

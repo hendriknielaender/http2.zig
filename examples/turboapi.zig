@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("turboapi-core");
 const http2 = @import("http2");
+const tls_server = @import("tls-server");
 
 const route_index = "index";
 const route_api_hello = "api_hello";
@@ -157,17 +158,13 @@ pub fn main() !void {
     try App.init(&app, allocator);
     defer app.deinit();
 
-    const config = http2.Server.Config{
+    const config = tls_server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", 8443),
         .dispatcher = http2.RequestDispatcher.bind(App, &app, App.dispatch),
         .max_connections = 100,
-        .buffer_size = 32 * 1024,
     };
 
-    var tls_ctx = try http2.tls.TlsServerContext.init(allocator, "cert.pem", "key.pem");
-    defer tls_ctx.deinit();
-
-    var server = try http2.Server.initWithTLS(allocator, config, &tls_ctx);
+    var server = try tls_server.Server.init(allocator, config);
     defer server.deinit();
 
     std.log.info("HTTP/2 over TLS server listening on {f}", .{config.address});
