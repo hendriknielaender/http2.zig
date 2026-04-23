@@ -16,11 +16,6 @@ pub fn build(b: *std.Build) void {
     // Standard target and optimization options
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const evented = b.option(
-        bool,
-        "evented",
-        "Enable the experimental std.Io.Evented backend.",
-    ) orelse false;
     const http2_boring_root = b.option(
         []const u8,
         "http2-boring-root",
@@ -31,9 +26,6 @@ pub fn build(b: *std.Build) void {
         "boringssl-source-path",
         "Path to a BoringSSL source checkout for the boring package.",
     ) orelse "boringssl";
-
-    const build_options = b.addOptions();
-    build_options.addOption(bool, "use_evented_backend", evented);
 
     const boring_dependency = b.dependency("boring", .{
         .target = target,
@@ -53,7 +45,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    http2_module.addOptions("build_options", build_options);
 
     const http2_boring_module = add_http2_boring_module(
         b,
@@ -90,7 +81,6 @@ pub fn build(b: *std.Build) void {
         http2_boring_module,
         boring_module,
         tls_server_module,
-        build_options,
     );
 
     // Benchmark application
@@ -102,11 +92,10 @@ pub fn build(b: *std.Build) void {
         http2_boring_module,
         boring_module,
         tls_server_module,
-        build_options,
     );
 
     // Test suite
-    add_tests(b, target, optimize, build_options);
+    add_tests(b, target, optimize);
 
     // Documentation
     add_documentation(b, http2_lib);
@@ -124,7 +113,6 @@ fn add_examples(
     http2_boring_module: *std.Build.Module,
     boring_module: *std.Build.Module,
     tls_server_module: *std.Build.Module,
-    build_options: *std.Build.Step.Options,
 ) void {
     // Basic TLS Example
     const basic_tls_module = b.createModule(.{
@@ -136,7 +124,6 @@ fn add_examples(
     basic_tls_module.addImport("http2-boring", http2_boring_module);
     basic_tls_module.addImport("boring", boring_module);
     basic_tls_module.addImport("tls-server", tls_server_module);
-    basic_tls_module.addOptions("build_options", build_options);
 
     const basic_tls = b.addExecutable(.{
         .name = "basic_tls_server",
@@ -167,7 +154,6 @@ fn add_examples(
     turboapi_module.addImport("boring", boring_module);
     turboapi_module.addImport("tls-server", tls_server_module);
     turboapi_module.addImport("turboapi-core", turboapi_core_module);
-    turboapi_module.addOptions("build_options", build_options);
 
     const turboapi = b.addExecutable(.{
         .name = "turboapi_server",
@@ -190,7 +176,6 @@ fn add_benchmark(
     http2_boring_module: *std.Build.Module,
     boring_module: *std.Build.Module,
     tls_server_module: *std.Build.Module,
-    build_options: *std.Build.Step.Options,
 ) void {
     // Benchmark server
     const benchmark_module = b.createModule(.{
@@ -202,7 +187,6 @@ fn add_benchmark(
     benchmark_module.addImport("http2-boring", http2_boring_module);
     benchmark_module.addImport("boring", boring_module);
     benchmark_module.addImport("tls-server", tls_server_module);
-    benchmark_module.addOptions("build_options", build_options);
 
     const benchmark = b.addExecutable(.{
         .name = "benchmark",
@@ -261,7 +245,6 @@ fn add_tests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    build_options: *std.Build.Step.Options,
 ) void {
     // Unit tests for core modules
     const test_modules = [_][]const u8{
@@ -287,7 +270,6 @@ fn add_tests(
             .optimize = optimize,
             .link_libc = true,
         });
-        test_module.addOptions("build_options", build_options);
 
         const module_test = b.addTest(.{
             .root_module = test_module,

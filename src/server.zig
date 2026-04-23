@@ -1,12 +1,8 @@
 //! HTTP/2 server transport built on the Zig standard library I/O stack.
 //!
-//! The default build uses `std.Io.Threaded`.
-//! On Linux, the experimental `std.Io.Evented` backend can be enabled with
-//! `-Devented=true` once the toolchain backend is known to compile cleanly.
+//! Zig 0.16.0's network-capable backend for Linux is `std.Io.Threaded`.
 
-const builtin = @import("builtin");
 const std = @import("std");
-const build_options = @import("build_options");
 
 const connection_module = @import("connection.zig");
 const handler = @import("handler.zig");
@@ -16,53 +12,26 @@ const Connection = connection_module.Connection;
 const ServerStats = @import("http2.zig").ServerStats;
 const log = std.log.scoped(.server);
 
-const backend_uses_evented = if (build_options.use_evented_backend)
-    builtin.os.tag == .linux and std.Io.Evented != void
-else
-    false;
+const Backend = struct {
+    threaded: std.Io.Threaded,
 
-const Backend = if (backend_uses_evented)
-    struct {
-        evented: std.Io.Evented,
-
-        fn init(target: *Backend, allocator: std.mem.Allocator) !void {
-            target.* = undefined;
-            try target.evented.init(allocator, .{
+    fn init(target: *Backend, allocator: std.mem.Allocator) !void {
+        target.* = .{
+            .threaded = std.Io.Threaded.init(allocator, .{
                 .argv0 = .empty,
                 .environ = .empty,
-                .backing_allocator_needs_mutex = true,
-            });
-        }
-
-        fn deinit(self: *Backend) void {
-            self.evented.deinit();
-        }
-
-        fn io(self: *Backend) std.Io {
-            return self.evented.io();
-        }
+            }),
+        };
     }
-else
-    struct {
-        threaded: std.Io.Threaded,
 
-        fn init(target: *Backend, allocator: std.mem.Allocator) !void {
-            target.* = .{
-                .threaded = std.Io.Threaded.init(allocator, .{
-                    .argv0 = .empty,
-                    .environ = .empty,
-                }),
-            };
-        }
+    fn deinit(self: *Backend) void {
+        self.threaded.deinit();
+    }
 
-        fn deinit(self: *Backend) void {
-            self.threaded.deinit();
-        }
-
-        fn io(self: *Backend) std.Io {
-            return self.threaded.io();
-        }
-    };
+    fn io(self: *Backend) std.Io {
+        return self.threaded.io();
+    }
+};
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -239,15 +208,6 @@ pub const Server = struct {
         stream: std.Io.net.Stream,
         connection_slot: *ConnectionSlot,
     ) !void {
-        if (backend_uses_evented) {
-            self.connection_group.async(io, serveConnectionTask, .{
-                self,
-                stream,
-                connection_slot,
-            });
-            return;
-        }
-
         // The threaded backend consumes a worker while a connection blocks in
         // socket I/O, so a connection task requires concurrency rather than
         // mere asynchrony.
@@ -417,23 +377,7 @@ fn logListening(self: *const Server) void {
 }
 
 fn backendLabel() []const u8 {
-    if (!backend_uses_evented) {
-        return "std.Io.Threaded";
-    }
-
-    return switch (builtin.os.tag) {
-        .linux => "std.Io.Evented (io_uring)",
-        .dragonfly, .freebsd, .netbsd, .openbsd => "std.Io.Evented (kqueue)",
-        .driverkit,
-        .ios,
-        .maccatalyst,
-        .macos,
-        .tvos,
-        .visionos,
-        .watchos,
-        => "std.Io.Evented (Dispatch)",
-        else => "std.Io.Evented",
-    };
+    return "std.Io.Threaded";
 }
 
 fn logConnectionError(err: anyerror) void {
