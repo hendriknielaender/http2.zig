@@ -26,12 +26,25 @@ pub fn build(b: *std.Build) void {
         "boringssl-source-path",
         "Path to a BoringSSL source checkout for the boring package.",
     ) orelse "boringssl";
+    const boringssl_lib_path = b.option(
+        []const u8,
+        "boringssl-lib-path",
+        "Path to a BoringSSL CMake build root for the boring package.",
+    );
 
-    const boring_dependency = b.dependency("boring", .{
-        .target = target,
-        .optimize = optimize,
-        .@"boringssl-source-path" = boringssl_source_path,
-    });
+    const boring_dependency = if (boringssl_lib_path) |lib_path|
+        b.dependency("boring", .{
+            .target = target,
+            .optimize = optimize,
+            .@"boringssl-source-path" = boringssl_source_path,
+            .@"boringssl-lib-path" = lib_path,
+        })
+    else
+        b.dependency("boring", .{
+            .target = target,
+            .optimize = optimize,
+            .@"boringssl-source-path" = boringssl_source_path,
+        });
     const boring_module = boring_dependency.module("boring");
     const http2_boring_source: std.Build.LazyPath = if (http2_boring_root) |root|
         .{ .cwd_relative = b.pathJoin(&.{ root, "src/http2_boring.zig" }) }

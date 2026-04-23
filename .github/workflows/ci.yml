@@ -16,6 +16,7 @@ concurrency:
 
 env:
   ZIG_VERSION: 0.16.0
+  BORINGSSL_CACHE_VERSION: v2
 
 defaults:
   run:
@@ -49,11 +50,33 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      - name: Resolve BoringSSL revision
+        id: boringssl
+        run: echo "revision=$(git -C boringssl rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore BoringSSL library cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-release-${{ steps.boringssl.outputs.revision }}
+
+      - name: Build BoringSSL library cache
+        run: |
+          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
+            echo "Using cached BoringSSL libraries."
+            exit 0
+          fi
+
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build boringssl/build --target ssl crypto --parallel
+
       - name: Build release artifacts
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dboringssl-lib-path=boringssl/build
 
       - name: Run unit tests
-        run: zig build test
+        run: zig build test -Dboringssl-lib-path=boringssl/build
 
   docs:
     name: Docs
@@ -85,6 +108,7 @@ jobs:
 
   conformance:
     name: HTTP/2 Conformance
+    needs: build_test_linux
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -103,8 +127,30 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      - name: Resolve BoringSSL revision
+        id: boringssl
+        run: echo "revision=$(git -C boringssl rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Restore BoringSSL library cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            boringssl/build/crypto
+            boringssl/build/ssl
+          key: boringssl-${{ env.BORINGSSL_CACHE_VERSION }}-${{ runner.os }}-${{ env.ZIG_VERSION }}-release-${{ steps.boringssl.outputs.revision }}
+
+      - name: Build BoringSSL library cache
+        run: |
+          if [[ -f boringssl/build/ssl/libssl.a && -f boringssl/build/crypto/libcrypto.a ]]; then
+            echo "Using cached BoringSSL libraries."
+            exit 0
+          fi
+
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build boringssl/build --target ssl crypto --parallel
+
       - name: Build benchmark server
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dboringssl-lib-path=boringssl/build
 
       - name: Generate test certificate
         run: |
