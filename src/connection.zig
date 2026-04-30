@@ -2108,8 +2108,32 @@ pub const Connection = struct {
         stream: *DefaultStream.StreamInstance,
     ) !handler.Response {
         const method = try self.requestMethod(stream);
-        var normalized_path_storage: [memory_budget.MemBudget.max_header_size]u8 = undefined;
-        const target = try self.requestTarget(stream, &normalized_path_storage);
+        const raw_target = stream.request_path orelse return error.MissingPath;
+        if (normalized_request_target(raw_target)) |target| {
+            return self.dispatch_request_target(request_dispatcher, stream, method, target);
+        }
+        return self.dispatch_request_slow(request_dispatcher, stream, method, raw_target);
+    }
+
+    fn dispatch_request_slow(
+        self: *@This(),
+        request_dispatcher: handler.RequestDispatcher,
+        stream: *DefaultStream.StreamInstance,
+        method: handler.Method,
+        raw_target: []const u8,
+    ) !handler.Response {
+        var path_storage: [memory_budget.MemBudget.max_header_size]u8 = undefined;
+        const target = try normalizeRequestTarget(raw_target, &path_storage);
+        return self.dispatch_request_target(request_dispatcher, stream, method, target);
+    }
+
+    fn dispatch_request_target(
+        self: *@This(),
+        request_dispatcher: handler.RequestDispatcher,
+        stream: *DefaultStream.StreamInstance,
+        method: handler.Method,
+        target: RequestTarget,
+    ) !handler.Response {
         var context = handler.Context.init(
             self.allocator,
             method,
@@ -2138,16 +2162,6 @@ pub const Connection = struct {
             return error.MissingMethod;
         }
         return error.UnsupportedMethod;
-    }
-
-    fn requestTarget(
-        self: *@This(),
-        stream: *DefaultStream.StreamInstance,
-        normalized_path_storage: []u8,
-    ) !RequestTarget {
-        _ = self;
-        const raw_target = stream.request_path orelse return error.MissingPath;
-        return normalizeRequestTarget(raw_target, normalized_path_storage);
     }
 
     fn requestPseudoHeader(
@@ -2962,6 +2976,69 @@ fn normalizeRequestTarget(
     };
 }
 
+fn normalized_request_target(raw_target: []const u8) ?RequestTarget {
+    const query_index = std.mem.indexOfScalar(u8, raw_target, '?') orelse raw_target.len;
+    const raw_path = raw_target[0..query_index];
+    if (!request_path_is_normalized(raw_path)) {
+        return null;
+    }
+
+    const query = if (query_index < raw_target.len)
+        raw_target[query_index + 1 ..]
+    else
+        "";
+
+    return .{
+        .normalized_path = raw_path,
+        .query = query,
+    };
+}
+
+fn request_path_is_normalized(raw_path: []const u8) bool {
+    if (raw_path.len == 0) {
+        return false;
+    }
+    if (raw_path[0] != '/') {
+        return false;
+    }
+
+    var segment_start: usize = 1;
+    var index: usize = 1;
+    while (index <= raw_path.len) : (index += 1) {
+        if (index < raw_path.len) {
+            const byte = raw_path[index];
+            if (byte == 0) {
+                return false;
+            }
+            if (byte == '%') {
+                return false;
+            }
+            if (byte != '/') {
+                continue;
+            }
+        }
+
+        if (request_path_segment_is_special(raw_path[segment_start..index])) {
+            return false;
+        }
+        segment_start = index + 1;
+    }
+
+    return true;
+}
+
+fn request_path_segment_is_special(segment: []const u8) bool {
+    if (segment.len == 1) {
+        return segment[0] == '.';
+    }
+    if (segment.len == 2) {
+        if (segment[0] == '.') {
+            return segment[1] == '.';
+        }
+    }
+    return false;
+}
+
 fn decodePathByte(raw_path: []const u8, source_index: *usize) !u8 {
     std.debug.assert(source_index.* < raw_path.len);
 
@@ -3363,6 +3440,21 @@ test "default response header encoding uses dynamic table after first response" 
     try connection.encode_response(second_stream, &second_response);
 
     try std.testing.expect(second_stream.response_header_block_len < first_header_block_len);
+}
+
+test "normalized request target fast path accepts canonical target" {
+    const target = normalized_request_target("/baseline2?a=1&b=2").?;
+
+    try std.testing.expectEqualStrings("/baseline2", target.normalized_path);
+    try std.testing.expectEqualStrings("a=1&b=2", target.query);
+}
+
+test "normalized request target fast path rejects slow-path targets" {
+    try std.testing.expect(normalized_request_target("") == null);
+    try std.testing.expect(normalized_request_target("baseline2?a=1") == null);
+    try std.testing.expect(normalized_request_target("/a/../b") == null);
+    try std.testing.expect(normalized_request_target("/a/%62") == null);
+    try std.testing.expect(normalized_request_target("/a/./b") == null);
 }
 
 test "flush_ready_streams reports completed responses once" {
