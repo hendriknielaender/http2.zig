@@ -5,15 +5,16 @@ const std = @import("std");
 const connection_module = @import("connection.zig");
 const handler = @import("handler.zig");
 const transport = @import("transport.zig");
+const http2 = @import("http2.zig");
 // Local fork of `std.Io.Kqueue` patched to compile against the current
 // `std.Io.VTable` shape. See `src/io/Kqueue.zig` for the rationale.
-const Kqueue = @import("io/Kqueue.zig");
+const Kqueue = http2.Kqueue;
 
 const Connection = connection_module.Connection;
 const ServerStats = @import("http2.zig").ServerStats;
 const log = std.log.scoped(.server);
 
-const Backend = struct {
+const Backend = if (http2.has_kqueue_backend) struct {
     allocator: std.mem.Allocator,
     evented: ?*Kqueue,
 
@@ -48,6 +49,18 @@ const Backend = struct {
 
     fn io(self: *Backend) std.Io {
         return self.evented.?.io();
+    }
+} else struct {
+    fn init(_: std.mem.Allocator) Backend {
+        return .{};
+    }
+
+    fn start(_: *Backend) !void {}
+
+    fn deinit(_: *Backend) void {}
+
+    fn io(_: *Backend) std.Io {
+        return std.Io.Threaded.global_single_threaded.io();
     }
 };
 
