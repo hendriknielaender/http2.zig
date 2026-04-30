@@ -211,14 +211,17 @@ pub const Server = struct {
 
     fn runAcceptLoop(self: *Self, io: std.Io) !void {
         while (self.running.load(.acquire)) {
-            var stream = self.listener.?.accept(io) catch |err| switch (err) {
-                error.ConnectionAborted => continue,
-                error.SocketNotListening => break,
-                error.Canceled => break,
-                else => {
-                    if (!self.running.load(.acquire)) break;
-                    return err;
-                },
+            var stream = self.listener.?.accept(io) catch |err| {
+                if (!self.running.load(.acquire) or self.listener_closed.load(.acquire)) {
+                    break;
+                }
+
+                switch (err) {
+                    error.ConnectionAborted => continue,
+                    error.SocketNotListening => break,
+                    error.Canceled => break,
+                    else => return err,
+                }
             };
 
             setTcpNoDelay(stream.socket.handle);
