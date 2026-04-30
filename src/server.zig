@@ -454,9 +454,9 @@ fn waitForServerPort(server: *const Server) !u16 {
     return error.TestUnexpectedResult;
 }
 
-fn waitForActiveConnection(server: *const Server) !void {
+fn waitForAcceptedConnection(server: *const Server) !void {
     for (0..5 * std.time.ms_per_s) |_| {
-        if (server.getStats().active_connections != 0) {
+        if (server.getStats().total_connections != 0) {
             return;
         }
 
@@ -535,7 +535,7 @@ test "stop cancels idle async connections" {
         client_stream.close(io);
     };
 
-    try waitForActiveConnection(&server);
+    try waitForAcceptedConnection(&server);
 
     server.stop();
     server_thread.join();
