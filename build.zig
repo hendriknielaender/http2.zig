@@ -361,6 +361,45 @@ fn add_tls_server_module(
     return module;
 }
 
+fn add_http2_boring_module(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    http2_module: *std.Build.Module,
+    boring_module: *std.Build.Module,
+    root_source_file: std.Build.LazyPath,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = root_source_file,
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("boring", boring_module);
+    module.addImport("http2", http2_module);
+
+    return module;
+}
+
+fn add_tls_server_module(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    http2_module: *std.Build.Module,
+    http2_boring_module: *std.Build.Module,
+    boring_module: *std.Build.Module,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path("examples/tls_server.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("http2", http2_module);
+    module.addImport("http2-boring", http2_boring_module);
+    module.addImport("boring", boring_module);
+
+    return module;
+}
+
 /// Add comprehensive test suite
 fn add_tests(
     b: *std.Build,
