@@ -215,7 +215,10 @@ pub const Server = struct {
                 error.ConnectionAborted => continue,
                 error.SocketNotListening => break,
                 error.Canceled => break,
-                else => return err,
+                else => {
+                    if (!self.running.load(.acquire)) break;
+                    return err;
+                },
             };
 
             setTcpNoDelay(stream.socket.handle);
@@ -439,29 +442,42 @@ const ServerRunContext = struct {
 };
 
 fn waitForServerPort(server: *const Server) !u16 {
-    var spin_count: u32 = 0;
-
-    while (true) : (spin_count += 1) {
+    for (0..5 * std.time.ms_per_s) |_| {
         const port = server.listeningPort();
         if (port != 0) {
             return port;
         }
 
-        try std.testing.expect(spin_count < 10_000);
-        std.Thread.yield() catch {};
+        sleepOneMs();
     }
+
+    return error.TestUnexpectedResult;
 }
 
 fn waitForActiveConnection(server: *const Server) !void {
-    var spin_count: u32 = 0;
-
-    while (true) : (spin_count += 1) {
+    for (0..5 * std.time.ms_per_s) |_| {
         if (server.getStats().active_connections != 0) {
             return;
         }
 
-        try std.testing.expect(spin_count < 10_000);
-        std.Thread.yield() catch {};
+        sleepOneMs();
+    }
+
+    return error.TestUnexpectedResult;
+}
+
+fn sleepOneMs() void {
+    var remaining: std.posix.timespec = .{
+        .sec = 0,
+        .nsec = std.time.ns_per_ms,
+    };
+
+    while (true) {
+        switch (std.posix.errno(std.posix.system.nanosleep(&remaining, &remaining))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return,
+        }
     }
 }
 
