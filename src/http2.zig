@@ -10,6 +10,11 @@
 
 const std = @import("std");
 
+// Local fork of `std.Io.Kqueue` (see `src/io/Kqueue.zig`). Re-exported so
+// out-of-tree modules (e.g. `examples/tls_server.zig`) consume the same
+// patched backend as the in-tree HTTP/2 server.
+pub const Kqueue = @import("io/Kqueue.zig");
+
 // Core HTTP/2 Protocol Components
 pub const Connection = @import("connection.zig").Connection;
 pub const Stream = @import("stream.zig").Stream;

@@ -18,3 +18,6 @@ release-stage/
 boringssl/
 
 server.log
+
+benchmarks/httparena/actix/target
+benchmarks/httparena/actix-h2c/target

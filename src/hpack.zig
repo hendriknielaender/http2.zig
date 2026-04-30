@@ -137,7 +137,10 @@ pub const Hpack = struct {
 
         pub fn get(index: usize) HeaderField {
             if (index >= entries.len) {
-                log.err("Static table index out of bounds: index={d}, max={d}\n", .{ index, entries.len });
+                log.err("Static table index out of bounds: index={d}, max={d}\n", .{
+                    index,
+                    entries.len,
+                });
                 // Return a dummy header to prevent crash
                 return HeaderField{ .name = "x-invalid-static", .value = "out-of-bounds" };
             }
@@ -232,7 +235,9 @@ pub const Hpack = struct {
 
         fn evictOldestEntry(self: *DynamicTable) void {
             if (self.count == 0) return;
-            const oldest_index = (self.head + MAX_DYNAMIC_TABLE_ENTRIES - self.count) % MAX_DYNAMIC_TABLE_ENTRIES;
+            const oldest_index =
+                (self.head + MAX_DYNAMIC_TABLE_ENTRIES - self.count) %
+                MAX_DYNAMIC_TABLE_ENTRIES;
             if (self.entries[oldest_index]) |entry| {
                 self.current_size -= entry.size;
                 self.entries[oldest_index] = null;
@@ -260,7 +265,9 @@ pub const Hpack = struct {
             if (index >= self.count) {
                 return error.InvalidIndex;
             }
-            const actual_index = (self.head + MAX_DYNAMIC_TABLE_ENTRIES - 1 - index) % MAX_DYNAMIC_TABLE_ENTRIES;
+            const actual_index =
+                (self.head + MAX_DYNAMIC_TABLE_ENTRIES - 1 - index) %
+                MAX_DYNAMIC_TABLE_ENTRIES;
             if (self.entries[actual_index]) |entry| {
                 return HeaderField{ .name = entry.name, .value = entry.value };
             } else {
@@ -272,12 +279,18 @@ pub const Hpack = struct {
             // HPACK dynamic table indices start from StaticTable.entries.len + 1 and increase
             const static_table_size = Hpack.StaticTable.entries.len;
             if (index <= static_table_size) {
-                log.err("Invalid dynamic table access: index {d} should be static (max {d})\n", .{ index, static_table_size });
+                log.err("Invalid dynamic table access: index {d} should be static (max {d})\n", .{
+                    index,
+                    static_table_size,
+                });
                 return error.InvalidIndex;
             }
             const position = index - static_table_size - 1;
             if (position >= self.count) {
-                log.err("Dynamic table position out of bounds: position={d}, table_size={d}\n", .{ position, self.count });
+                log.err("Dynamic table position out of bounds: position={d}, table_size={d}\n", .{
+                    position,
+                    self.count,
+                });
                 return error.InvalidIndex;
             }
             // Additional safety check
@@ -287,6 +300,20 @@ pub const Hpack = struct {
             }
             const result = try self.getEntry(position);
             return result;
+        }
+
+        pub fn getHpackIndex(self: *DynamicTable, name: []const u8, value: []const u8) ?usize {
+            var position: usize = 0;
+            while (position < self.count) : (position += 1) {
+                const entry = self.getEntry(position) catch unreachable;
+                if (std.mem.eql(u8, name, entry.name)) {
+                    if (std.mem.eql(u8, value, entry.value)) {
+                        return Hpack.StaticTable.entries.len + 1 + position;
+                    }
+                }
+            }
+
+            return null;
         }
 
         pub fn updateMaxSize(self: *DynamicTable, new_size: usize) !void {
@@ -343,7 +370,9 @@ pub const Hpack = struct {
             var layouts: [MAX_DYNAMIC_TABLE_ENTRIES]EntryLayout = undefined;
             var layouts_count: usize = 0;
             var compacted_used: usize = 0;
-            var slot = (self.head + MAX_DYNAMIC_TABLE_ENTRIES - self.count) % MAX_DYNAMIC_TABLE_ENTRIES;
+            var slot =
+                (self.head + MAX_DYNAMIC_TABLE_ENTRIES - self.count) %
+                MAX_DYNAMIC_TABLE_ENTRIES;
             var scanned: usize = 0;
 
             while (scanned < self.count) : (scanned += 1) {
@@ -374,9 +403,11 @@ pub const Hpack = struct {
             self.storage_used = compacted_used;
 
             for (layouts[0..layouts_count]) |layout| {
+                const name_end = layout.name_start + layout.name_len;
+                const value_end = layout.value_start + layout.value_len;
                 self.entries[layout.slot] = .{
-                    .name = self.storage[layout.name_start .. layout.name_start + layout.name_len],
-                    .value = self.storage[layout.value_start .. layout.value_start + layout.value_len],
+                    .name = self.storage[layout.name_start..name_end],
+                    .value = self.storage[layout.value_start..value_end],
                     .size = layout.size,
                 };
             }
@@ -451,7 +482,11 @@ pub const Hpack = struct {
         }
     }
 
-    pub fn encodeString(str: []const u8, buffer: *std.ArrayList(u8), allocator: std.mem.Allocator) !void {
+    pub fn encodeString(
+        str: []const u8,
+        buffer: *std.ArrayList(u8),
+        allocator: std.mem.Allocator,
+    ) !void {
         assert(str.len <= MAX_HEADER_LIST_SIZE);
         assert(@intFromPtr(buffer) != 0);
 
@@ -482,6 +517,10 @@ pub const Hpack = struct {
 
         const static_index = Hpack.StaticTable.getStaticIndex(field.name, field.value);
         if (static_index) |idx| {
+            // Indexed Header Field Representation (Section 6.1)
+            const prefix_value: u8 = 0x80; // First bit set to 1
+            try Hpack.encodeInt(idx, 7, buffer, allocator, prefix_value);
+        } else if (dynamic_table.getHpackIndex(field.name, field.value)) |idx| {
             // Indexed Header Field Representation (Section 6.1)
             const prefix_value: u8 = 0x80; // First bit set to 1
             try Hpack.encodeInt(idx, 7, buffer, allocator, prefix_value);
@@ -686,7 +725,10 @@ pub const Hpack = struct {
         var cursor: usize = int_result.bytes_consumed;
 
         if (int_result.value > data.len - cursor) {
-            log.err("Invalid encoding: length {any} exceeds available buffer size {any}\n", .{ int_result.value, data.len - cursor });
+            log.err("Invalid encoding: length {any} exceeds available buffer size {any}\n", .{
+                int_result.value,
+                data.len - cursor,
+            });
             return error.InvalidEncoding;
         }
 
@@ -757,10 +799,10 @@ test "Dynamic table handles oversized entry correctly" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var dynamic_table = Hpack.DynamicTable.init(allocator, 100); // Small size to test oversized entry
+    var dynamic_table = Hpack.DynamicTable.init(allocator, 100);
     defer dynamic_table.deinit();
     // Create a larger value to exceed the dynamic table's max_size of 100
-    const large_value = try allocator.alloc(u8, 101); // Create a value with 101 bytes (oversized)
+    const large_value = try allocator.alloc(u8, 101);
     defer allocator.free(large_value);
     // Manually fill the buffer with 'a'
     for (large_value) |*byte| {
@@ -995,7 +1037,10 @@ test "HPACK encoding and decoding of :status and content-length using static tab
         try Hpack.encodeHeaderField(status_field, &dynamic_table, &buffer, allocator);
     }
     // Check if content-length is in the static table
-    if (Hpack.StaticTable.getStaticIndex(content_length_field.name, content_length_field.value)) |idx| {
+    if (Hpack.StaticTable.getStaticIndex(
+        content_length_field.name,
+        content_length_field.value,
+    )) |idx| {
         try Hpack.encodeInt(idx, 7, &buffer, allocator, 0x80); // Indexed Header Field (Section 6.1)
     } else {
         try Hpack.encodeHeaderField(content_length_field, &dynamic_table, &buffer, allocator);
@@ -1013,7 +1058,11 @@ test "HPACK encoding and decoding of :status and content-length using static tab
     }
     var cursor: usize = 0;
     while (cursor < buffer.items.len) {
-        var decoded_header = try Hpack.decodeHeaderField(buffer.items[cursor..], &dynamic_table, allocator);
+        var decoded_header = try Hpack.decodeHeaderField(
+            buffer.items[cursor..],
+            &dynamic_table,
+            allocator,
+        );
         defer decoded_header.deinit();
         // Create owned copies
         const owned_header = Hpack.HeaderField{

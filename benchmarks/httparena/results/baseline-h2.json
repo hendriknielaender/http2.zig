@@ -1,0 +1,37 @@
+[
+  {
+    "framework": "http2-zig",
+    "language": "Zig",
+    "rps": 4828600,
+    "avg_latency": "2.82ms",
+    "p99_latency": "20.68ms",
+    "connections": 256,
+    "threads": 10,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "101.31MB/s",
+    "reconnects": 0,
+    "status_2xx": 24143000,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  }
+,
+  {
+    "framework": "http2-zig",
+    "language": "Zig",
+    "rps": 4704810,
+    "avg_latency": "2.91ms",
+    "p99_latency": "24.79ms",
+    "connections": 1024,
+    "threads": 10,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "98.91MB/s",
+    "reconnects": 0,
+    "status_2xx": 23571100,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  }
+]

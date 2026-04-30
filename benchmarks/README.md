@@ -47,6 +47,38 @@ curl -k --http2 https://127.0.0.1:8443
 h2load -n 10000 -c 100 -m 10 https://127.0.0.1:8443/
 ```
 
+## HttpArena leaderboard comparison
+
+The benchmark server implements the [HttpArena](https://www.http-arena.com/leaderboard/)
+`baseline-h2` contract: `GET /baseline2?a=<i64>&b=<i64>` returns the integer
+sum, and `GET /json/{count}?m=<i64>` returns a processed slice of the dataset
+(loaded from `$DATASET_PATH`, falling back to `data/dataset.json`, then to a
+synthetic 50-item set so the endpoint is always available). The benchmark
+logs the cgroup v2 CPU budget from `/sys/fs/cgroup/cpu.max`, which keeps local
+results honest when run under `docker run --cpus=N`.
+
+```bash
+# Run h2load with the upstream baseline-h2 profile (c=256 then c=1024) and
+# write results into benchmarks/httparena/results/baseline-h2.json.
+zig build httparena
+
+# Pull the upstream leaderboard JSON and rank our run alongside it.
+zig build httparena-compare
+
+# Same-host comparison against the upstream Rust reference. A verbatim copy
+# of MDA2AV/HttpArena/frameworks/actix-h2c lives at
+# benchmarks/httparena/actix-h2c/ (built on first use via cargo). Runs both
+# servers, prints zig (h2/TLS) vs actix (h2c) rps side-by-side. Cross-protocol,
+# so use it to track our delta from a known reference, not to declare a winner.
+zig build httparena-vs-actix
+```
+
+The upstream leaderboard runs on a dedicated 64-core host with CPU pinning, so
+absolute rps is not directly comparable on smaller dev boxes. Use the rank
+and the rps trend over time, not the raw number. Tunable via env: `DURATION`
+(default `5s`), `CONNECTIONS` (default `"256 1024"`), `H2THREADS`,
+`PORT`, `DATASET_PATH`.
+
 ## Configuration
 
 - `PORT`: Server port (default: 8443)

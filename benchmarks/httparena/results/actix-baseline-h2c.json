@@ -1,0 +1,37 @@
+[
+  {
+    "framework": "actix-h2c-local",
+    "language": "Rust",
+    "rps": 1168160,
+    "avg_latency": "22.00ms",
+    "p99_latency": "37.71ms",
+    "connections": 256,
+    "threads": 10,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "40.12MB/s",
+    "reconnects": 0,
+    "status_2xx": 5840800,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  }
+,
+  {
+    "framework": "actix-h2c-local",
+    "language": "Rust",
+    "rps": 1151454,
+    "avg_latency": "82.96ms",
+    "p99_latency": "110.94ms",
+    "connections": 1024,
+    "threads": 10,
+    "duration": "5s",
+    "pipeline": 1,
+    "bandwidth": "39.73MB/s",
+    "reconnects": 0,
+    "status_2xx": 5780300,
+    "status_3xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0
+  }
+]

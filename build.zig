@@ -101,10 +101,9 @@ pub fn build(b: *std.Build) void {
         b,
         target,
         optimize,
-        http2_module,
-        http2_boring_module,
-        boring_module,
-        tls_server_module,
+        http2_boring_root,
+        boringssl_source_path,
+        boringssl_lib_path,
     );
 
     // Test suite
@@ -185,21 +184,69 @@ fn add_benchmark(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    http2_module: *std.Build.Module,
-    http2_boring_module: *std.Build.Module,
-    boring_module: *std.Build.Module,
-    tls_server_module: *std.Build.Module,
+    http2_boring_root: ?[]const u8,
+    boringssl_source_path: []const u8,
+    boringssl_lib_path: ?[]const u8,
 ) void {
+    // Benchmarks must be optimized by default. Actix is always built with
+    // `cargo build --release`, so a default `zig build httparena-vs-actix`
+    // must not silently compare Debug Zig against Release Rust.
+    const benchmark_optimize: std.builtin.OptimizeMode = switch (optimize) {
+        .Debug => .ReleaseFast,
+        else => optimize,
+    };
+
+    const benchmark_boring_dependency = if (boringssl_lib_path) |lib_path|
+        b.dependency("boring", .{
+            .target = target,
+            .optimize = benchmark_optimize,
+            .@"boringssl-source-path" = boringssl_source_path,
+            .@"boringssl-lib-path" = lib_path,
+        })
+    else
+        b.dependency("boring", .{
+            .target = target,
+            .optimize = benchmark_optimize,
+            .@"boringssl-source-path" = boringssl_source_path,
+        });
+    const benchmark_boring_module = benchmark_boring_dependency.module("boring");
+    const benchmark_http2_module = b.createModule(.{
+        .root_source_file = b.path("src/http2.zig"),
+        .target = target,
+        .optimize = benchmark_optimize,
+        .link_libc = true,
+    });
+    const benchmark_http2_boring_source: std.Build.LazyPath = if (http2_boring_root) |root|
+        .{ .cwd_relative = b.pathJoin(&.{ root, "src/http2_boring.zig" }) }
+    else
+        benchmark_boring_dependency.path("http2-boring/src/http2_boring.zig");
+    const benchmark_http2_boring_module = add_http2_boring_module(
+        b,
+        target,
+        benchmark_optimize,
+        benchmark_http2_module,
+        benchmark_boring_module,
+        benchmark_http2_boring_source,
+    );
+    const benchmark_tls_server_module = add_tls_server_module(
+        b,
+        target,
+        benchmark_optimize,
+        benchmark_http2_module,
+        benchmark_http2_boring_module,
+        benchmark_boring_module,
+    );
+
     // Benchmark server
     const benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/benchmark.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = benchmark_optimize,
     });
-    benchmark_module.addImport("http2", http2_module);
-    benchmark_module.addImport("http2-boring", http2_boring_module);
-    benchmark_module.addImport("boring", boring_module);
-    benchmark_module.addImport("tls-server", tls_server_module);
+    benchmark_module.addImport("http2", benchmark_http2_module);
+    benchmark_module.addImport("http2-boring", benchmark_http2_boring_module);
+    benchmark_module.addImport("boring", benchmark_boring_module);
+    benchmark_module.addImport("tls-server", benchmark_tls_server_module);
 
     const benchmark = b.addExecutable(.{
         .name = "benchmark",
@@ -212,6 +259,67 @@ fn add_benchmark(
     run_benchmark.step.dependOn(b.getInstallStep());
     const benchmark_step = b.step("benchmark", "Run HTTP/2 TLS benchmark server");
     benchmark_step.dependOn(&run_benchmark.step);
+
+    // HttpArena baseline-h2 profile: starts the server, runs h2load with the
+    // upstream profile knobs, writes results JSON in HttpArena's schema.
+    const httparena_run = b.addSystemCommand(&.{ "bash", "benchmarks/httparena/run.sh" });
+    httparena_run.step.dependOn(b.getInstallStep());
+    const httparena_step = b.step(
+        "httparena",
+        "Run the HttpArena baseline-h2 profile against our server",
+    );
+    httparena_step.dependOn(&httparena_run.step);
+
+    // Comparison: read the local results and rank against the upstream
+    // leaderboard JSON pulled from github.com/MDA2AV/HttpArena.
+    const httparena_compare = b.addSystemCommand(&.{ "bash", "benchmarks/httparena/compare.sh" });
+    const compare_step = b.step(
+        "httparena-compare",
+        "Compare local HttpArena results against the upstream leaderboard",
+    );
+    compare_step.dependOn(&httparena_compare.step);
+
+    // Same-host comparison against the upstream Rust reference (actix-h2c).
+    // The reference source lives at benchmarks/httparena/actix-h2c/ as a
+    // verbatim copy. The runner cargo-builds it on first use.
+    const httparena_actix = b.addSystemCommand(&.{ "bash", "benchmarks/httparena/run-actix.sh" });
+    const actix_step = b.step(
+        "httparena-actix",
+        "Build & benchmark the upstream actix-h2c reference implementation",
+    );
+    actix_step.dependOn(&httparena_actix.step);
+
+    // Same-host comparison against the upstream actix TLS variant (h2 + rustls).
+    // This is the apples-to-apples reference for our zig server, since both
+    // negotiate h2 over TLS on :8443. Source at benchmarks/httparena/actix/.
+    const httparena_actix_tls = b.addSystemCommand(&.{
+        "bash",
+        "benchmarks/httparena/run-actix-tls.sh",
+    });
+    const actix_tls_step = b.step(
+        "httparena-actix-tls",
+        "Build & benchmark the upstream actix h2-over-TLS reference implementation",
+    );
+    actix_tls_step.dependOn(&httparena_actix_tls.step);
+
+    // End-to-end: run our zig profile, run both actix references, print a
+    // side-by-side table on identical hardware. The runners use the same
+    // port (8443) for the TLS variants, so they must run sequentially.
+    // build.zig serializes the steps via dependsOn rather than running them
+    // in parallel.
+    const httparena_compare_local = b.addSystemCommand(&.{
+        "bash",
+        "benchmarks/httparena/compare-local.sh",
+    });
+    httparena_compare_local.step.dependOn(&httparena_run.step);
+    httparena_compare_local.step.dependOn(&httparena_actix.step);
+    httparena_actix_tls.step.dependOn(&httparena_run.step);
+    httparena_compare_local.step.dependOn(&httparena_actix_tls.step);
+    const vs_actix_step = b.step(
+        "httparena-vs-actix",
+        "Run zig + actix-h2c + actix-tls benchmarks and print side-by-side results",
+    );
+    vs_actix_step.dependOn(&httparena_compare_local.step);
 }
 
 fn add_http2_boring_module(

@@ -1,35 +1,53 @@
 //! HTTP/2 server transport built on the Zig standard library I/O stack.
-//!
-//! Zig 0.16.0's network-capable backend for Linux is `std.Io.Threaded`.
 
 const std = @import("std");
 
 const connection_module = @import("connection.zig");
 const handler = @import("handler.zig");
 const transport = @import("transport.zig");
+// Local fork of `std.Io.Kqueue` patched to compile against the current
+// `std.Io.VTable` shape. See `src/io/Kqueue.zig` for the rationale.
+const Kqueue = @import("io/Kqueue.zig");
 
 const Connection = connection_module.Connection;
 const ServerStats = @import("http2.zig").ServerStats;
 const log = std.log.scoped(.server);
 
 const Backend = struct {
-    threaded: std.Io.Threaded,
+    allocator: std.mem.Allocator,
+    evented: ?*Kqueue,
 
-    fn init(target: *Backend, allocator: std.mem.Allocator) !void {
-        target.* = .{
-            .threaded = std.Io.Threaded.init(allocator, .{
-                .argv0 = .empty,
-                .environ = .empty,
-            }),
+    fn init(allocator: std.mem.Allocator) Backend {
+        return .{
+            .allocator = allocator,
+            .evented = null,
         };
     }
 
+    fn start(self: *Backend) !void {
+        std.debug.assert(self.evented == null);
+
+        const evented = try self.allocator.create(Kqueue);
+        errdefer self.allocator.destroy(evented);
+
+        try evented.init(self.allocator, .{
+            .n_threads = null,
+        });
+        errdefer evented.deinit();
+
+        self.evented = evented;
+    }
+
     fn deinit(self: *Backend) void {
-        self.threaded.deinit();
+        const evented = self.evented orelse return;
+
+        evented.deinit();
+        self.allocator.destroy(evented);
+        self.evented = null;
     }
 
     fn io(self: *Backend) std.Io {
-        return self.threaded.io();
+        return self.evented.?.io();
     }
 };
 
@@ -44,7 +62,7 @@ pub const Server = struct {
     listener_closed: std.atomic.Value(bool),
     listener: ?std.Io.net.Server,
     connection_group: std.Io.Group,
-    next_connection_slot: std.atomic.Value(u32),
+    next_connection_slot: u32,
     stats: Stats,
 
     const Self = @This();
@@ -80,10 +98,6 @@ pub const Server = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         assertConfig(config);
 
-        var backend: Backend = undefined;
-        try Backend.init(&backend, allocator);
-        errdefer backend.deinit();
-
         const io_buffer_storage = try allocator.alloc(u8, totalIoBufferBytes(config));
         errdefer allocator.free(io_buffer_storage);
 
@@ -97,7 +111,7 @@ pub const Server = struct {
 
         return .{
             .allocator = allocator,
-            .backend = backend,
+            .backend = Backend.init(allocator),
             .config = config,
             .connection_slots = connection_slots,
             .io_buffer_storage = io_buffer_storage,
@@ -106,19 +120,18 @@ pub const Server = struct {
             .listener_closed = .init(true),
             .listener = null,
             .connection_group = .init,
-            .next_connection_slot = .init(0),
+            .next_connection_slot = 0,
             .stats = Stats.init(),
         };
     }
 
     pub fn deinit(self: *Self) void {
-        const io = self.backend.io();
-
         if (self.running.load(.acquire)) {
             self.stop();
         }
 
         if (self.listener != null) {
+            const io = self.backend.io();
             self.cleanupListener(io);
         }
 
@@ -128,6 +141,9 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Self) !void {
+        try self.backend.start();
+        defer self.backend.deinit();
+
         const io = self.backend.io();
 
         std.debug.assert(self.listener == null);
@@ -189,6 +205,8 @@ pub const Server = struct {
                 else => return err,
             };
 
+            setTcpNoDelay(stream.socket.handle);
+
             const connection_slot = self.acquireConnectionSlot() orelse {
                 stream.close(io);
                 continue;
@@ -208,9 +226,8 @@ pub const Server = struct {
         stream: std.Io.net.Stream,
         connection_slot: *ConnectionSlot,
     ) !void {
-        // The threaded backend consumes a worker while a connection blocks in
-        // socket I/O, so a connection task requires concurrency rather than
-        // mere asynchrony.
+        // Use grouped concurrency so each accepted connection has independent
+        // cancellation and completion accounting inside the evented backend.
         try self.connection_group.concurrent(io, serveConnectionTask, .{
             self,
             stream,
@@ -220,26 +237,18 @@ pub const Server = struct {
 
     fn acquireConnectionSlot(self: *Self) ?*ConnectionSlot {
         const slot_count: u32 = @intCast(self.connection_slots.len);
-        var attempt_count: u32 = 0;
+        std.debug.assert(slot_count > 0);
 
-        while (attempt_count < slot_count) : (attempt_count += 1) {
-            const current_index = self.next_connection_slot.load(.acquire);
-            const next_index = if (current_index + 1 < slot_count)
-                current_index + 1
+        var probe_count: u32 = 0;
+        while (probe_count < slot_count) : (probe_count += 1) {
+            const slot_index = self.next_connection_slot;
+            self.next_connection_slot = if (slot_index + 1 < slot_count)
+                slot_index + 1
             else
                 0;
 
-            if (self.next_connection_slot.cmpxchgWeak(
-                current_index,
-                next_index,
-                .acq_rel,
-                .acquire,
-            ) != null) {
-                continue;
-            }
-
-            const connection_slot = &self.connection_slots[@as(usize, @intCast(current_index))];
-            if (connection_slot.in_use.cmpxchgWeak(false, true, .acq_rel, .acquire) != null) {
+            const connection_slot = &self.connection_slots[@as(usize, @intCast(slot_index))];
+            if (connection_slot.in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
                 continue;
             }
 
@@ -377,7 +386,17 @@ fn logListening(self: *const Server) void {
 }
 
 fn backendLabel() []const u8 {
-    return "std.Io.Threaded";
+    return "Kqueue";
+}
+
+fn setTcpNoDelay(fd: std.posix.fd_t) void {
+    const value: c_int = 1;
+    _ = std.posix.setsockopt(
+        fd,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        std.mem.asBytes(&value),
+    ) catch {};
 }
 
 fn logConnectionError(err: anyerror) void {
