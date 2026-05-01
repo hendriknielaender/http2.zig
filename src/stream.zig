@@ -98,7 +98,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
         const WindowBufferSize: u32 = 1 << WindowBits;
         const WindowDefault: u32 = WindowBufferSize - 1;
         const MaxStreamCount: u32 = MaxStreams;
-        const HeaderBufferSize = memory_budget.MemBudget.max_header_size;
+        const HeaderBufferSize = memory_budget.MemBudget.max_header_size_bytes;
         const HeaderCountMax = 64;
 
         // Per-stream scratch the dispatcher can format small response bodies
@@ -167,7 +167,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             request_method: ?handler.Method,
             request_path: ?[]const u8,
             total_data_received: usize,
-            request_body_storage: [memory_budget.MemBudget.max_data_buffer]u8,
+            request_body_storage: [memory_budget.MemBudget.max_data_buffer_bytes]u8,
             request_body_len: usize,
             // Scratch the request handler formats small response bodies into,
             // owned by the stream so the body slice on `response` stays valid
@@ -994,7 +994,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     }
                 }
 
-                if (!isAllLowercase(header.name)) {
+                if (!handler.isAllLowercaseHeaderName(header.name)) {
                     try self.fail_protocol_error("Header field name contains uppercase letters");
                 }
             }
@@ -1119,15 +1119,6 @@ fn isConnectionSpecificHeader(header_name: []const u8) bool {
         }
     }
     return false;
-}
-
-fn isAllLowercase(s: []const u8) bool {
-    for (s) |c| {
-        if (c >= 'A' and c <= 'Z') {
-            return false;
-        }
-    }
-    return true;
 }
 
 pub const DefaultStream = Stream(16, 1000); // 64KB window, 1000 max streams

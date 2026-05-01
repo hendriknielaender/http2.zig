@@ -21,7 +21,7 @@ const HttpPriority = @import("http_priority.zig").Priority;
 const memory_budget = @import("memory_budget.zig");
 const TestIo = @import("testing/fixed_io.zig").FixedIo;
 const MAX_IN_FLIGHT_FRAMES = 64;
-const max_streams_per_connection = memory_budget.MemBudget.max_streams_per_conn;
+const max_streams_per_connection = memory_budget.MemBudget.max_streams_per_connection;
 const max_frame_size_default = http2.max_frame_size_default;
 const log = std.log.scoped(.connection);
 
@@ -2130,7 +2130,7 @@ pub const Connection = struct {
         method: handler.Method,
         raw_target: []const u8,
     ) !handler.Response {
-        var path_storage: [memory_budget.MemBudget.max_header_size]u8 = undefined;
+        var path_storage: [memory_budget.MemBudget.max_header_size_bytes]u8 = undefined;
         const target = try normalizeRequestTarget(raw_target, &path_storage);
         return self.dispatch_request_target(request_dispatcher, stream, method, target);
     }
@@ -2294,108 +2294,103 @@ pub const Connection = struct {
         }
     }
 
+    fn readFrameHeader(self: *@This(), header_buf: *[9]u8) !void {
+        var read: usize = 0;
+        while (read < 9) {
+            const n = try self.reader.readSliceShort(header_buf[read..]);
+            if (n == 0) return error.UnexpectedEOF;
+            read += n;
+        }
+    }
+
+    fn parsedFrameHeader(buf: [9]u8) struct {
+        length: u32,
+        frame_type: ?FrameType,
+        frame_type_u8: u8,
+        flags: FrameFlags,
+        stream_id: u32,
+    } {
+        const length: u32 = (@as(u32, buf[0]) << 16) | (@as(u32, buf[1]) << 8) | @as(u32, buf[2]);
+        const frame_type_u8: u8 = buf[3];
+        const frame_type = FrameType.fromU8(frame_type_u8);
+        const flags = FrameFlags{ .value = buf[4] };
+        const stream_id: u32 = @intCast(std.mem.readInt(u32, buf[5..9], .big) & 0x7FFFFFFF);
+        return .{ .length = length, .frame_type = frame_type, .frame_type_u8 = frame_type_u8, .flags = flags, .stream_id = stream_id };
+    }
+
+    fn readPayload(self: *@This(), payload: []u8) !void {
+        var read: usize = 0;
+        while (read < payload.len) {
+            const n = try self.reader.readSliceShort(payload[read..]);
+            if (n == 0) return error.UnexpectedEOF;
+            read += n;
+        }
+    }
+
+    fn failFrameSize(self: *@This(), length: u32, limit: u32) !void {
+        log.err("Received frame size {d} exceeds limit {d}, sending GOAWAY\n", .{ length, limit });
+        try self.send_goaway(self.highest_stream_id(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
+    }
+
     pub fn receive_frame_arena(self: *@This()) !Frame {
         assert(self.frame_arena_available);
 
         var header_buf: [9]u8 = undefined;
-        // Read the frame header (9 bytes) in a loop to handle partial reads
-        var header_read: usize = 0;
-        while (header_read < 9) {
-            const bytes_read = try self.reader.readSliceShort(header_buf[header_read..]);
-            if (bytes_read == 0) {
-                return error.UnexpectedEOF;
-            }
-            header_read += bytes_read;
-        }
-        // Manually parse frame length (first 3 bytes)
-        const length: u32 = (@as(u32, header_buf[0]) << 16) | (@as(u32, header_buf[1]) << 8) | @as(u32, header_buf[2]);
-        if (length > max_frame_size_default) {
-            log.err("Received frame size {d} exceeds compile-time limit {d}, sending GOAWAY\n", .{ length, max_frame_size_default });
-            try self.send_goaway(self.highest_stream_id(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
+        try self.readFrameHeader(&header_buf);
+        const parsed = parsedFrameHeader(header_buf);
+
+        if (parsed.length > max_frame_size_default) {
+            try self.failFrameSize(parsed.length, max_frame_size_default);
             return error.FrameSizeError;
         }
-        // Validate the length against the max_frame_size
-        if (length > self.settings.max_frame_size) {
-            log.err("Received frame size {d} exceeds SETTINGS_MAX_FRAME_SIZE {d}, sending GOAWAY\n", .{ length, self.settings.max_frame_size });
-            try self.send_goaway(self.highest_stream_id(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
+        if (parsed.length > self.settings.max_frame_size) {
+            try self.failFrameSize(parsed.length, self.settings.max_frame_size);
             return error.FrameSizeError;
         }
-        const frame_type_u8: u8 = header_buf[3];
-        const frame_type = FrameType.fromU8(frame_type_u8) orelse {
-            log.err("Invalid frame type: {d}\n", .{frame_type_u8});
+
+        const frame_type = parsed.frame_type orelse {
+            log.err("Invalid frame type: {d}\n", .{parsed.frame_type_u8});
             return error.InvalidFrameType;
         };
-        const flags = FrameFlags{ .value = header_buf[4] };
-        // Parse the stream ID (last 4 bytes of the header) in big-endian
-        const stream_id_u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
-        const stream_id: u32 = @intCast(stream_id_u32);
-        const payload = try self.frame_arena.allocator().alloc(u8, length);
-        var total_read: usize = 0;
-        while (total_read < length) {
-            const bytes_read = try self.reader.readSliceShort(payload[total_read..]);
-            if (bytes_read == 0) {
-                return error.UnexpectedEOF;
-            }
-            total_read += bytes_read;
-        }
+
+        const payload = try self.frame_arena.allocator().alloc(u8, parsed.length);
+        try self.readPayload(payload);
+
         return Frame{
             .header = FrameHeader{
-                .length = length,
-                .frame_type = @enumFromInt(frame_type),
-                .flags = flags,
-                .stream_id = stream_id,
+                .length = parsed.length,
+                .frame_type = frame_type,
+                .flags = parsed.flags,
+                .stream_id = parsed.stream_id,
                 .reserved = false,
             },
             .payload = payload,
         };
     }
+
     pub fn receive_frame(self: *@This()) !Frame {
         var header_buf: [9]u8 = undefined;
-        // Read the frame header (9 bytes) in a loop to handle partial reads
-        var header_read: usize = 0;
-        while (header_read < 9) {
-            const bytes_read = try self.reader.readSliceShort(header_buf[header_read..]);
-            if (bytes_read == 0) {
-                return error.UnexpectedEOF;
-            }
-            header_read += bytes_read;
-        }
-        // Manually parse frame length (first 3 bytes)
-        const length: u32 = (@as(u32, header_buf[0]) << 16) | (@as(u32, header_buf[1]) << 8) | @as(u32, header_buf[2]);
-        // Validate the length against the max_frame_size
-        if (length > self.settings.max_frame_size) {
-            log.err("Received frame size {d} exceeds SETTINGS_MAX_FRAME_SIZE {d}, sending GOAWAY\n", .{ length, self.settings.max_frame_size });
-            try self.send_goaway(self.highest_stream_id(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
+        try self.readFrameHeader(&header_buf);
+        const parsed = parsedFrameHeader(header_buf);
+
+        if (parsed.length > self.settings.max_frame_size) {
+            try self.failFrameSize(parsed.length, self.settings.max_frame_size);
             return error.FrameSizeError;
         }
-        const frame_type: u8 = header_buf[3];
-        const flags = FrameFlags{ .value = header_buf[4] };
-        // Parse the stream ID (last 4 bytes of the header) in big-endian
-        const stream_id_u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
-        const stream_id: u32 = @intCast(stream_id_u32);
-        // Read the frame payload in a loop to ensure all data is read
-        const payload = try self.allocator.alloc(u8, length);
-        var total_read: usize = 0;
-        while (total_read < length) {
-            const bytes_read = try self.reader.readSliceShort(payload[total_read..]);
-            if (bytes_read == 0) {
-                return error.UnexpectedEOF;
-            }
-            total_read += bytes_read;
-        }
+
+        const payload = try self.allocator.alloc(u8, parsed.length);
+        try self.readPayload(payload);
+
         return Frame{
             .header = FrameHeader{
-                .length = length,
-                .frame_type = @enumFromInt(frame_type),
-                .flags = flags,
-                .stream_id = stream_id,
+                .length = parsed.length,
+                .frame_type = @enumFromInt(parsed.frame_type_u8),
+                .flags = parsed.flags,
+                .stream_id = parsed.stream_id,
                 .reserved = false,
             },
             .payload = payload,
         };
-    }
-    fn from_int(val: u8) FrameType {
-        return std.meta.int_to_enum(FrameType, val) catch undefined;
     }
     pub fn apply_frame_settings(self: *@This(), frame: Frame) !void {
         std.debug.assert(frame.header.frame_type == FrameType.SETTINGS);
@@ -3106,9 +3101,6 @@ fn is_valid_frame_type(frame_type: u8) bool {
     return FrameHandler.fromFrameType(frame_type) != null;
 }
 
-inline fn is_valid_frame_type_inline(comptime frame_type: u8) bool {
-    return comptime FrameHandler.fromFrameType(frame_type) != null;
-}
 /// Ensure valid flags for frame types.
 fn is_valid_flags(header: FrameHeader) bool {
     const flags = header.flags.value;

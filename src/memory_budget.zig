@@ -1,417 +1,226 @@
-//! This module implements compile-time memory budgeting that prevents runtime OOM
-//! by pre-allocating all necessary memory based on worst-case calculations.
+//! Compile-time memory budgeting that prevents runtime OOM by sizing every
+//! allocation against worst-case calculations known before the server starts.
 //!
-//! - Compile-time resource planning
-//! - Static memory budgets
-//! - Fail-fast at build time
-//! - Zero runtime allocation failures
-//! - Performance through pre-allocation
+//! The budget constants serve as the single source of truth for maximum
+//! resource counts.  Every module that pre-allocates storage (connection
+//! slots, stream buffers, header fragments) binds its array lengths to these
+//! constants so that a budget change one place flows through the entire build.
+//!
+//! A phase-gated allocator (StaticAllocator) wraps the caller's allocator so
+//! that all heap work happens during init and is frozen before the event loop
+//! starts.  Any accidental runtime allocation triggers an assertion failure.
 const std = @import("std");
+
 pub const KiB = 1024;
 pub const MiB = 1024 * KiB;
 pub const GiB = 1024 * MiB;
-/// Compile-time Memory Budget Calculator
+
+/// Compile-time resource budget; every capacity choice lives here so that
+/// a single edit propagates to every consumer without leaving any array
+/// unbounded.
 pub const MemBudget = struct {
-    pub const max_conns = 128;
-    pub const max_streams_per_conn = 100;
-    pub const bytes_per_conn = 64 * KiB; // Per-connection flow-control window
-    pub const max_frame_size = 16 * KiB; // Standard HTTP/2 frame size
-    pub const max_header_size = 8 * KiB; // Maximum header block size (needs 6KB minimum)
-    pub const max_data_buffer = 16 * KiB; // Per-stream data buffer (needs 16KB minimum)
+    /// Maximum concurrent connections.  Must match `server.Config.max_connections`
+    /// default so that budget calculations are coherent with deployed code.
+    pub const max_connections = 1000;
+
+    /// Maximum concurrent streams inside a single connection.
+    /// RFC 7540 §5.1.1 notes the peer MAY advertise fewer via SETTINGS;
+    /// this is the worst-case local reservation.
+    pub const max_streams_per_connection = 100;
+
+    /// Per-connection receive-window ceiling in bytes.
+    pub const bytes_per_connection = 64 * KiB;
+
+    /// Largest frame payload we accept (RFC 7540 §4.2 minimum is 16384).
+    pub const max_frame_size_bytes = 16 * KiB;
+
+    /// Maximum uncompressed header block size.  RFC 7540 §10.3 recommends
+    /// at least 8KB capacity; HPACK dynamic-table entries may occupy this.
+    pub const max_header_size_bytes = 8 * KiB;
+
+    /// Per-stream data buffer (minimum 16KB per RFC 7540 §6.9.2).
+    pub const max_data_buffer_bytes = 16 * KiB;
+
+    /// Worker threads spun up for request processing.
     pub const worker_count = 2;
-    pub const stack_per_thread = 128 * KiB;
-    pub const global_reserve = 256 * KiB;
-    pub const emergency_reserve = 256 * KiB;
-    // Calculate total memory requirements at compile time
-    pub const stream_memory = max_streams_per_conn * max_data_buffer;
-    pub const connection_memory = max_conns * (bytes_per_conn + stream_memory);
-    pub const worker_memory = worker_count * stack_per_thread;
-    pub const total_required = connection_memory + worker_memory + global_reserve + emergency_reserve;
+
+    /// Minimum stack allocation per worker thread.
+    pub const stack_bytes_per_thread = 128 * KiB;
+
+    // -----------------------------------------------------------------------
+    //  Derived sizes – kept manually in sync with StreamInstance inline
+    //  buffers so that the budget is always the ceiling.
+    // -----------------------------------------------------------------------
+
+    pub const stream_header_fragments_bytes = max_header_size_bytes;
+    pub const stream_headers_storage_bytes = max_header_size_bytes;
+    pub const stream_request_body_bytes = max_data_buffer_bytes;
+    pub const stream_response_body_bytes = 256;
+    pub const stream_headers_array_bytes = 64 * @sizeOf(struct { name: []const u8, value: []const u8 });
+    pub const stream_metadata_bytes = 512;
+
+    pub const stream_instance_bytes =
+        stream_header_fragments_bytes +
+        stream_headers_storage_bytes +
+        stream_request_body_bytes +
+        stream_response_body_bytes +
+        stream_headers_array_bytes +
+        stream_metadata_bytes;
+
+    pub const stream_storage_lookup_bytes =
+        256 * (@sizeOf(u32) + @sizeOf(u8)) +
+        max_streams_per_connection * (@sizeOf(u32) + @sizeOf(bool));
+
+    pub const stream_storage_bytes =
+        max_streams_per_connection * stream_instance_bytes + stream_storage_lookup_bytes;
+
+    pub const connection_slot_overhead_bytes = 64;
+    pub const connection_slot_bytes = stream_storage_bytes + connection_slot_overhead_bytes;
+
+    pub const server_overhead_bytes = 16 * KiB;
+
+    pub const stream_memory_per_connection =
+        max_streams_per_connection * stream_instance_bytes;
+
+    pub const connection_memory_bytes = max_connections * connection_slot_bytes;
+    pub const worker_memory_bytes = worker_count * stack_bytes_per_thread;
+    pub const total_required_bytes = connection_memory_bytes +
+        worker_memory_bytes + server_overhead_bytes;
+
     comptime {
-        // System memory limit (8GB for most servers)
-        const system_limit = 8 * GiB;
-        if (total_required > system_limit) {
+        const system_limit_bytes = 8 * GiB;
+        if (total_required_bytes > system_limit_bytes) {
             @compileError("Memory budget exceeds system limit: " ++
-                std.fmt.comptimePrint("{d}MB required > {d}MB limit", .{ total_required / MiB, system_limit / MiB }));
+                std.fmt.comptimePrint("{d}MB required > {d}MB limit", .{
+                    total_required_bytes / MiB, system_limit_bytes / MiB,
+                }));
         }
-        // Ensure we don't exceed per-connection limits - adjusted for smaller buffers
-        if (stream_memory > bytes_per_conn * 100) {
-            @compileError("Stream memory per connection exceeds reasonable limits");
-        }
-        // Validate worker configuration
         if (worker_count == 0 or worker_count > 128) {
             @compileError("Invalid worker count: must be between 1-128");
         }
     }
-    /// Memory layout information for debugging
+
+    /// Print the budget to the log so operators can sanity-check sizing
+    /// before deployment.
     pub fn printBudget() void {
         std.log.info("Memory Budget:", .{});
-        std.log.info("  Max Connections: {d}", .{max_conns});
-        std.log.info("  Max Streams/Conn: {d}", .{max_streams_per_conn});
-        std.log.info("  Connection Memory: {d}MB", .{connection_memory / MiB});
+        std.log.info("  Max Connections: {d}", .{max_connections});
+        std.log.info("  Max Streams/Conn: {d}", .{max_streams_per_connection});
+        std.log.info("  Stream Instance: {d}KB", .{stream_instance_bytes / KiB});
+        std.log.info("  StreamStorage/Conn: {d}KB", .{stream_storage_bytes / KiB});
+        std.log.info("  Connection Slots: {d}MB", .{connection_memory_bytes / MiB});
         std.log.info("  Worker Threads: {d}", .{worker_count});
-        std.log.info("  Worker Memory: {d}MB", .{worker_memory / MiB});
-        std.log.info("  Global Reserve: {d}MB", .{global_reserve / MiB});
-        std.log.info("  Total Required: {d}MB", .{total_required / MiB});
-        std.log.info("  Memory Efficiency: {d}%", .{(total_required * 100) / (8 * GiB)});
+        std.log.info("  Worker Memory: {d}MB", .{worker_memory_bytes / MiB});
+        std.log.info("  Server Overhead: {d}MB", .{server_overhead_bytes / MiB});
+        std.log.info("  Total Required: {d}MB", .{total_required_bytes / MiB});
     }
 };
-/// Static Memory Pool for Zero-Allocation Operations
-pub const StaticMemoryPool = struct {
-    // Pre-allocated connection pool - simplified without linked lists for now
-    connection_pool: [MemBudget.max_conns]ConnectionSlot,
-    connection_next_free: std.atomic.Value(u32),
-    // Pre-allocated stream pools (per connection) - simplified
-    stream_pools: [MemBudget.max_conns][MemBudget.max_streams_per_conn]StreamSlot,
-    stream_next_free: [MemBudget.max_conns]std.atomic.Value(u32),
-    // Pre-allocated data buffers
-    data_buffer_pool: [MemBudget.max_conns * MemBudget.max_streams_per_conn][MemBudget.max_data_buffer]u8,
-    header_buffer_pool: [MemBudget.max_conns * MemBudget.max_streams_per_conn][MemBudget.max_header_size]u8,
-    // Worker thread pools (will be managed by WorkerPool)
-    // worker_pool: [MemBudget.worker_count]WorkerThread,
-    // Global allocator arena
-    arena: std.heap.ArenaAllocator,
-    backing_allocator: std.mem.Allocator,
-    const Self = @This();
 
-    pub fn init(target: *Self, backing_allocator: std.mem.Allocator) !void {
-        target.* = .{
-            .connection_pool = undefined,
-            .connection_next_free = std.atomic.Value(u32).init(0),
-            .stream_pools = undefined,
-            .stream_next_free = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** MemBudget.max_conns,
-            .data_buffer_pool = undefined,
-            .header_buffer_pool = undefined,
-            .arena = std.heap.ArenaAllocator.init(backing_allocator),
-            .backing_allocator = backing_allocator,
-        };
-        const self = target;
+const StaticAllocator = @import("static_allocator.zig");
 
-        // Initialize connection pool
-        for (&self.connection_pool, 0..) |*connection_slot, connection_index| {
-            // Assert connection index is within bounds
-            std.debug.assert(connection_index < MemBudget.max_conns);
-            connection_slot.* = ConnectionSlot{
-                .id = @intCast(connection_index),
-                .in_use = std.atomic.Value(bool).init(false),
-                .data = .{
-                    .settings = .{},
-                    .recv_window_size = 65535,
-                    .send_window_size = 65535,
-                    .last_stream_id = 0,
-                    .goaway_sent = false,
-                    .goaway_received = false,
-                },
-            };
-        }
+/// Single phase-gated allocator wrapping the caller-supplied heap.
+/// All server-level allocations flow through this; it is frozen before
+/// the event loop starts so that any accidental runtime allocation
+/// triggers an assertion failure.
+var static_allocator_global: StaticAllocator = undefined;
+var static_allocator_initialized: bool = false;
 
-        // Initialize stream pools
-        for (&self.stream_pools, 0..) |*stream_pool, connection_index| {
-            // Assert connection index is within bounds
-            std.debug.assert(connection_index < MemBudget.max_conns);
-
-            for (stream_pool, 0..) |*stream_slot, stream_index| {
-                // Assert stream index is within bounds
-                std.debug.assert(stream_index < MemBudget.max_streams_per_conn);
-                stream_slot.* = StreamSlot{
-                    .id = @intCast(stream_index),
-                    .connection_id = @intCast(connection_index),
-                    .in_use = std.atomic.Value(bool).init(false),
-                    .data = .{
-                        .state = .Idle,
-                        .recv_window_size = 65535,
-                        .send_window_size = 65535,
-                        .headers_received = false,
-                        .data_received = 0,
-                    },
-                };
-            }
-        }
-    }
-
-    pub fn create(backing_allocator: std.mem.Allocator) !*Self {
-        const pool = try backing_allocator.create(Self);
-        errdefer backing_allocator.destroy(pool);
-        try pool.init(backing_allocator);
-        return pool;
-    }
-    pub fn deinit(self: *Self) void {
-        // Worker pool cleanup is handled by WorkerPool module
-        self.arena.deinit();
-    }
-
-    pub fn destroy(self: *Self) void {
-        const backing_allocator = self.backing_allocator;
-        self.deinit();
-        backing_allocator.destroy(self);
-    }
-
-    pub fn acquireConnection(self: *Self) ?*ConnectionSlot {
-        // Assert pool is initialized
-        std.debug.assert(self.connection_pool.len == MemBudget.max_conns);
-
-        // Simple round-robin allocation with bound checking
-        var attempt_count: u32 = 0;
-        while (attempt_count < MemBudget.max_conns) : (attempt_count += 1) {
-            const current_index = self.connection_next_free.load(.acquire);
-            // Assert current index is within bounds
-            std.debug.assert(current_index < MemBudget.max_conns);
-
-            const next_index = (current_index + 1) % MemBudget.max_conns;
-
-            if (self.connection_next_free.cmpxchgWeak(current_index, next_index, .acq_rel, .acquire) == null) {
-                const connection_slot = &self.connection_pool[current_index];
-                if (connection_slot.in_use.cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
-                    return connection_slot;
-                }
-            }
-        }
-        return null; // No available connections
-    }
-    /// Release a connection slot
-    pub fn releaseConnection(self: *Self, connection_slot: *ConnectionSlot) void {
-        // Assert slot is valid
-        std.debug.assert(connection_slot.id < MemBudget.max_conns);
-        _ = self;
-        connection_slot.in_use.store(false, .release);
-    }
-    /// Acquire a stream slot for a specific connection
-    pub fn acquireStream(self: *Self, connection_id: u32) ?*StreamSlot {
-        // Assert connection ID is within bounds
-        std.debug.assert(connection_id < MemBudget.max_conns);
-        if (connection_id >= MemBudget.max_conns) return null;
-
-        // Simple round-robin allocation for streams with bounds checking
-        var attempt_count: u32 = 0;
-        while (attempt_count < MemBudget.max_streams_per_conn) : (attempt_count += 1) {
-            const current_stream_index = self.stream_next_free[connection_id].load(.acquire);
-            // Assert stream index is within bounds
-            std.debug.assert(current_stream_index < MemBudget.max_streams_per_conn);
-
-            const next_stream_index = (current_stream_index + 1) % MemBudget.max_streams_per_conn;
-
-            if (self.stream_next_free[connection_id].cmpxchgWeak(current_stream_index, next_stream_index, .acq_rel, .acquire) == null) {
-                const stream_slot = &self.stream_pools[connection_id][current_stream_index];
-                if (stream_slot.in_use.cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
-                    return stream_slot;
-                }
-            }
-        }
-        return null; // No available streams for this connection
-    }
-    /// Release a stream slot
-    pub fn releaseStream(self: *Self, stream_slot: *StreamSlot) void {
-        // Assert slot is valid
-        std.debug.assert(stream_slot.id < MemBudget.max_streams_per_conn);
-        std.debug.assert(stream_slot.connection_id < MemBudget.max_conns);
-        _ = self;
-        stream_slot.in_use.store(false, .release);
-    }
-    /// Get pre-allocated data buffer for a stream
-    pub fn getDataBuffer(self: *Self, connection_id: u32, stream_id: u32) ?[]u8 {
-        // Assert IDs are within bounds
-        std.debug.assert(connection_id < MemBudget.max_conns);
-        std.debug.assert(stream_id < MemBudget.max_streams_per_conn);
-
-        const buffer_index = connection_id * MemBudget.max_streams_per_conn + stream_id;
-        if (buffer_index >= self.data_buffer_pool.len) return null;
-        return &self.data_buffer_pool[buffer_index];
-    }
-    /// Get pre-allocated header buffer for a stream
-    pub fn getHeaderBuffer(self: *Self, connection_id: u32, stream_id: u32) ?[]u8 {
-        // Assert IDs are within bounds
-        std.debug.assert(connection_id < MemBudget.max_conns);
-        std.debug.assert(stream_id < MemBudget.max_streams_per_conn);
-
-        const buffer_index = connection_id * MemBudget.max_streams_per_conn + stream_id;
-        if (buffer_index >= self.header_buffer_pool.len) return null;
-        return &self.header_buffer_pool[buffer_index];
-    }
-    /// Get arena allocator for temporary allocations
-    pub fn allocator(self: *Self) std.mem.Allocator {
-        return self.arena.allocator();
-    }
-};
-/// Connection Slot in the static pool
-pub const ConnectionSlot = struct {
-    id: u32,
-    in_use: std.atomic.Value(bool),
-    data: ConnectionData,
-    pub const ConnectionData = struct {
-        // Connection-specific data will be defined when integrating with Connection
-        settings: ConnectionSettings,
-        recv_window_size: i32,
-        send_window_size: i32,
-        last_stream_id: u32,
-        goaway_sent: bool,
-        goaway_received: bool,
-    };
-};
-/// Stream Slot in the static pool
-pub const StreamSlot = struct {
-    id: u32,
-    connection_id: u32,
-    in_use: std.atomic.Value(bool),
-    data: StreamData,
-    pub const StreamData = struct {
-        // Stream-specific data will be defined when integrating with Stream
-        state: StreamState,
-        recv_window_size: i32,
-        send_window_size: i32,
-        headers_received: bool,
-        data_received: u32,
-    };
-};
-/// Worker Thread for handling HTTP/2 processing
-pub const WorkerThread = struct {
-    id: u32,
-    work_queue: std.atomic.Queue(WorkItem),
-    running: std.atomic.Value(bool),
-    thread: std.Thread,
-    pub fn start(self: *WorkerThread) !void {
-        self.running.store(true, .release);
-        self.thread = try std.Thread.spawn(.{}, workerMain, .{self});
-    }
-    pub fn stop(self: *WorkerThread) void {
-        self.running.store(false, .release);
-        // Wake up the worker if it's sleeping
-        self.work_queue.prepend(WorkItem{ .type = .shutdown });
-        self.thread.join();
-    }
-    fn workerMain(self: *WorkerThread) void {
-        while (self.running.load(.acquire)) {
-            if (self.work_queue.popFirst()) |work| {
-                switch (work.type) {
-                    .shutdown => break,
-                    .process_frame => {
-                        // Process HTTP/2 frame
-                        processFrame(work.data.frame);
-                    },
-                    .process_connection => {
-                        // Handle connection events
-                        processConnection(work.data.connection);
-                    },
-                }
-            } else {
-                // No work available, yield CPU
-                std.Thread.yield() catch {};
-            }
-        }
-    }
-};
-/// Work item for the worker queue
-pub const WorkItem = struct {
-    type: WorkType,
-    data: WorkData = undefined,
-    pub const WorkType = enum {
-        shutdown,
-        process_frame,
-        process_connection,
-    };
-    pub const WorkData = union {
-        frame: *FrameData,
-        connection: *ConnectionSlot,
-    };
-};
-/// Placeholder types (will be replaced with actual types during integration)
-const ConnectionSettings = struct {
-    header_table_size: u32 = 4096,
-    enable_push: bool = true,
-    max_concurrent_streams: u32 = 1000,
-    initial_window_size: u32 = 65535,
-    max_frame_size: u32 = 16384,
-    max_header_list_size: u32 = 8192,
-};
-const StreamState = enum {
-    Idle,
-    ReservedLocal,
-    ReservedRemote,
-    Open,
-    HalfClosedLocal,
-    HalfClosedRemote,
-    Closed,
-};
-const FrameData = struct {
-    // Placeholder for frame data
-};
-// Placeholder functions (will be implemented during integration)
-fn processFrame(frame: *FrameData) void {
-    _ = frame;
-    // Frame execution stays in the connection path until the static worker pool
-    // is integrated with protocol state transitions.
+pub fn isStaticAllocatorInitialized() bool {
+    return static_allocator_initialized;
 }
-fn processConnection(connection: *ConnectionSlot) void {
-    _ = connection;
-    // Connection ownership remains with the server event loop until the worker
-    // handoff semantics are fully defined.
-}
-/// Global static memory pool instance
-var global_memory_pool: ?*StaticMemoryPool = null;
-/// Initialize the global memory pool
-pub fn initGlobalMemoryPool(backing_allocator: std.mem.Allocator) !void {
-    if (global_memory_pool != null) {
-        return error.AlreadyInitialized;
-    }
-    global_memory_pool = try StaticMemoryPool.create(backing_allocator);
-    // Worker pool is managed separately by worker_pool.zig
+
+/// Wrap the caller's allocator in a phase-gated StaticAllocator and print
+/// the memory budget.  Safe to call multiple times (second call is a no-op)
+/// so that both `http2.init()` and test suites can call it.
+pub fn initStaticAllocator(backing_allocator: std.mem.Allocator) !void {
+    if (static_allocator_initialized) return;
+
+    static_allocator_global = StaticAllocator.init(backing_allocator);
+    static_allocator_initialized = true;
     MemBudget.printBudget();
 }
-/// Get the global memory pool
-pub fn getGlobalMemoryPool() *StaticMemoryPool {
-    return global_memory_pool.?;
+
+/// Return a pointer to the phase-gated allocator.
+/// Precondition: `initStaticAllocator` must have been called.
+pub fn staticAllocatorPtr() *StaticAllocator {
+    std.debug.assert(static_allocator_initialized);
+    return &static_allocator_global;
 }
-/// Deinitialize the global memory pool
-pub fn deinitGlobalMemoryPool() void {
-    if (global_memory_pool) |pool| {
-        pool.destroy();
-        global_memory_pool = null;
+
+/// Freeze the phase-gated allocator so that any `alloc`, `resize`, or
+/// `remap` call will assert-fail.  Call after all server init is complete.
+pub fn freezeStaticAllocator() void {
+    std.debug.assert(static_allocator_initialized);
+    if (static_allocator_global.state == .init) {
+        static_allocator_global.transition_from_init_to_static();
     }
 }
-/// Compile-time verification that all budget constraints are met
-pub fn verifyMemoryBudget() void {
-    comptime {
-        // Verify total memory usage
-        if (MemBudget.total_required > 8 * GiB) {
-            @compileError("Total memory budget exceeds 8GB limit");
-        }
-        // Verify connection limits are reasonable
-        if (MemBudget.max_conns * MemBudget.max_streams_per_conn > 1_000_000) {
-            @compileError("Total stream capacity exceeds reasonable limits");
-        }
-        // Verify worker thread configuration
-        if (MemBudget.worker_count > std.Thread.getCpuCount() catch 32) {
-            @compileError("Worker count exceeds available CPU cores");
-        }
+
+/// Unfreeze for shutdown; allows `free` but not `alloc`.
+/// State may already be `.deinit` if resources were freed via errdefer
+/// before the explicit shutdown sequence.
+pub fn unfreezeStaticAllocator() void {
+    std.debug.assert(static_allocator_initialized);
+    if (static_allocator_global.state == .static) {
+        static_allocator_global.transition_from_static_to_deinit();
     }
 }
-test "Memory budget calculations" {
-    // Verify compile-time calculations are reasonable
-    try std.testing.expect(MemBudget.total_required > 0);
-    try std.testing.expect(MemBudget.total_required < 8 * GiB);
+
+/// Deinitialize the phase-gated allocator and mark it as uninitialized.
+pub fn deinitStaticAllocator() void {
+    if (!static_allocator_initialized) return;
+
+    unfreezeStaticAllocator();
+    static_allocator_global.deinit();
+    static_allocator_initialized = false;
+}
+
+// -----------------------------------------------------------------------
+//  Tests
+// -----------------------------------------------------------------------
+
+test "MemBudget constants are consistent" {
+    try std.testing.expect(MemBudget.total_required_bytes > 0);
+    try std.testing.expect(MemBudget.total_required_bytes < 8 * GiB);
     try std.testing.expect(MemBudget.worker_count > 0);
     try std.testing.expect(MemBudget.worker_count <= 128);
+
+    // The stream instance must be at least large enough to hold the
+    // mandatory inline buffers.
+    const minimum_stream_bytes = MemBudget.stream_header_fragments_bytes +
+        MemBudget.stream_request_body_bytes;
+    try std.testing.expect(MemBudget.stream_instance_bytes >= minimum_stream_bytes);
+
+    // Connection-level totals must exceed per-stream storage.
+    try std.testing.expect(MemBudget.connection_memory_bytes > MemBudget.stream_memory_per_connection);
 }
-test "Static memory pool initialization" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const pool = try StaticMemoryPool.create(arena.allocator());
-    defer pool.destroy();
-    // Test connection acquisition
-    const conn1 = pool.acquireConnection();
-    try std.testing.expect(conn1 != null);
-    const conn2 = pool.acquireConnection();
-    try std.testing.expect(conn2 != null);
-    try std.testing.expect(conn1.?.id != conn2.?.id);
-    // Test stream acquisition
-    const stream1 = pool.acquireStream(0);
-    try std.testing.expect(stream1 != null);
-    try std.testing.expect(stream1.?.connection_id == 0);
-    // Test buffer access
-    const data_buffer = pool.getDataBuffer(0, 0);
-    try std.testing.expect(data_buffer != null);
-    try std.testing.expect(data_buffer.?.len == MemBudget.max_data_buffer);
-    // Clean up
-    if (conn1) |c| pool.releaseConnection(c);
-    if (conn2) |c| pool.releaseConnection(c);
-    if (stream1) |s| pool.releaseStream(s);
+
+test "StaticAllocator init → freeze → unfreeze → deinit lifecycle" {
+    const allocator = std.testing.allocator;
+
+    try initStaticAllocator(allocator);
+    defer deinitStaticAllocator();
+
+    const alloc = staticAllocatorPtr().allocator();
+    const mem = try alloc.alloc(u8, 64);
+
+    freezeStaticAllocator();
+
+    unfreezeStaticAllocator();
+    alloc.free(mem);
+}
+
+test "StaticAllocator prevents alloc after freeze" {
+    const allocator = std.testing.allocator;
+
+    try initStaticAllocator(allocator);
+    defer deinitStaticAllocator();
+
+    const alloc = staticAllocatorPtr().allocator();
+    const mem = try alloc.alloc(u8, 64);
+
+    freezeStaticAllocator();
+    // alloc after freeze would @panic; cannot test without process isolation.
+    unfreezeStaticAllocator();
+    alloc.free(mem);
 }

@@ -1,7 +1,7 @@
 //! Deterministic HTTP/2 cluster simulator.
 //!
 //! This is the bridge between the protocol-aware single-connection simulator
-//! and a TigerBeetle-style cluster harness: peers own real `Connection` state,
+//! and cluster harness: peers own real `Connection` state,
 //! frames move through a bounded packet simulator, ticks are fixed, and the
 //! checker is protocol-aware enough to catch stream/accounting violations.
 
@@ -19,6 +19,7 @@ const hpack_mod = @import("hpack.zig");
 const memory_budget = @import("memory_budget.zig");
 const packet_sim = @import("testing/packet_simulator.zig");
 const prng_mod = @import("testing/prng.zig");
+const sim_common = @import("sim_common.zig");
 
 const Connection = connection_mod.Connection;
 const Frame = frame_mod.Frame;
@@ -85,20 +86,7 @@ pub const Metrics = struct {
     }
 };
 
-const SimWriter = struct {
-    interface: std.Io.Writer,
-    storage: [writer_capacity]u8 = undefined,
-
-    fn init() SimWriter {
-        var self: SimWriter = undefined;
-        self.interface = .fixed(&self.storage);
-        return self;
-    }
-
-    fn written(self: *const SimWriter) []const u8 {
-        return self.interface.buffered();
-    }
-};
+const SimWriter = sim_common.SimWriter(writer_capacity);
 
 pub const Http2Peer = struct {
     role: Role,
@@ -347,8 +335,8 @@ const ClusterChecker = struct {
         var completed: u64 = 0;
         for (peers, 0..) |*peer, peer_index| {
             if (!peer.has_connection) continue;
-            assert(peer.connection.stream_slots_in_use_count <= memory_budget.MemBudget.max_streams_per_conn);
-            assert(peer.connection.pending_stream_count <= memory_budget.MemBudget.max_streams_per_conn);
+            assert(peer.connection.stream_slots_in_use_count <= memory_budget.MemBudget.max_streams_per_connection);
+            assert(peer.connection.pending_stream_count <= memory_budget.MemBudget.max_streams_per_connection);
             assert(peer.connection.recv_window_size <= std.math.maxInt(i32));
             assert(peer.connection.send_window_size <= std.math.maxInt(i32));
             assert(peer.connection.hpack_decoder_table.current_size <= peer.connection.hpack_decoder_table.max_size);
@@ -639,45 +627,11 @@ pub const Http2Cluster = struct {
     }
 };
 
-fn frameFromPacket(packet: *const Packet) Frame {
-    return .{
-        .header = .{
-            .length = packet.payload_len,
-            .frame_type = coreFrameType(packet.frame_type),
-            .flags = FrameFlags.init(packet.flags),
-            .reserved = false,
-            .stream_id = packet.stream_id,
-        },
-        .payload = packet.payload_slice(),
-    };
-}
-
-fn packetFrameType(frame_type: FrameType) packet_sim.FrameType {
-    return @enumFromInt(@intFromEnum(frame_type));
-}
-
-fn coreFrameType(frame_type: packet_sim.FrameType) FrameType {
-    return @enumFromInt(@intFromEnum(frame_type));
-}
-
-fn digestMix(value: u64, input: u64) u64 {
-    return (value ^ input) *% 0x100000001b3;
-}
-
-fn isExpectedError(err: anyerror) bool {
-    return switch (err) {
-        error.ProtocolError,
-        error.StreamClosed,
-        error.FrameSizeError,
-        error.FlowControlError,
-        error.InvalidStreamState,
-        error.IdleStreamError,
-        error.CompressionError,
-        error.MaxConcurrentStreamsExceeded,
-        => true,
-        else => false,
-    };
-}
+const frameFromPacket = sim_common.frameFromPacket;
+const packetFrameType = sim_common.packetFrameType;
+const coreFrameType = sim_common.coreFrameType;
+const digestMix = sim_common.digestMix;
+const isExpectedError = sim_common.isExpectedError;
 
 fn encodeRequestHeaders(
     allocator: std.mem.Allocator,

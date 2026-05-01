@@ -34,6 +34,7 @@ pub const Priority = @import("http_priority.zig").Priority;
 // Memory Management
 pub const memory_budget = @import("memory_budget.zig");
 pub const budget_assertions = @import("budget_assertions.zig");
+pub const MemBudget = @import("memory_budget.zig").MemBudget;
 
 // Error Types
 pub const error_types = @import("error.zig");
@@ -151,14 +152,28 @@ pub const ServerStats = struct {
     requests_processed: u64 = 0,
 };
 
-/// Initialize the HTTP/2 system
+/// Initialize the HTTP/2 system.
+/// Wraps the caller's allocator in a phase-gated StaticAllocator so that
+/// all heap work can be frozen before the event loop starts.
 pub fn init(allocator: std.mem.Allocator) !void {
-    try memory_budget.initGlobalMemoryPool(allocator);
+    try memory_budget.initStaticAllocator(allocator);
 }
 
-/// Deinitialize the HTTP/2 system
+/// Return the phase-gated allocator.  All server init should use this so that
+/// `freeze()` can prevent accidental runtime allocations.
+pub fn staticAllocator() std.mem.Allocator {
+    return memory_budget.staticAllocatorPtr().allocator();
+}
+
+/// Freeze allocations.  Any alloc/resize after this will assert-fail.
+pub fn freeze() void {
+    memory_budget.freezeStaticAllocator();
+}
+
+/// Deinitialize the HTTP/2 system.  Unfreezes the allocator and frees all
+/// tracked memory.
 pub fn deinit() void {
-    memory_budget.deinitGlobalMemoryPool();
+    memory_budget.deinitStaticAllocator();
 }
 
 // Compile-time validation and assertions for design integrity

@@ -21,6 +21,7 @@ const hpack_mod = @import("hpack.zig");
 const memory_budget = @import("memory_budget.zig");
 const packet_sim = @import("testing/packet_simulator.zig");
 const prng_mod = @import("testing/prng.zig");
+const sim_common = @import("sim_common.zig");
 
 const Connection = connection_mod.Connection;
 const Frame = frame_mod.Frame;
@@ -112,9 +113,7 @@ const TraceEvent = struct {
     stream_id: u32,
 };
 
-fn digestMix(value: u64, input: u64) u64 {
-    return (value ^ input) *% 0x100000001b3;
-}
+const digestMix = sim_common.digestMix;
 
 pub const Metrics = struct {
     seed: u64,
@@ -264,20 +263,7 @@ fn optionsSwarm(seed: u64, mode: Mode) Config {
     };
 }
 
-const SimWriter = struct {
-    interface: std.Io.Writer,
-    storage: [writer_capacity]u8 = undefined,
-
-    fn init() SimWriter {
-        var self: SimWriter = undefined;
-        self.interface = .fixed(&self.storage);
-        return self;
-    }
-
-    fn written(self: *const SimWriter) []const u8 {
-        return self.interface.buffered();
-    }
-};
+const SimWriter = sim_common.SimWriter(writer_capacity);
 
 const Model = struct {
     next_stream_id: u32 = 1,
@@ -739,8 +725,8 @@ const Simulator = struct {
     }
 
     fn checkInvariants(self: *Simulator) !void {
-        assert(self.connection.stream_slots_in_use_count <= memory_budget.MemBudget.max_streams_per_conn);
-        assert(self.connection.pending_stream_count <= memory_budget.MemBudget.max_streams_per_conn);
+        assert(self.connection.stream_slots_in_use_count <= memory_budget.MemBudget.max_streams_per_connection);
+        assert(self.connection.pending_stream_count <= memory_budget.MemBudget.max_streams_per_connection);
         assert(self.connection.completed_responses_pending <= self.model.requests_sent);
         self.checker.check(&self.connection);
 
@@ -790,41 +776,10 @@ fn frame(frame_type: FrameType, flags: u8, stream_id: u32, payload: []const u8) 
     };
 }
 
-fn frameFromPacket(packet: *const Packet) Frame {
-    return .{
-        .header = .{
-            .length = packet.payload_len,
-            .frame_type = coreFrameType(packet.frame_type),
-            .flags = FrameFlags.init(packet.flags),
-            .reserved = false,
-            .stream_id = packet.stream_id,
-        },
-        .payload = packet.payload_slice(),
-    };
-}
-
-fn packetFrameType(frame_type: FrameType) packet_sim.FrameType {
-    return @enumFromInt(@intFromEnum(frame_type));
-}
-
-fn coreFrameType(frame_type: packet_sim.FrameType) FrameType {
-    return @enumFromInt(@intFromEnum(frame_type));
-}
-
-fn isExpectedError(err: anyerror) bool {
-    return switch (err) {
-        error.ProtocolError,
-        error.StreamClosed,
-        error.FrameSizeError,
-        error.FlowControlError,
-        error.InvalidStreamState,
-        error.IdleStreamError,
-        error.CompressionError,
-        error.MaxConcurrentStreamsExceeded,
-        => true,
-        else => false,
-    };
-}
+const frameFromPacket = sim_common.frameFromPacket;
+const packetFrameType = sim_common.packetFrameType;
+const coreFrameType = sim_common.coreFrameType;
+const isExpectedError = sim_common.isExpectedError;
 
 fn encodeRequestHeaders(
     allocator: std.mem.Allocator,

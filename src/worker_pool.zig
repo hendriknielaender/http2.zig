@@ -63,11 +63,9 @@ pub const WorkerPool = struct {
     // Statistics (atomic for thread-safe access)
     total_work_processed: std.atomic.Value(u64),
     work_queue_depth: std.atomic.Value(u32),
-    // Memory pool reference
-    memory_pool: *memory_budget.StaticMemoryPool,
     allocator: std.mem.Allocator,
     const Self = @This();
-    pub fn init(allocator: std.mem.Allocator, memory_pool: *memory_budget.StaticMemoryPool) !Self {
+    pub fn init(allocator: std.mem.Allocator) !Self {
         const self = Self{
             .worker_threads = [_]?std.Thread{null} ** memory_budget.MemBudget.worker_count,
             .work_queue = .{},
@@ -77,7 +75,6 @@ pub const WorkerPool = struct {
             .active_workers = std.atomic.Value(u32).init(0),
             .total_work_processed = std.atomic.Value(u64).init(0),
             .work_queue_depth = std.atomic.Value(u32).init(0),
-            .memory_pool = memory_pool,
             .allocator = allocator,
         };
         return self;
@@ -461,24 +458,17 @@ fn sleepFor(duration_ns: u64) void {
 test "Worker pool initialization and basic operations" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const memory_pool = try memory_budget.StaticMemoryPool.create(arena.allocator());
-    defer memory_pool.destroy();
-    var worker_pool = try WorkerPool.init(arena.allocator(), memory_pool);
+    var worker_pool = try WorkerPool.init(arena.allocator());
     defer worker_pool.deinit();
-    // Test initialization
     const initial_stats = worker_pool.getStats();
     try std.testing.expect(initial_stats.worker_count == memory_budget.MemBudget.worker_count);
     try std.testing.expect(initial_stats.active_workers == 0);
     try std.testing.expect(!initial_stats.running);
-    // Just test initialization without starting workers for now.
-    // This keeps the test deterministic while the queue code evolves.
 }
 test "worker distribution initialization" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const memory_pool = try memory_budget.StaticMemoryPool.create(arena.allocator());
-    defer memory_pool.destroy();
-    var worker_pool = try WorkerPool.init(arena.allocator(), memory_pool);
+    var worker_pool = try WorkerPool.init(arena.allocator());
     defer worker_pool.deinit();
     const stats = worker_pool.getStats();
     try std.testing.expect(stats.worker_count == memory_budget.MemBudget.worker_count);

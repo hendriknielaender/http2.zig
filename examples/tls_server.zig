@@ -128,17 +128,29 @@ pub const Server = struct {
         var acceptor = http2_boring.Acceptor.initWithBuilder(&builder);
         errdefer acceptor.deinit();
 
-        const connection_slots = try allocator.alloc(
+        // Connection slots use the phase-gated allocator so they cannot grow
+        // at runtime.  Falls back to the raw allocator in tests / when
+        // http2.init() hasn't been called.
+        const slot_allocator = if (@import("http2").memory_budget.isStaticAllocatorInitialized())
+            http2.staticAllocator()
+        else
+            allocator;
+
+        const connection_slots = try slot_allocator.alloc(
             ConnectionSlot,
             @as(usize, @intCast(config.max_connections)),
         );
-        errdefer allocator.free(connection_slots);
+        errdefer slot_allocator.free(connection_slots);
 
         initConnectionSlots(connection_slots);
 
+        // Eagerly start the I/O backend so all allocations happen during init.
+        var backend = Backend.init(allocator);
+        try backend.start();
+
         return .{
             .allocator = allocator,
-            .backend = Backend.init(allocator),
+            .backend = backend,
             .config = config,
             .acceptor = acceptor,
             .connection_slots = connection_slots,
@@ -152,14 +164,15 @@ pub const Server = struct {
 
     pub fn deinit(self: *Self) void {
         self.backend.deinit();
-        self.allocator.free(self.connection_slots);
+        const slot_allocator = if (@import("http2").memory_budget.isStaticAllocatorInitialized())
+            http2.staticAllocator()
+        else
+            self.allocator;
+        slot_allocator.free(self.connection_slots);
         self.acceptor.deinit();
     }
 
     pub fn run(self: *Self) !void {
-        try self.backend.start();
-        defer self.backend.deinit();
-
         const io = self.backend.io();
 
         var listener = try self.config.address.listen(io, .{
