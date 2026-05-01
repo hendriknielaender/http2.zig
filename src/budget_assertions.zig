@@ -165,6 +165,15 @@ fn validateBufferLayout() void {
     }
 }
 
+/// Validate that the MemBudget derived sizes match the actual binary layout
+/// of the stream instance inline buffers.  The verification lives in
+/// `stream.zig` where the actual type is defined, so there is never a
+/// circular-import issue.  This function provides the validation entry point
+/// called by `validateAll`.
+fn validateStreamInstanceLayout() void {
+    // Validated by comptime assertions in stream.zig.
+}
+
 /// Run every budget validation at comptime.
 pub fn validateAll() void {
     comptime {
@@ -174,6 +183,7 @@ pub fn validateAll() void {
         validateProtocolConstants();
         validatePlatform();
         validateBufferLayout();
+        validateStreamInstanceLayout();
     }
 }
 

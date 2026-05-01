@@ -352,10 +352,10 @@ const ClusterChecker = struct {
                 assert(stream.request_body_len <= stream.request_body_storage.len);
                 assert(stream.send_window_size <= std.math.maxInt(i32));
                 assert(stream.recv_window_size <= std.math.maxInt(i32));
-                if (stream.response) |response| {
-                    assert(stream.response_body_sent <= response.body.len);
+                if (stream.response_writer.response) |response| {
+                    assert(stream.response_writer.response_body_sent <= response.body.len);
                 } else {
-                    assert(stream.response_body_sent == 0);
+                    assert(stream.response_writer.response_body_sent == 0);
                 }
                 if (self.wasResetForPeer(stream.id, @intCast(peer_index))) {
                     assert(stream.state == .Closed);

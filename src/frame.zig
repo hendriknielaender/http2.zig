@@ -2,25 +2,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const http2 = @import("http2.zig");
 const max_frame_size_default = http2.max_frame_size_default;
-const MAX_IN_FLIGHT_FRAMES = 64; // Reasonable limit for concurrent frames
 threadlocal var frame_scratch: [max_frame_size_default]u8 = undefined;
-
-/// Frame metadata for arena tracking
-pub const FrameMeta = struct {
-    allocated_size: u32,
-    timestamp: u64,
-    frame_type: FrameType,
-    stream_id: u32,
-};
-
-/// Fixed buffer allocator for frames per connection
-pub const FrameArena = std.heap.FixedBufferAllocator;
-
-/// Initialize frame arena with compile-time size limits
-pub fn initFrameArena(buffer: []u8) FrameArena {
-    assert(buffer.len >= MAX_IN_FLIGHT_FRAMES * (max_frame_size_default + @sizeOf(FrameMeta)));
-    return std.heap.FixedBufferAllocator.init(buffer);
-}
 pub const FrameType = enum(u8) {
     DATA = 0x0,
     HEADERS = 0x1,

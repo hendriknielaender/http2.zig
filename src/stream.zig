@@ -11,6 +11,7 @@ const Priority = @import("http_priority.zig").Priority;
 const handler = @import("handler.zig");
 const memory_budget = @import("memory_budget.zig");
 const TestIo = @import("testing/fixed_io.zig").FixedIo;
+const ResponseWriter = @import("response.zig").ResponseWriter;
 
 const log = std.log.scoped(.stream);
 
@@ -175,11 +176,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             response_body_storage: [ResponseBodyStorageSize]u8,
             request_headers_complete: bool,
             request_complete: bool,
-            response: ?handler.Response,
-            response_prepared: bool,
-            response_header_block_len: usize,
-            response_headers_sent: bool,
-            response_body_sent: usize,
+            response_writer: ResponseWriter,
             cleaned_up: bool,
 
             // RFC 9218 extensible priority state.
@@ -222,11 +219,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     .response_body_storage = undefined,
                     .request_headers_complete = false,
                     .request_complete = false,
-                    .response = null,
-                    .response_prepared = false,
-                    .response_header_block_len = 0,
-                    .response_headers_sent = false,
-                    .response_body_sent = 0,
+                    .response_writer = undefined,
                     .cleaned_up = false,
                     .priority = .{},
                     .priority_update_received = false,
@@ -237,6 +230,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     .weight = 16,
                 };
                 self.headers = std.ArrayList(Hpack.HeaderField).initBuffer(&self.headers_storage);
+                self.response_writer = ResponseWriter.init(&self.header_block_fragments_buf);
             }
 
             // Optimized cleanup with static memory management
@@ -254,15 +248,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 self.header_block_fragments_len = 0;
                 self.headers_bytes_len = 0;
                 self.request_body_len = 0;
-                self.response_header_block_len = 0;
-                self.response_prepared = false;
-                self.response_headers_sent = false;
-                self.response_body_sent = 0;
 
-                if (self.response) |*response| {
-                    response.deinit();
-                }
-                self.response = null;
+                self.response_writer.deinit();
                 self.headers.clearRetainingCapacity();
                 self.request_method_bytes = null;
                 self.request_method = null;
@@ -1122,6 +1109,50 @@ fn isConnectionSpecificHeader(header_name: []const u8) bool {
 }
 
 pub const DefaultStream = Stream(16, 1000); // 64KB window, 1000 max streams
+
+comptime {
+    const Instance = DefaultStream.StreamInstance;
+    const Budget = memory_budget.MemBudget;
+    const fields = @typeInfo(Instance).@"struct".fields;
+    var found_header_fragments: bool = false;
+    var found_headers_storage: bool = false;
+    var found_request_body: bool = false;
+    var found_response_body: bool = false;
+    var found_headers_array: bool = false;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, "header_block_fragments_buf")) {
+            found_header_fragments = true;
+            if (@sizeOf(field.type) != Budget.stream_header_fragments_bytes) {
+                @compileError("stream_header_fragments_bytes budget mismatch");
+            }
+        } else if (std.mem.eql(u8, field.name, "headers_bytes_storage")) {
+            found_headers_storage = true;
+            if (@sizeOf(field.type) != Budget.stream_headers_storage_bytes) {
+                @compileError("stream_headers_storage_bytes budget mismatch");
+            }
+        } else if (std.mem.eql(u8, field.name, "request_body_storage")) {
+            found_request_body = true;
+            if (@sizeOf(field.type) != Budget.stream_request_body_bytes) {
+                @compileError("stream_request_body_bytes budget mismatch");
+            }
+        } else if (std.mem.eql(u8, field.name, "response_body_storage")) {
+            found_response_body = true;
+            if (@sizeOf(field.type) != Budget.stream_response_body_bytes) {
+                @compileError("stream_response_body_bytes budget mismatch");
+            }
+        } else if (std.mem.eql(u8, field.name, "headers_storage")) {
+            found_headers_array = true;
+            if (@sizeOf(field.type) != Budget.stream_headers_array_bytes) {
+                @compileError("stream_headers_array_bytes budget mismatch");
+            }
+        }
+    }
+    if (!found_header_fragments) @compileError("Missing field: header_block_fragments_buf");
+    if (!found_headers_storage) @compileError("Missing field: headers_bytes_storage");
+    if (!found_request_body) @compileError("Missing field: request_body_storage");
+    if (!found_response_body) @compileError("Missing field: response_body_storage");
+    if (!found_headers_array) @compileError("Missing field: headers_storage");
+}
 
 test "compile-time stream configuration" {
     // Test different configurations compile successfully
