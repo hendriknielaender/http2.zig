@@ -1,3 +1,10 @@
+//! HTTP/2 response encoding and frame writing.
+//!
+//! Encodes response status and headers into HPACK wire format, writes
+//! HEADERS and DATA frames to the transport, and manages stream state
+//! transitions for response completion.  All functions operate on the
+//! stream and connection that own the relevant buffers and I/O handles.
+
 const std = @import("std");
 const assert = std.debug.assert;
 
@@ -8,15 +15,10 @@ const Hpack = @import("hpack.zig").Hpack;
 const handler = @import("handler.zig");
 const transitionState = @import("stream.zig").transitionState;
 const StreamState = @import("stream.zig").StreamState;
+const DefaultStream = @import("stream.zig").DefaultStream;
+const Connection = @import("connection.zig").Connection;
 
-const default_response_body =
-    \\<!DOCTYPE html>
-    \\<html>
-    \\<body>
-    \\<h1>Hello, World!</h1>
-    \\</body>
-    \\</html>
-;
+const StreamInstanceType = DefaultStream.StreamInstance;
 
 const log = std.log.scoped(.response);
 
@@ -27,26 +29,26 @@ pub fn connectionResponseWindowAvailable(window_size: i32) usize {
     return 0;
 }
 
-pub fn shouldSuppressResponseBody(stream: anytype) bool {
+pub fn shouldSuppressResponseBody(stream: *const StreamInstanceType) bool {
     return stream.request_method == .head;
 }
 
-pub fn responseHeadersBlock(stream: anytype) []const u8 {
+pub fn responseHeadersBlock(stream: *const StreamInstanceType) []const u8 {
     return stream.header_block_fragments_buf[0..stream.response_header_block_len];
 }
 
-pub fn responseBody(stream: anytype) []const u8 {
+pub fn responseBody(stream: *const StreamInstanceType) []const u8 {
     return stream.response.?.body;
 }
 
-pub fn shouldEndStreamWithHeaders(stream: anytype) bool {
+pub fn shouldEndStreamWithHeaders(stream: *const StreamInstanceType) bool {
     if (shouldSuppressResponseBody(stream)) {
         return true;
     }
     return responseBody(stream).len == 0;
 }
 
-pub fn streamResponseComplete(stream: anytype) bool {
+pub fn streamResponseComplete(stream: *const StreamInstanceType) bool {
     if (!stream.response_prepared) {
         return false;
     }
@@ -65,7 +67,7 @@ pub fn streamResponseComplete(stream: anytype) bool {
 /// stream's header-block-fragments buffer so `sendResponseHeaders` can write
 /// it to the transport without a copy.
 pub fn encodeResponseHeaders(
-    stream: anytype,
+    stream: *StreamInstanceType,
     response: *const handler.Response,
     encoder_table: *Hpack.DynamicTable,
     allocator: std.mem.Allocator,
@@ -97,11 +99,11 @@ pub fn encodeResponseHeaders(
 }
 
 /// Write the HEADERS frame for a stream whose response has already been
-/// encoded.  If the response carries no body (empty body or HEAD method),
-/// END_STREAM is set on the frame and the stream transitions to closed.
+/// encoded.  If the response carries no body, END_STREAM is set and the
+/// stream transitions to closed.
 pub fn sendResponseHeaders(
-    stream: anytype,
-    conn: anytype,
+    stream: *StreamInstanceType,
+    conn: *Connection,
 ) !void {
     const headers_block = responseHeadersBlock(stream);
     const end_stream = shouldEndStreamWithHeaders(stream);
@@ -137,11 +139,10 @@ pub fn sendResponseHeaders(
 }
 
 /// Write at most one DATA frame for the stream, bounded by flow-control
-/// windows and the connection's max frame size.  Returns immediately when
-/// the body is fully sent or the window is blocked.
+/// windows and the connection's max frame size.
 pub fn sendResponseBody(
-    stream: anytype,
-    conn: anytype,
+    stream: *StreamInstanceType,
+    conn: *Connection,
 ) !void {
     if (!stream.response_headers_sent) {
         return;
@@ -180,59 +181,183 @@ pub fn sendResponseBody(
     }
 }
 
+// -----------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------
+
 test "shouldEndStreamWithHeaders true when body is empty" {
-    const Stream = struct {
-        response: ?handler.Response = null,
-        response_body_sent: usize = 0,
-        response_prepared: bool = true,
-        response_headers_sent: bool = false,
-        state: StreamState = .Open,
-        request_method: handler.Method = .get,
+    var stream = DefaultStream.StreamInstance{
+        .id = 1,
+        .state = .Open,
+        .conn = undefined,
+        .recv_window_size = 65535,
+        .send_window_size = 65535,
+        .initial_window_size = 65535,
+        .header_block_fragments_buf = undefined,
+        .headers_bytes_storage = undefined,
+        .header_block_fragments_len = 0,
+        .headers_bytes_len = 0,
+        .expecting_continuation = false,
+        .headers_storage = undefined,
+        .headers = .empty,
+        .content_length = null,
+        .request_method_bytes = null,
+        .request_method = .get,
+        .request_path = null,
+        .total_data_received = 0,
+        .request_body_storage = undefined,
+        .request_body_len = 0,
+        .response_body_storage = undefined,
+        .request_headers_complete = false,
+        .request_complete = false,
+        .response = null,
+        .response_prepared = true,
+        .response_header_block_len = 0,
+        .response_headers_sent = false,
+        .response_body_sent = 0,
+        .cleaned_up = false,
+        .priority = .{},
+        .priority_update_received = false,
+        .schedule_epoch_last = 0,
+        .schedule_count = 0,
+        .stream_dependency = 0,
+        .exclusive = false,
+        .weight = 16,
     };
     var response = handler.Response.init(.ok);
     defer response.deinit();
     response.body = "";
-
-    var stream = Stream{
-        .response = response,
-        .state = .Open,
-    };
+    stream.response = response;
     try std.testing.expect(shouldEndStreamWithHeaders(&stream));
 }
 
 test "shouldEndStreamWithHeaders false when body is not empty" {
-    const Stream = struct {
-        response: ?handler.Response = null,
-        response_body_sent: usize = 0,
-        response_prepared: bool = true,
-        response_headers_sent: bool = false,
-        state: StreamState = .Open,
-        request_method: handler.Method = .get,
+    var stream = DefaultStream.StreamInstance{
+        .id = 1,
+        .state = .Open,
+        .conn = undefined,
+        .recv_window_size = 65535,
+        .send_window_size = 65535,
+        .initial_window_size = 65535,
+        .header_block_fragments_buf = undefined,
+        .headers_bytes_storage = undefined,
+        .header_block_fragments_len = 0,
+        .headers_bytes_len = 0,
+        .expecting_continuation = false,
+        .headers_storage = undefined,
+        .headers = .empty,
+        .content_length = null,
+        .request_method_bytes = null,
+        .request_method = .get,
+        .request_path = null,
+        .total_data_received = 0,
+        .request_body_storage = undefined,
+        .request_body_len = 0,
+        .response_body_storage = undefined,
+        .request_headers_complete = false,
+        .request_complete = false,
+        .response = null,
+        .response_prepared = true,
+        .response_header_block_len = 0,
+        .response_headers_sent = false,
+        .response_body_sent = 0,
+        .cleaned_up = false,
+        .priority = .{},
+        .priority_update_received = false,
+        .schedule_epoch_last = 0,
+        .schedule_count = 0,
+        .stream_dependency = 0,
+        .exclusive = false,
+        .weight = 16,
     };
     var response = handler.Response.init(.ok);
     defer response.deinit();
     response.body = "data";
-
-    var stream = Stream{
-        .response = response,
-        .state = .Open,
-    };
+    stream.response = response;
     try std.testing.expect(!shouldEndStreamWithHeaders(&stream));
 }
 
 test "shouldSuppressResponseBody true for HEAD requests" {
-    const Stream = struct {
-        request_method: handler.Method = .head,
+    var stream = DefaultStream.StreamInstance{
+        .id = 0,
+        .state = .Idle,
+        .conn = undefined,
+        .recv_window_size = 0,
+        .send_window_size = 0,
+        .initial_window_size = 0,
+        .header_block_fragments_buf = undefined,
+        .headers_bytes_storage = undefined,
+        .header_block_fragments_len = 0,
+        .headers_bytes_len = 0,
+        .expecting_continuation = false,
+        .headers_storage = undefined,
+        .headers = .empty,
+        .content_length = null,
+        .request_method_bytes = null,
+        .request_method = .head,
+        .request_path = null,
+        .total_data_received = 0,
+        .request_body_storage = undefined,
+        .request_body_len = 0,
+        .response_body_storage = undefined,
+        .request_headers_complete = false,
+        .request_complete = false,
+        .response = null,
+        .response_prepared = false,
+        .response_header_block_len = 0,
+        .response_headers_sent = false,
+        .response_body_sent = 0,
+        .cleaned_up = false,
+        .priority = .{},
+        .priority_update_received = false,
+        .schedule_epoch_last = 0,
+        .schedule_count = 0,
+        .stream_dependency = 0,
+        .exclusive = false,
+        .weight = 16,
     };
-    var stream = Stream{};
     try std.testing.expect(shouldSuppressResponseBody(&stream));
 }
 
 test "shouldSuppressResponseBody false for GET requests" {
-    const Stream = struct {
-        request_method: handler.Method = .get,
+    var stream = DefaultStream.StreamInstance{
+        .id = 0,
+        .state = .Idle,
+        .conn = undefined,
+        .recv_window_size = 0,
+        .send_window_size = 0,
+        .initial_window_size = 0,
+        .header_block_fragments_buf = undefined,
+        .headers_bytes_storage = undefined,
+        .header_block_fragments_len = 0,
+        .headers_bytes_len = 0,
+        .expecting_continuation = false,
+        .headers_storage = undefined,
+        .headers = .empty,
+        .content_length = null,
+        .request_method_bytes = null,
+        .request_method = .get,
+        .request_path = null,
+        .total_data_received = 0,
+        .request_body_storage = undefined,
+        .request_body_len = 0,
+        .response_body_storage = undefined,
+        .request_headers_complete = false,
+        .request_complete = false,
+        .response = null,
+        .response_prepared = false,
+        .response_header_block_len = 0,
+        .response_headers_sent = false,
+        .response_body_sent = 0,
+        .cleaned_up = false,
+        .priority = .{},
+        .priority_update_received = false,
+        .schedule_epoch_last = 0,
+        .schedule_count = 0,
+        .stream_dependency = 0,
+        .exclusive = false,
+        .weight = 16,
     };
-    var stream = Stream{};
     try std.testing.expect(!shouldSuppressResponseBody(&stream));
 }
 
@@ -246,25 +371,85 @@ test "connectionResponseWindowAvailable returns zero for non-positive window" {
 }
 
 test "streamResponseComplete false when response not prepared" {
-    const Stream = struct {
-        response: ?handler.Response = null,
-        response_prepared: bool = false,
-        response_headers_sent: bool = false,
-        response_body_sent: usize = 0,
-        state: StreamState = .Open,
+    var stream = DefaultStream.StreamInstance{
+        .id = 0,
+        .state = .Open,
+        .conn = undefined,
+        .recv_window_size = 0,
+        .send_window_size = 0,
+        .initial_window_size = 0,
+        .header_block_fragments_buf = undefined,
+        .headers_bytes_storage = undefined,
+        .header_block_fragments_len = 0,
+        .headers_bytes_len = 0,
+        .expecting_continuation = false,
+        .headers_storage = undefined,
+        .headers = .empty,
+        .content_length = null,
+        .request_method_bytes = null,
+        .request_method = .get,
+        .request_path = null,
+        .total_data_received = 0,
+        .request_body_storage = undefined,
+        .request_body_len = 0,
+        .response_body_storage = undefined,
+        .request_headers_complete = false,
+        .request_complete = false,
+        .response = null,
+        .response_prepared = false,
+        .response_header_block_len = 0,
+        .response_headers_sent = false,
+        .response_body_sent = 0,
+        .cleaned_up = false,
+        .priority = .{},
+        .priority_update_received = false,
+        .schedule_epoch_last = 0,
+        .schedule_count = 0,
+        .stream_dependency = 0,
+        .exclusive = false,
+        .weight = 16,
     };
-    const stream = Stream{};
     try std.testing.expect(!streamResponseComplete(&stream));
 }
 
 test "streamResponseComplete true when stream closed" {
-    const Stream = struct {
-        response: ?handler.Response = null,
-        response_prepared: bool = true,
-        response_headers_sent: bool = true,
-        response_body_sent: usize = 0,
-        state: StreamState = .Closed,
+    var stream = DefaultStream.StreamInstance{
+        .id = 0,
+        .state = .Closed,
+        .conn = undefined,
+        .recv_window_size = 0,
+        .send_window_size = 0,
+        .initial_window_size = 0,
+        .header_block_fragments_buf = undefined,
+        .headers_bytes_storage = undefined,
+        .header_block_fragments_len = 0,
+        .headers_bytes_len = 0,
+        .expecting_continuation = false,
+        .headers_storage = undefined,
+        .headers = .empty,
+        .content_length = null,
+        .request_method_bytes = null,
+        .request_method = .get,
+        .request_path = null,
+        .total_data_received = 0,
+        .request_body_storage = undefined,
+        .request_body_len = 0,
+        .response_body_storage = undefined,
+        .request_headers_complete = false,
+        .request_complete = false,
+        .response = null,
+        .response_prepared = true,
+        .response_header_block_len = 0,
+        .response_headers_sent = true,
+        .response_body_sent = 0,
+        .cleaned_up = false,
+        .priority = .{},
+        .priority_update_received = false,
+        .schedule_epoch_last = 0,
+        .schedule_count = 0,
+        .stream_dependency = 0,
+        .exclusive = false,
+        .weight = 16,
     };
-    const stream = Stream{};
     try std.testing.expect(streamResponseComplete(&stream));
 }

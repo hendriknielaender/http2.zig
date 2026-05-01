@@ -374,9 +374,9 @@ const Http2StateChecker = struct {
         assert(connection.hpack_decoder_table.max_size <= connection.hpack_decoder_table.max_allowed_size);
         assert(connection.hpack_encoder_table.max_size <= connection.hpack_encoder_table.max_allowed_size);
 
-        for (connection.stream_slots_in_use, 0..) |in_use, index| {
+        for (connection.stream_storage.in_use, 0..) |in_use, index| {
             if (!in_use) continue;
-            const stream = &connection.stream_slots[index];
+            const stream = &connection.stream_storage.slots[index];
             assert(stream.id > 0);
             assert(stream.id <= self.highest_stream_id or stream.id & 1 == 0);
             assert(stream.request_body_len <= stream.request_body_storage.len);
@@ -581,7 +581,7 @@ const Simulator = struct {
         self.metrics.completed_responses = self.connection.completed_responses_pending;
         self.metrics.max_live_streams = @max(
             self.metrics.max_live_streams,
-            self.connection.stream_slots_in_use_count,
+            self.connection.stream_storage.in_use_count,
         );
     }
 
@@ -725,7 +725,7 @@ const Simulator = struct {
     }
 
     fn checkInvariants(self: *Simulator) !void {
-        assert(self.connection.stream_slots_in_use_count <= memory_budget.MemBudget.max_streams_per_connection);
+        assert(self.connection.stream_storage.in_use_count <= memory_budget.MemBudget.max_streams_per_connection);
         assert(self.connection.pending_stream_count <= memory_budget.MemBudget.max_streams_per_connection);
         assert(self.connection.completed_responses_pending <= self.model.requests_sent);
         self.checker.check(&self.connection);
@@ -735,10 +735,10 @@ const Simulator = struct {
         }
 
         var live_count: u32 = 0;
-        for (self.connection.stream_slots_in_use, 0..) |in_use, index| {
+        for (self.connection.stream_storage.in_use, 0..) |in_use, index| {
             if (!in_use) continue;
             live_count += 1;
-            const stream = &self.connection.stream_slots[index];
+            const stream = &self.connection.stream_storage.slots[index];
             assert(stream.id > 0);
             assert(stream.request_body_len <= stream.request_body_storage.len);
             if (stream.response) |response| {
@@ -749,7 +749,7 @@ const Simulator = struct {
             assert(stream.send_window_size <= std.math.maxInt(i32));
             assert(stream.recv_window_size <= std.math.maxInt(i32));
         }
-        assert(live_count == self.connection.stream_slots_in_use_count);
+        assert(live_count == self.connection.stream_storage.in_use_count);
     }
 
     fn recordTrace(self: *Simulator, tick: u64, action: Action, stream_id: u32) void {

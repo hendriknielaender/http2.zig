@@ -20,39 +20,13 @@ pub const http2 = @import("http2.zig");
 const HttpPriority = @import("http_priority.zig").Priority;
 const memory_budget = @import("memory_budget.zig");
 const TestIo = @import("testing/fixed_io.zig").FixedIo;
+const path = @import("path.zig");
+const stream_storage_module = @import("stream_storage.zig");
 const MAX_IN_FLIGHT_FRAMES = 64;
 const max_streams_per_connection = memory_budget.MemBudget.max_streams_per_connection;
 const max_frame_size_default = http2.max_frame_size_default;
 const log = std.log.scoped(.connection);
 
-// Open-addressed hash table for `stream_id -> stream_slot_index` lookup. Keeps
-// per-frame stream resolution at O(1) on the hot path instead of an O(N) scan
-// over the full stream slot array.
-//
-// Capacity must be a power of two and large enough that the table stays well
-// below 50% load with `max_streams_per_connection` live entries. This keeps
-// the average probe length under two for any reasonable hash. Stream IDs are
-// always > 0, so we use 0 as the "empty" sentinel and `0xff` as the unused
-// slot-index sentinel (slot indices are < `max_streams_per_connection`, <= 100).
-const stream_lookup_capacity: u32 = 256;
-const stream_lookup_mask: u32 = stream_lookup_capacity - 1;
-const stream_lookup_shift: u5 = 32 - 8; // log2(stream_lookup_capacity) = 8.
-const stream_slot_index_empty: u8 = std.math.maxInt(u8);
-
-comptime {
-    assert(@popCount(stream_lookup_capacity) == 1);
-    assert(stream_lookup_capacity >= max_streams_per_connection * 2);
-    assert(max_streams_per_connection < stream_slot_index_empty);
-    assert((@as(u32, 1) << @as(u5, 32 - @as(u32, stream_lookup_shift))) == stream_lookup_capacity);
-}
-
-// Knuth multiplicative hash; the constant is `floor(2^32 / phi)` and gives a
-// strong avalanche on the upper bits, which is exactly what we shift into the
-// table index. Cheap (one imul) and well-distributed for the sequential odd
-// stream IDs that dominate real traffic.
-inline fn streamLookupHash(stream_id: u32) u32 {
-    return (stream_id *% 0x9E3779B1) >> stream_lookup_shift;
-}
 const assert = std.debug.assert;
 const http2_preface: []const u8 = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const priority_frame_payload_size: usize = 5;
@@ -81,10 +55,7 @@ comptime {
     assert(default_response_content_type.len == 24);
 }
 
-const RequestTarget = struct {
-    normalized_path: []const u8,
-    query: []const u8,
-};
+const RequestTarget = @import("path.zig").RequestTarget;
 pub const Config = struct {
     // Socket options - configured at comptime for zero-cost abstractions
     pub const SocketOpts = struct {
@@ -183,16 +154,7 @@ pub fn acceptMany(listener: std.net.Server, connections: []std.net.Server.Connec
     return accepted;
 }
 pub const Connection = struct {
-    pub const StreamStorage = struct {
-        slots: [max_streams_per_connection]DefaultStream.StreamInstance,
-        ids: [max_streams_per_connection]u32,
-        in_use: [max_streams_per_connection]bool,
-        // O(1) lookup table mapping stream_id to an index into `slots`.
-        // `lookup_ids[i] == 0` marks an empty bucket; otherwise the entry maps
-        // `lookup_ids[i]` to `lookup_slot_indices[i]`.
-        lookup_ids: [stream_lookup_capacity]u32,
-        lookup_slot_indices: [stream_lookup_capacity]u8,
-    };
+    pub const StreamStorage = @import("stream_storage.zig").StreamStorage;
     pub const PendingPriorityUpdate = struct {
         stream_id: u32 = 0,
         priority: HttpPriority = .{},
@@ -210,20 +172,7 @@ pub const Connection = struct {
     settings: Settings,
     recv_window_size: i32 = 65535,
     send_window_size: i32 = 65535,
-    stream_slots: []DefaultStream.StreamInstance,
-    // Keep hot lookup metadata compact so stream scans do not walk the full stream storage.
-    stream_slot_ids: []u32,
-    stream_slots_in_use: []bool,
-    // Live count of occupied stream slots. Maintained in lockstep with
-    // `stream_slots_in_use` so the per-frame `MAX_CONCURRENT_STREAMS` check
-    // is O(1); walking the slot array touches one cache line per 24 KiB
-    // stream struct, which dominated the new-stream path. The counter is a
-    // conservative upper bound: closed-but-not-yet-released streams count
-    // toward the limit until the next `flush_ready_streams` releases them.
-    stream_slots_in_use_count: u8 = 0,
-    // O(1) `stream_id -> slot_index` table; see `streamLookupHash` for layout.
-    stream_lookup_ids: []u32,
-    stream_lookup_slot_indices: []u8,
+    stream_storage: *StreamStorage,
     owned_stream_storage: ?*StreamStorage = null,
     pending_stream_slots: [max_streams_per_connection]u8,
     pending_stream_queued: [max_streams_per_connection]bool,
@@ -247,27 +196,15 @@ pub const Connection = struct {
     frame_arena: FrameArena,
     frame_arena_available: bool = false,
 
-    fn initStreamStorage(target: *StreamStorage) void {
-        target.* = .{
-            .slots = undefined,
-            .ids = [_]u32{0} ** max_streams_per_connection,
-            .in_use = [_]bool{false} ** max_streams_per_connection,
-            // Empty bucket sentinel is `0` for ids (stream IDs are always > 0)
-            // and `stream_slot_index_empty` for slot indices.
-            .lookup_ids = [_]u32{0} ** stream_lookup_capacity,
-            .lookup_slot_indices = [_]u8{stream_slot_index_empty} ** stream_lookup_capacity,
-        };
-    }
-
     fn initBase(
         target: *@This(),
-        stream_storage: *StreamStorage,
+        stream_storage_ptr: *StreamStorage,
         frame_arena_storage: ?*FrameArenaStorage,
         allocator: std.mem.Allocator,
         reader: *std.Io.Reader,
         writer: *std.Io.Writer,
     ) void {
-        initStreamStorage(stream_storage);
+        stream_storage_ptr.init();
 
         target.* = .{
             .allocator = allocator,
@@ -277,12 +214,7 @@ pub const Connection = struct {
             .settings = Settings.default(),
             .recv_window_size = 65535,
             .send_window_size = 65535,
-            .stream_slots = stream_storage.slots[0..],
-            .stream_slot_ids = stream_storage.ids[0..],
-            .stream_slots_in_use = stream_storage.in_use[0..],
-            .stream_slots_in_use_count = 0,
-            .stream_lookup_ids = stream_storage.lookup_ids[0..],
-            .stream_lookup_slot_indices = stream_storage.lookup_slot_indices[0..],
+            .stream_storage = stream_storage_ptr,
             .owned_stream_storage = null,
             .pending_stream_slots = undefined,
             .pending_stream_queued = [_]bool{false} ** max_streams_per_connection,
@@ -300,11 +232,11 @@ pub const Connection = struct {
             .frame_arena_available = false,
         };
 
-        assert(target.stream_slots.len == max_streams_per_connection);
-        assert(target.stream_slot_ids.len == max_streams_per_connection);
-        assert(target.stream_slots_in_use.len == max_streams_per_connection);
-        assert(target.stream_lookup_ids.len == stream_lookup_capacity);
-        assert(target.stream_lookup_slot_indices.len == stream_lookup_capacity);
+        assert(target.stream_storage.slots.len == max_streams_per_connection);
+        assert(target.stream_storage.ids.len == max_streams_per_connection);
+        assert(target.stream_storage.in_use.len == max_streams_per_connection);
+        assert(target.stream_storage.lookup_ids.len == 256);
+        assert(target.stream_storage.lookup_indices.len == 256);
         if (frame_arena_storage) |storage| {
             target.frame_arena = initFrameArena(storage);
             target.frame_arena_available = true;
@@ -421,24 +353,23 @@ pub const Connection = struct {
         log.debug("Valid HTTP/2 preface received", .{});
     }
     pub fn deinit(self: *@This()) void {
-        // Mark connection as closed to prevent further operations
         self.connection_closed = true;
 
-        for (self.stream_slots, 0..) |*stream_slot, stream_index| {
-            if (!self.stream_slots_in_use[stream_index]) continue;
+        for (&self.stream_storage.slots, 0..) |*stream_slot, stream_index| {
+            if (!self.stream_storage.in_use[stream_index]) continue;
             stream_slot.deinit();
-            self.stream_slot_ids[stream_index] = 0;
-            self.stream_slots_in_use[stream_index] = false;
+            self.stream_storage.ids[stream_index] = 0;
+            self.stream_storage.in_use[stream_index] = false;
         }
-        self.stream_slots_in_use_count = 0;
-        self.streamLookupReset();
+        self.stream_storage.in_use_count = 0;
+        self.stream_storage.reset();
         self.pending_stream_count = 0;
         self.pending_stream_queued = [_]bool{false} ** max_streams_per_connection;
         self.completed_responses_pending = 0;
         self.hpack_decoder_table.deinit();
         self.hpack_encoder_table.deinit();
-        if (self.owned_stream_storage) |stream_storage| {
-            self.allocator.destroy(stream_storage);
+        if (self.owned_stream_storage) |owned| {
+            self.allocator.destroy(owned);
             self.owned_stream_storage = null;
         }
         if (self.owned_frame_arena_storage) |frame_arena_storage| {
@@ -457,8 +388,7 @@ pub const Connection = struct {
     }
 
     fn active_stream_count(self: *@This()) u32 {
-        assert(self.stream_slots_in_use_count <= max_streams_per_connection);
-        return self.stream_slots_in_use_count;
+        return self.stream_storage.activeCount();
     }
 
     fn send_preface(self: *const @This()) !void {
@@ -469,96 +399,13 @@ pub const Connection = struct {
         return self.last_stream_id;
     }
 
-    // O(1) average lookup over the open-addressed hash table. Linear probing
-    // terminates at the first empty bucket because deletions backshift to keep
-    // the probe chain contiguous (see `streamLookupRemove`).
+    // O(1) average lookup via the open-addressed hash table in StreamStorage.
     fn streamFindIndex(self: *const @This(), stream_id: u32) ?u8 {
-        assert(stream_id > 0);
-
-        var probe: u32 = streamLookupHash(stream_id);
-        var probes: u32 = 0;
-        while (probes < stream_lookup_capacity) : (probes += 1) {
-            const bucket_id = self.stream_lookup_ids[probe];
-            if (bucket_id == 0) return null;
-            if (bucket_id == stream_id) {
-                const slot_index = self.stream_lookup_slot_indices[probe];
-                assert(slot_index < max_streams_per_connection);
-                assert(self.stream_slots_in_use[slot_index]);
-                assert(self.stream_slot_ids[slot_index] == stream_id);
-                return slot_index;
-            }
-            probe = (probe + 1) & stream_lookup_mask;
-        }
-        // Load factor < 0.5 means a full sweep without finding an empty bucket
-        // is impossible; reaching here would mean the table is corrupt.
-        unreachable;
-    }
-
-    // Insert a `(stream_id, slot_index)` pair. Caller must guarantee
-    // `stream_id` is not already present in the table.
-    fn streamLookupInsert(self: *@This(), stream_id: u32, slot_index: u8) void {
-        assert(stream_id > 0);
-        assert(slot_index < max_streams_per_connection);
-
-        var probe: u32 = streamLookupHash(stream_id);
-        var probes: u32 = 0;
-        while (probes < stream_lookup_capacity) : (probes += 1) {
-            const bucket_id = self.stream_lookup_ids[probe];
-            assert(bucket_id != stream_id);
-            if (bucket_id == 0) {
-                self.stream_lookup_ids[probe] = stream_id;
-                self.stream_lookup_slot_indices[probe] = slot_index;
-                return;
-            }
-            probe = (probe + 1) & stream_lookup_mask;
-        }
-        // With at most `max_streams_per_connection` live entries and capacity
-        // at least 2x that, an insert can always find a free bucket.
-        unreachable;
-    }
-
-    // Remove `stream_id` and backshift any displaced followers to preserve the
-    // invariant that probing stops at the first empty bucket.
-    fn streamLookupRemove(self: *@This(), stream_id: u32) void {
-        assert(stream_id > 0);
-
-        var hole: u32 = streamLookupHash(stream_id);
-        var probes: u32 = 0;
-        while (self.stream_lookup_ids[hole] != stream_id) {
-            assert(self.stream_lookup_ids[hole] != 0);
-            hole = (hole + 1) & stream_lookup_mask;
-            probes += 1;
-            assert(probes < stream_lookup_capacity);
-        }
-
-        var next: u32 = (hole + 1) & stream_lookup_mask;
-        while (self.stream_lookup_ids[next] != 0) {
-            const next_id = self.stream_lookup_ids[next];
-            const next_home = streamLookupHash(next_id);
-            // An entry at `next` can fill `hole` iff its home position lies
-            // outside the open interval `(hole, next]` cyclically, so its
-            // displacement from home reaches at least as far as the hole.
-            const displacement = (next -% next_home) & stream_lookup_mask;
-            const gap_distance = (next -% hole) & stream_lookup_mask;
-            if (displacement >= gap_distance) {
-                self.stream_lookup_ids[hole] = next_id;
-                self.stream_lookup_slot_indices[hole] = self.stream_lookup_slot_indices[next];
-                hole = next;
-            }
-            next = (next + 1) & stream_lookup_mask;
-        }
-        self.stream_lookup_ids[hole] = 0;
-        self.stream_lookup_slot_indices[hole] = stream_slot_index_empty;
-    }
-
-    fn streamLookupReset(self: *@This()) void {
-        @memset(self.stream_lookup_ids, 0);
-        @memset(self.stream_lookup_slot_indices, stream_slot_index_empty);
+        return self.stream_storage.findIndex(stream_id);
     }
 
     fn streamFind(self: *@This(), stream_id: u32) ?*DefaultStream.StreamInstance {
-        const stream_index = self.streamFindIndex(stream_id) orelse return null;
-        return &self.stream_slots[stream_index];
+        return self.stream_storage.find(stream_id);
     }
 
     pub fn rfc7540_priority_signals_ignored(self: *const @This()) bool {
@@ -650,8 +497,8 @@ pub const Connection = struct {
         candidate_index: u8,
         current_index: u8,
     ) bool {
-        const candidate_stream = &self.stream_slots[candidate_index];
-        const current_stream = &self.stream_slots[current_index];
+        const candidate_stream = &self.stream_storage.slots[candidate_index];
+        const current_stream = &self.stream_storage.slots[current_index];
 
         if (candidate_stream.priority.urgency < current_stream.priority.urgency) {
             return true;
@@ -729,9 +576,9 @@ pub const Connection = struct {
             self.pending_stream_slots[pending_index - 1] = self.pending_stream_slots[pending_index];
         }
         self.pending_stream_count -= 1;
-        assert(self.stream_slots[stream_index].schedule_count < std.math.maxInt(u32));
-        self.stream_slots[stream_index].schedule_count += 1;
-        self.stream_slots[stream_index].schedule_epoch_last = self.schedule_epoch_next;
+        assert(self.stream_storage.slots[stream_index].schedule_count < std.math.maxInt(u32));
+        self.stream_storage.slots[stream_index].schedule_count += 1;
+        self.stream_storage.slots[stream_index].schedule_epoch_last = self.schedule_epoch_next;
         self.schedule_epoch_next += 1;
         return stream_index;
     }
@@ -761,19 +608,12 @@ pub const Connection = struct {
     }
 
     fn releaseClosedStream(self: *@This(), stream_index: u8) void {
-        assert(stream_index < max_streams_per_connection);
-        assert(self.stream_slots_in_use[stream_index]);
-
-        const stream = &self.stream_slots[stream_index];
+        const stream = self.stream_storage.findBySlotIndex(stream_index);
         const stream_id = stream.id;
 
         self.pendingStreamRemove(stream_index);
         stream.deinit();
-        self.streamLookupRemove(stream_id);
-        self.stream_slot_ids[stream_index] = 0;
-        self.stream_slots_in_use[stream_index] = false;
-        assert(self.stream_slots_in_use_count > 0);
-        self.stream_slots_in_use_count -= 1;
+        self.stream_storage.releaseSlot(stream_index);
         log.debug("Released closed stream {d}\n", .{stream_id});
     }
 
@@ -790,7 +630,7 @@ pub const Connection = struct {
         if (stream.expecting_continuation) {
             return;
         }
-        if (self.streamResponseComplete(stream)) {
+        if (resp.streamResponseComplete(stream)) {
             return;
         }
 
@@ -805,24 +645,13 @@ pub const Connection = struct {
     }
 
     fn streamAllocate(self: *@This(), stream_id: u32) !*DefaultStream.StreamInstance {
-        assert(stream_id > 0);
-
-        for (self.stream_slots, 0..) |*stream_slot, stream_index| {
-            if (self.stream_slots_in_use[stream_index]) continue;
-
-            self.stream_slot_ids[stream_index] = stream_id;
-            self.stream_slots_in_use[stream_index] = true;
-            assert(self.stream_slots_in_use_count < max_streams_per_connection);
-            self.stream_slots_in_use_count += 1;
-            self.streamLookupInsert(stream_id, @intCast(stream_index));
-            stream_slot.init(self, stream_id);
-            if (self.pending_priority_update_take(stream_id)) |priority| {
-                stream_slot.applyPriority(priority);
-            }
-            return stream_slot;
+        const slot_index = try self.stream_storage.allocateSlot(stream_id);
+        const stream_slot = self.stream_storage.findBySlotIndex(slot_index);
+        stream_slot.init(self, stream_id);
+        if (self.pending_priority_update_take(stream_id)) |priority| {
+            stream_slot.applyPriority(priority);
         }
-
-        return error.MaxConcurrentStreamsExceeded;
+        return stream_slot;
     }
     /// Sends a RST_STREAM frame for a given stream ID with the specified error code.
     pub fn send_rst_stream(self: *@This(), stream_id: u32, error_code: u32) !void {
@@ -1459,11 +1288,11 @@ pub const Connection = struct {
     }
 
     fn flush_ready_stream(self: *@This(), stream_index: u8) !bool {
-        if (!self.stream_slots_in_use[stream_index]) {
+        if (!self.stream_storage.in_use[stream_index]) {
             return false;
         }
 
-        const stream = &self.stream_slots[stream_index];
+        const stream = &self.stream_storage.slots[stream_index];
         try self.process_request(stream);
 
         if (stream.state == .Closed) {
@@ -1471,7 +1300,7 @@ pub const Connection = struct {
             return false;
         }
 
-        if (!self.streamResponseComplete(stream)) {
+        if (!resp.streamResponseComplete(stream)) {
             return true;
         }
 
@@ -1635,8 +1464,8 @@ pub const Connection = struct {
         assert(!stream.expecting_continuation);
         log.debug("Processing request for stream ID: {d}, state: {s}", .{ stream.id, @tagName(stream.state) });
         try self.process_request_prepare_response(stream);
-        try self.process_request_send_headers(stream);
-        try self.process_request_send_body(stream);
+        try resp.sendResponseHeaders(stream, self);
+        try resp.sendResponseBody(stream, self);
     }
 
     fn process_request_prepare_response(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
@@ -1649,52 +1478,6 @@ pub const Connection = struct {
         try self.encode_response(stream, &response);
         stream.response = response;
         stream.response_prepared = true;
-    }
-
-    fn process_request_send_headers(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
-        if (stream.response_headers_sent) {
-            return;
-        }
-        try self.process_request_prepare_response(stream);
-        try resp.sendResponseHeaders(stream, self);
-    }
-
-    fn process_request_send_body(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
-        if (!stream.response_headers_sent) {
-            return;
-        }
-        if (resp.shouldSuppressResponseBody(stream)) {
-            return;
-        }
-
-        const body = resp.responseBody(stream);
-        if (stream.response_body_sent >= body.len) {
-            return;
-        }
-
-        const conn_window = resp.connectionResponseWindowAvailable(self.send_window_size);
-        const stream_window = resp.connectionResponseWindowAvailable(stream.send_window_size);
-        const remaining_len = body.len - stream.response_body_sent;
-        const frame_limit: usize = @intCast(self.settings.max_frame_size);
-        const response_len = @min(remaining_len, @min(frame_limit, @min(conn_window, stream_window)));
-        if (response_len == 0) {
-            return;
-        }
-
-        const response_start = stream.response_body_sent;
-        const response_end = response_start + response_len;
-        const end_stream = response_end == body.len;
-
-        log.debug("Sending DATA frame for stream {} ({} bytes)", .{ stream.id, response_len });
-        try stream.sendData(body[response_start..response_end], end_stream);
-        self.send_window_size -= @intCast(response_len);
-        stream.response_body_sent = response_end;
-
-        if (end_stream) {
-            assert(stream.state == .Closed);
-            assert(self.completed_responses_pending < std.math.maxInt(u32));
-            self.completed_responses_pending += 1;
-        }
     }
 
     fn build_response(self: *@This(), stream: *DefaultStream.StreamInstance) !handler.Response {
@@ -1724,7 +1507,7 @@ pub const Connection = struct {
     ) !handler.Response {
         const method = try self.requestMethod(stream);
         const raw_target = stream.request_path orelse return error.MissingPath;
-        if (normalized_request_target(raw_target)) |target| {
+        if (path.normalizedRequestTarget(raw_target)) |target| {
             return self.dispatch_request_target(request_dispatcher, stream, method, target);
         }
         return self.dispatch_request_slow(request_dispatcher, stream, method, raw_target);
@@ -1738,7 +1521,7 @@ pub const Connection = struct {
         raw_target: []const u8,
     ) !handler.Response {
         var path_storage: [memory_budget.MemBudget.max_header_size_bytes]u8 = undefined;
-        const target = try normalizeRequestTarget(raw_target, &path_storage);
+        const target = try path.normalizeRequestTarget(raw_target, &path_storage);
         return self.dispatch_request_target(request_dispatcher, stream, method, target);
     }
 
@@ -1809,31 +1592,6 @@ pub const Connection = struct {
             &self.hpack_encoder_table,
             self.allocator,
         );
-    }
-
-    fn responseHeadersBlock(self: *@This(), stream: *DefaultStream.StreamInstance) []const u8 {
-        _ = self;
-        return resp.responseHeadersBlock(stream);
-    }
-
-    fn responseBody(self: *@This(), stream: *DefaultStream.StreamInstance) []const u8 {
-        _ = self;
-        return resp.responseBody(stream);
-    }
-
-    fn shouldEndStreamWithHeaders(self: *@This(), stream: *DefaultStream.StreamInstance) bool {
-        _ = self;
-        return resp.shouldEndStreamWithHeaders(stream);
-    }
-
-    fn shouldSuppressResponseBody(self: *@This(), stream: *DefaultStream.StreamInstance) bool {
-        _ = self;
-        return resp.shouldSuppressResponseBody(stream);
-    }
-
-    fn streamResponseComplete(self: *@This(), stream: *const DefaultStream.StreamInstance) bool {
-        _ = self;
-        return resp.streamResponseComplete(stream);
     }
 
     pub fn send_settings(self: *@This()) !void {
@@ -2077,7 +1835,7 @@ pub const Connection = struct {
 
     /// Update all stream window sizes when initial window size changes
     fn apply_frame_settings_update_stream_windows(self: *@This(), window_delta: i32) !void {
-        for (self.stream_slots, self.stream_slots_in_use) |*stream, in_use| {
+        for (&self.stream_storage.slots, self.stream_storage.in_use) |*stream, in_use| {
             if (!in_use) continue;
             const new_window_size: i64 = @as(i64, stream.send_window_size) + @as(i64, window_delta);
             if (new_window_size < std.math.minInt(i32)) {
@@ -2349,189 +2107,6 @@ const Settings = struct {
     }
 };
 
-fn normalizeRequestTarget(
-    raw_target: []const u8,
-    normalized_path_storage: []u8,
-) !RequestTarget {
-    if (normalized_path_storage.len == 0) {
-        return error.RequestTargetTooLarge;
-    }
-
-    const query_index = std.mem.indexOfScalar(u8, raw_target, '?') orelse raw_target.len;
-    const raw_path = raw_target[0..query_index];
-    const query = if (query_index < raw_target.len)
-        raw_target[query_index + 1 ..]
-    else
-        "";
-
-    var source_index: usize = 0;
-    var target_index: usize = 0;
-    var last_slash: usize = 0;
-
-    normalized_path_storage[target_index] = '/';
-    target_index += 1;
-    if (raw_path.len > 0 and raw_path[0] == '/') {
-        source_index = 1;
-    }
-
-    while (source_index < raw_path.len) {
-        const decoded = try decodePathByte(raw_path, &source_index);
-        if (decoded == 0) return error.InvalidRequestTarget;
-
-        if (decoded == '/') {
-            const rewind = rewindSpecialPath(
-                normalized_path_storage[0..target_index],
-                last_slash,
-            );
-            target_index -= rewind;
-            if (rewind > 0) {
-                last_slash = if (target_index > 0) target_index - 1 else 0;
-                continue;
-            }
-            last_slash = target_index;
-        }
-
-        if (target_index >= normalized_path_storage.len) {
-            return error.RequestTargetTooLarge;
-        }
-        normalized_path_storage[target_index] = decoded;
-        target_index += 1;
-    }
-
-    const rewind = rewindSpecialPath(
-        normalized_path_storage[0..target_index],
-        last_slash,
-    );
-    target_index -= rewind;
-    if (target_index == 0) {
-        normalized_path_storage[0] = '/';
-        target_index = 1;
-    }
-
-    return .{
-        .normalized_path = normalized_path_storage[0..target_index],
-        .query = query,
-    };
-}
-
-fn normalized_request_target(raw_target: []const u8) ?RequestTarget {
-    const query_index = std.mem.indexOfScalar(u8, raw_target, '?') orelse raw_target.len;
-    const raw_path = raw_target[0..query_index];
-    if (!request_path_is_normalized(raw_path)) {
-        return null;
-    }
-
-    const query = if (query_index < raw_target.len)
-        raw_target[query_index + 1 ..]
-    else
-        "";
-
-    return .{
-        .normalized_path = raw_path,
-        .query = query,
-    };
-}
-
-fn request_path_is_normalized(raw_path: []const u8) bool {
-    if (raw_path.len == 0) {
-        return false;
-    }
-    if (raw_path[0] != '/') {
-        return false;
-    }
-
-    var segment_start: usize = 1;
-    var index: usize = 1;
-    while (index <= raw_path.len) : (index += 1) {
-        if (index < raw_path.len) {
-            const byte = raw_path[index];
-            if (byte == 0) {
-                return false;
-            }
-            if (byte == '%') {
-                return false;
-            }
-            if (byte != '/') {
-                continue;
-            }
-        }
-
-        if (request_path_segment_is_special(raw_path[segment_start..index])) {
-            return false;
-        }
-        segment_start = index + 1;
-    }
-
-    return true;
-}
-
-fn request_path_segment_is_special(segment: []const u8) bool {
-    if (segment.len == 1) {
-        return segment[0] == '.';
-    }
-    if (segment.len == 2) {
-        if (segment[0] == '.') {
-            return segment[1] == '.';
-        }
-    }
-    return false;
-}
-
-fn decodePathByte(raw_path: []const u8, source_index: *usize) !u8 {
-    std.debug.assert(source_index.* < raw_path.len);
-
-    const current = raw_path[source_index.*];
-    if (current != '%') {
-        source_index.* += 1;
-        return current;
-    }
-    if (source_index.* + 2 >= raw_path.len) {
-        source_index.* += 1;
-        return current;
-    }
-
-    const hi = decodeHexDigit(raw_path[source_index.* + 1]) orelse {
-        source_index.* += 1;
-        return current;
-    };
-    const lo = decodeHexDigit(raw_path[source_index.* + 2]) orelse {
-        source_index.* += 1;
-        return current;
-    };
-
-    source_index.* += 3;
-    return (hi << 4) | lo;
-}
-
-fn decodeHexDigit(byte: u8) ?u8 {
-    if (byte >= '0' and byte <= '9') return byte - '0';
-    if (byte >= 'A' and byte <= 'F') return byte - 'A' + 10;
-    if (byte >= 'a' and byte <= 'f') return byte - 'a' + 10;
-    return null;
-}
-
-fn rewindSpecialPath(path: []const u8, last_slash: usize) usize {
-    std.debug.assert(path.len > 0);
-    std.debug.assert(last_slash < path.len);
-
-    const original_len = path.len;
-    var new_len = original_len;
-    const part_len = original_len - last_slash;
-
-    if (part_len == 2 and path[original_len - 1] == '.') {
-        new_len -= 1;
-    } else if (part_len == 3 and path[original_len - 2] == '.' and path[original_len - 1] == '.') {
-        new_len -= 2;
-        if (new_len > 1) {
-            while (new_len > 0 and path[new_len - 1] != '/') {
-                new_len -= 1;
-            }
-        }
-    }
-
-    return original_len - new_len;
-}
-
 fn encodeTestRequestHeaders(
     allocator: std.mem.Allocator,
     connection: *Connection,
@@ -2581,7 +2156,12 @@ test "HTTP/2 connection initialization and flow control" {
         .payload = headers_payload,
     };
     try stream.handleFrame(headers_frame);
-    try connection.process_request_send_headers(stream);
+    var response = try connection.build_default_response();
+    defer response.deinit();
+    try connection.encode_response(stream, &response);
+    stream.response = response;
+    stream.response_prepared = true;
+    try resp.sendResponseHeaders(stream, &connection);
     const headers_written_data = test_io.written();
     assert(headers_written_data.len > preface_written_data.len);
     const data = "Hello, world!";
@@ -2849,21 +2429,6 @@ test "default response header encoding uses dynamic table after first response" 
     try connection.encode_response(second_stream, &second_response);
 
     try std.testing.expect(second_stream.response_header_block_len < first_header_block_len);
-}
-
-test "normalized request target fast path accepts canonical target" {
-    const target = normalized_request_target("/baseline2?a=1&b=2").?;
-
-    try std.testing.expectEqualStrings("/baseline2", target.normalized_path);
-    try std.testing.expectEqualStrings("a=1&b=2", target.query);
-}
-
-test "normalized request target fast path rejects slow-path targets" {
-    try std.testing.expect(normalized_request_target("") == null);
-    try std.testing.expect(normalized_request_target("baseline2?a=1") == null);
-    try std.testing.expect(normalized_request_target("/a/../b") == null);
-    try std.testing.expect(normalized_request_target("/a/%62") == null);
-    try std.testing.expect(normalized_request_target("/a/./b") == null);
 }
 
 test "flush_ready_streams reports completed responses once" {
@@ -3143,7 +2708,7 @@ test "scheduler prefers lower urgency before higher urgency" {
     try connection.queueStreamIfReady(high_urgency_stream);
 
     const selected_index = connection.pendingStreamPop() orelse unreachable;
-    const selected_stream = &connection.stream_slots[selected_index];
+    const selected_stream = connection.stream_storage.findBySlotIndex(selected_index);
     try std.testing.expectEqual(@as(u32, 3), selected_stream.id);
 }
 
@@ -3180,12 +2745,12 @@ test "scheduler gives same-urgency incremental streams a first turn" {
     try connection.queueStreamIfReady(incremental_stream);
 
     const first_index = connection.pendingStreamPop() orelse unreachable;
-    try std.testing.expectEqual(@as(u32, 1), connection.stream_slots[first_index].id);
+    try std.testing.expectEqual(@as(u32, 1), connection.stream_storage.slots[first_index].id);
 
     try connection.pendingStreamPush(first_index);
 
     const second_index = connection.pendingStreamPop() orelse unreachable;
-    try std.testing.expectEqual(@as(u32, 3), connection.stream_slots[second_index].id);
+    try std.testing.expectEqual(@as(u32, 3), connection.stream_storage.slots[second_index].id);
 }
 
 test "flush_ready_streams does not let a blocked stream stall other responses" {

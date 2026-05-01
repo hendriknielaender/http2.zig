@@ -45,6 +45,12 @@ pub const transport = @import("transport.zig");
 pub const ServeConnectionOptions = transport.ServeConnectionOptions;
 pub const serveConnection = transport.serveConnection;
 
+// Request-target path normalization.
+pub const path = @import("path.zig");
+
+// Per-connection stream slot storage with O(1) lookup.
+pub const stream_storage = @import("stream_storage.zig");
+
 // Handler API
 pub const handler = @import("handler.zig");
 pub const Context = handler.Context;

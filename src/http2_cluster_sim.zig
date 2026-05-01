@@ -335,7 +335,7 @@ const ClusterChecker = struct {
         var completed: u64 = 0;
         for (peers, 0..) |*peer, peer_index| {
             if (!peer.has_connection) continue;
-            assert(peer.connection.stream_slots_in_use_count <= memory_budget.MemBudget.max_streams_per_connection);
+            assert(peer.connection.stream_storage.in_use_count <= memory_budget.MemBudget.max_streams_per_connection);
             assert(peer.connection.pending_stream_count <= memory_budget.MemBudget.max_streams_per_connection);
             assert(peer.connection.recv_window_size <= std.math.maxInt(i32));
             assert(peer.connection.send_window_size <= std.math.maxInt(i32));
@@ -345,9 +345,9 @@ const ClusterChecker = struct {
             assert(peer.connection.hpack_encoder_table.max_size <= peer.connection.hpack_encoder_table.max_allowed_size);
             completed += peer.connection.completed_responses_pending;
 
-            for (peer.connection.stream_slots_in_use, 0..) |in_use, slot_index| {
+            for (peer.connection.stream_storage.in_use, 0..) |in_use, slot_index| {
                 if (!in_use) continue;
-                const stream = &peer.connection.stream_slots[slot_index];
+                const stream = &peer.connection.stream_storage.slots[slot_index];
                 assert(stream.id > 0);
                 assert(stream.request_body_len <= stream.request_body_storage.len);
                 assert(stream.send_window_size <= std.math.maxInt(i32));
