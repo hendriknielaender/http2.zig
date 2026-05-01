@@ -9,6 +9,29 @@ pub const Huffman = struct {
         bits: u8,
     };
 
+    const DecodeSymbol = enum(u16) {
+        none = std.math.maxInt(u16),
+        eos = 256,
+        _,
+
+        fn byte(symbol: DecodeSymbol) ?u8 {
+            const value = @intFromEnum(symbol);
+            assert(value <= 256 or value == std.math.maxInt(u16));
+            if (value < 256) {
+                return @intCast(value);
+            }
+            return null;
+        }
+    };
+
+    const DecodeNode = struct {
+        child: [2]u16 = .{ node_missing, node_missing },
+        symbol: DecodeSymbol = .none,
+    };
+
+    const node_missing = std.math.maxInt(u16);
+    const decode_nodes_max = 8192;
+
     const huffmanTable = [_]HuffmanEntry{
         .{ .symbol = .{ .byte = 0 }, .code = 0x1ff8, .bits = 13 },
         .{ .symbol = .{ .byte = 1 }, .code = 0x7fffd8, .bits = 23 },
@@ -269,6 +292,48 @@ pub const Huffman = struct {
         .{ .symbol = .{ .eos = {} }, .code = 0x3fffffff, .bits = 30 }, // EOS symbol
     };
 
+    const decode_trie = buildDecodeTrie();
+
+    const DecodeTrie = struct {
+        nodes: [decode_nodes_max]DecodeNode,
+        count: u16,
+    };
+
+    fn buildDecodeTrie() DecodeTrie {
+        @setEvalBranchQuota(10000);
+
+        var trie = DecodeTrie{
+            .nodes = [_]DecodeNode{.{}} ** decode_nodes_max,
+            .count = 1,
+        };
+
+        for (huffmanTable) |entry| {
+            var node_index: u16 = 0;
+            var bit_index: u8 = 0;
+            while (bit_index < entry.bits) : (bit_index += 1) {
+                const shift: u5 = @intCast(entry.bits - 1 - bit_index);
+                const bit: u1 = @intCast((entry.code >> shift) & 1);
+                var node = &trie.nodes[node_index];
+
+                if (node.child[bit] == node_missing) {
+                    assert(trie.count < decode_nodes_max);
+                    node.child[bit] = trie.count;
+                    trie.count += 1;
+                }
+                node_index = node.child[bit];
+            }
+
+            const symbol: DecodeSymbol = switch (entry.symbol) {
+                .byte => |value| @enumFromInt(value),
+                .eos => .eos,
+            };
+            assert(trie.nodes[node_index].symbol == .none);
+            trie.nodes[node_index].symbol = symbol;
+        }
+
+        return trie;
+    }
+
     pub fn encode(input: []const u8, allocator: std.mem.Allocator) ![]u8 {
         std.debug.assert(input.len <= 16384); // Reasonable input size limit
         std.debug.assert(@intFromPtr(&allocator) != 0);
@@ -383,39 +448,37 @@ pub const Huffman = struct {
         std.debug.assert(input.len <= 16384);
 
         var output_used: usize = 0;
-        var bit_buffer: u64 = 0;
-        var bit_count: u8 = 0;
         var code: u32 = 0;
         var code_bits: u8 = 0;
+        var node_index: u16 = 0;
 
         for (input) |byte| {
-            bit_buffer = (bit_buffer << 8) | @as(u64, byte);
-            bit_count += 8;
+            var bit_index: u4 = 0;
+            while (bit_index < 8) : (bit_index += 1) {
+                const shift: u3 = @intCast(7 - bit_index);
+                const bit: u1 = @intCast((byte >> shift) & 1);
+                const bit_u32: u32 = bit;
 
-            while (bit_count > 0) {
-                const bit_count_u6: u6 = @intCast(bit_count - 1);
-                const bit_u32: u32 = @intCast((bit_buffer >> bit_count_u6) & 0x1);
+                const next_node = decode_trie.nodes[node_index].child[bit];
+                if (next_node == node_missing) return error.InvalidHuffmanCode;
+                node_index = next_node;
+
                 code = (code << 1) | bit_u32;
                 code_bits += 1;
-                bit_count -= 1;
 
-                var found = false;
-                for (huffmanTable) |entry| {
-                    if (entry.bits != code_bits) continue;
-                    if (entry.code != code) continue;
-                    if (entry.symbol == .eos) return error.InvalidHuffmanCode;
-                    if (output_used >= output.len) return error.HuffmanOutputTooLarge;
-
-                    output[output_used] = entry.symbol.byte;
-                    output_used += 1;
-                    code = 0;
-                    code_bits = 0;
-                    found = true;
-                    break;
+                const symbol = decode_trie.nodes[node_index].symbol;
+                if (symbol == .none) {
+                    if (code_bits > 30) return error.InvalidHuffmanCode;
+                    continue;
                 }
+                if (symbol == .eos) return error.InvalidHuffmanCode;
+                if (output_used >= output.len) return error.HuffmanOutputTooLarge;
 
-                if (found) continue;
-                if (code_bits > 30) return error.InvalidHuffmanCode;
+                output[output_used] = symbol.byte().?;
+                output_used += 1;
+                node_index = 0;
+                code = 0;
+                code_bits = 0;
             }
         }
 

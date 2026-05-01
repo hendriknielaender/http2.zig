@@ -13,16 +13,43 @@ fn benchmarkHandler(ctx: *const http2.Context) !http2.Response {
         if (std.mem.eql(u8, ctx.path, "/")) {
             return ctx.response.text(.ok, "Hello, World!");
         }
+        if (std.mem.startsWith(u8, ctx.path, "/baseline2")) {
+            return baseline2Handler(ctx);
+        }
     }
 
     return ctx.response.text(.not_found, "Not Found");
 }
 
+/// HttpArena baseline-h2 contract: GET /baseline2?a=<i64>&b=<i64> -> sum.
+fn baseline2Handler(ctx: *const http2.Context) !http2.Response {
+    var a: i64 = 0;
+    var b: i64 = 0;
+
+    var query_iter = std.mem.splitScalar(u8, ctx.query, '&');
+    while (query_iter.next()) |param| {
+        if (param.len < 3) {
+            continue;
+        }
+        if (param[1] != '=') {
+            continue;
+        }
+
+        const value = std.fmt.parseInt(i64, param[2..], 10) catch 0;
+        switch (param[0]) {
+            'a' => a = value,
+            'b' => b = value,
+            else => {},
+        }
+    }
+
+    const written = try std.fmt.bufPrint(ctx.response_body_buffer, "{d}", .{a + b});
+    return ctx.response.text(.ok, written);
+}
+
 /// High-performance HTTP/2 over TLS benchmark server.
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const allocator = std.heap.smp_allocator;
 
     // Initialize http2 system
     try http2.init(allocator);
@@ -39,7 +66,7 @@ pub fn main() !void {
     // Configure server for benchmarking with high concurrency
     const config = tls_server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", port),
-        .dispatcher = http2.RequestDispatcher.fromHandler(benchmarkHandler),
+        .dispatcher = http2.RequestDispatcher.fromHandlerWithoutHeaders(benchmarkHandler),
         .max_connections = http2.memory_budget.MemBudget.max_conns,
     };
 

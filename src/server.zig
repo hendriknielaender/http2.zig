@@ -1,31 +1,78 @@
 //! HTTP/2 server transport built on the Zig standard library I/O stack.
-//!
-//! Zig 0.16.0's network-capable backend for Linux is `std.Io.Threaded`.
 
 const std = @import("std");
 
 const connection_module = @import("connection.zig");
 const handler = @import("handler.zig");
 const transport = @import("transport.zig");
+const http2 = @import("http2.zig");
+// Local fork of `std.Io.Kqueue` patched to compile against the current
+// `std.Io.VTable` shape. See `src/io/Kqueue.zig` for the rationale.
+const Kqueue = http2.Kqueue;
 
 const Connection = connection_module.Connection;
 const ServerStats = @import("http2.zig").ServerStats;
 const log = std.log.scoped(.server);
 
-const Backend = struct {
-    threaded: std.Io.Threaded,
+const Backend = if (http2.has_kqueue_backend) struct {
+    allocator: std.mem.Allocator,
+    evented: ?*Kqueue,
 
-    fn init(target: *Backend, allocator: std.mem.Allocator) !void {
-        target.* = .{
-            .threaded = std.Io.Threaded.init(allocator, .{
-                .argv0 = .empty,
-                .environ = .empty,
-            }),
+    fn init(allocator: std.mem.Allocator) Backend {
+        return .{
+            .allocator = allocator,
+            .evented = null,
         };
     }
 
+    fn start(self: *Backend) !void {
+        std.debug.assert(self.evented == null);
+
+        const evented = try self.allocator.create(Kqueue);
+        errdefer self.allocator.destroy(evented);
+
+        try evented.init(self.allocator, .{
+            .n_threads = null,
+        });
+        errdefer evented.deinit();
+
+        self.evented = evented;
+    }
+
     fn deinit(self: *Backend) void {
+        const evented = self.evented orelse return;
+
+        evented.deinit();
+        self.allocator.destroy(evented);
+        self.evented = null;
+    }
+
+    fn io(self: *Backend) std.Io {
+        return self.evented.?.io();
+    }
+} else struct {
+    allocator: std.mem.Allocator,
+    threaded: std.Io.Threaded,
+    started: bool,
+
+    fn init(allocator: std.mem.Allocator) Backend {
+        return .{
+            .allocator = allocator,
+            .threaded = undefined,
+            .started = false,
+        };
+    }
+
+    fn start(self: *Backend) !void {
+        std.debug.assert(!self.started);
+        self.threaded = .init(self.allocator, .{});
+        self.started = true;
+    }
+
+    fn deinit(self: *Backend) void {
+        if (!self.started) return;
         self.threaded.deinit();
+        self.started = false;
     }
 
     fn io(self: *Backend) std.Io {
@@ -40,11 +87,12 @@ pub const Server = struct {
     connection_slots: []ConnectionSlot,
     io_buffer_storage: []u8,
     running: std.atomic.Value(bool),
+    stop_requested: std.atomic.Value(bool),
     bound_port: std.atomic.Value(u16),
     listener_closed: std.atomic.Value(bool),
     listener: ?std.Io.net.Server,
     connection_group: std.Io.Group,
-    next_connection_slot: std.atomic.Value(u32),
+    next_connection_slot: u32,
     stats: Stats,
 
     const Self = @This();
@@ -80,10 +128,6 @@ pub const Server = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         assertConfig(config);
 
-        var backend: Backend = undefined;
-        try Backend.init(&backend, allocator);
-        errdefer backend.deinit();
-
         const io_buffer_storage = try allocator.alloc(u8, totalIoBufferBytes(config));
         errdefer allocator.free(io_buffer_storage);
 
@@ -97,28 +141,28 @@ pub const Server = struct {
 
         return .{
             .allocator = allocator,
-            .backend = backend,
+            .backend = Backend.init(allocator),
             .config = config,
             .connection_slots = connection_slots,
             .io_buffer_storage = io_buffer_storage,
             .running = .init(false),
+            .stop_requested = .init(false),
             .bound_port = .init(0),
             .listener_closed = .init(true),
             .listener = null,
             .connection_group = .init,
-            .next_connection_slot = .init(0),
+            .next_connection_slot = 0,
             .stats = Stats.init(),
         };
     }
 
     pub fn deinit(self: *Self) void {
-        const io = self.backend.io();
-
         if (self.running.load(.acquire)) {
             self.stop();
         }
 
         if (self.listener != null) {
+            const io = self.backend.io();
             self.cleanupListener(io);
         }
 
@@ -128,11 +172,15 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Self) !void {
+        try self.backend.start();
+        defer self.backend.deinit();
+
         const io = self.backend.io();
 
         std.debug.assert(self.listener == null);
         std.debug.assert(!self.running.load(.acquire));
 
+        self.stop_requested.store(false, .release);
         self.listener = try self.config.address.listen(io, .{
             .kernel_backlog = 4096,
             .reuse_address = true,
@@ -152,20 +200,29 @@ pub const Server = struct {
         const accept_result = self.runAcceptLoop(io);
         self.running.store(false, .release);
         self.connection_group.cancel(io);
-        try accept_result;
+        accept_result catch |err| {
+            if (self.stop_requested.load(.acquire)) return;
+            return err;
+        };
     }
 
     pub fn stop(self: *Self) void {
+        self.stop_requested.store(true, .release);
         self.running.store(false, .release);
 
-        if (self.listener == null) {
-            return;
+        if (self.listener) |listener| {
+            if (http2.has_kqueue_backend) {
+                if (!self.listener_closed.swap(true, .acq_rel)) {
+                    listener.socket.close(self.backend.io());
+                }
+            } else {
+                // `std.Io.net.Server.AcceptError` documents socket shutdown as the
+                // concurrent cancellation mechanism for a blocking accept. Closing
+                // the fd from this thread races with Linux accept4 and can surface
+                // as EBADF -> error.Unexpected in std.Io.Threaded.
+                _ = std.posix.system.shutdown(listener.socket.handle, std.posix.SHUT.RDWR);
+            }
         }
-        if (self.listener_closed.swap(true, .acq_rel)) {
-            return;
-        }
-
-        self.listener.?.socket.close(self.backend.io());
     }
 
     pub fn getStats(self: *const Self) ServerStats {
@@ -182,12 +239,23 @@ pub const Server = struct {
 
     fn runAcceptLoop(self: *Self, io: std.Io) !void {
         while (self.running.load(.acquire)) {
-            var stream = self.listener.?.accept(io) catch |err| switch (err) {
-                error.ConnectionAborted => continue,
-                error.SocketNotListening => break,
-                error.Canceled => break,
-                else => return err,
+            var stream = self.listener.?.accept(io) catch |err| {
+                if (self.stop_requested.load(.acquire) or
+                    !self.running.load(.acquire) or
+                    self.listener_closed.load(.acquire))
+                {
+                    break;
+                }
+
+                switch (err) {
+                    error.ConnectionAborted => continue,
+                    error.SocketNotListening => break,
+                    error.Canceled => break,
+                    else => return err,
+                }
             };
+
+            setTcpNoDelay(stream.socket.handle);
 
             const connection_slot = self.acquireConnectionSlot() orelse {
                 stream.close(io);
@@ -208,9 +276,8 @@ pub const Server = struct {
         stream: std.Io.net.Stream,
         connection_slot: *ConnectionSlot,
     ) !void {
-        // The threaded backend consumes a worker while a connection blocks in
-        // socket I/O, so a connection task requires concurrency rather than
-        // mere asynchrony.
+        // Use grouped concurrency so each accepted connection has independent
+        // cancellation and completion accounting inside the evented backend.
         try self.connection_group.concurrent(io, serveConnectionTask, .{
             self,
             stream,
@@ -220,26 +287,18 @@ pub const Server = struct {
 
     fn acquireConnectionSlot(self: *Self) ?*ConnectionSlot {
         const slot_count: u32 = @intCast(self.connection_slots.len);
-        var attempt_count: u32 = 0;
+        std.debug.assert(slot_count > 0);
 
-        while (attempt_count < slot_count) : (attempt_count += 1) {
-            const current_index = self.next_connection_slot.load(.acquire);
-            const next_index = if (current_index + 1 < slot_count)
-                current_index + 1
+        var probe_count: u32 = 0;
+        while (probe_count < slot_count) : (probe_count += 1) {
+            const slot_index = self.next_connection_slot;
+            self.next_connection_slot = if (slot_index + 1 < slot_count)
+                slot_index + 1
             else
                 0;
 
-            if (self.next_connection_slot.cmpxchgWeak(
-                current_index,
-                next_index,
-                .acq_rel,
-                .acquire,
-            ) != null) {
-                continue;
-            }
-
-            const connection_slot = &self.connection_slots[@as(usize, @intCast(current_index))];
-            if (connection_slot.in_use.cmpxchgWeak(false, true, .acq_rel, .acquire) != null) {
+            const connection_slot = &self.connection_slots[@as(usize, @intCast(slot_index))];
+            if (connection_slot.in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
                 continue;
             }
 
@@ -377,7 +436,17 @@ fn logListening(self: *const Server) void {
 }
 
 fn backendLabel() []const u8 {
-    return "std.Io.Threaded";
+    return "Kqueue";
+}
+
+fn setTcpNoDelay(fd: std.posix.fd_t) void {
+    const value: c_int = 1;
+    _ = std.posix.setsockopt(
+        fd,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        std.mem.asBytes(&value),
+    ) catch {};
 }
 
 fn logConnectionError(err: anyerror) void {
@@ -407,29 +476,42 @@ const ServerRunContext = struct {
 };
 
 fn waitForServerPort(server: *const Server) !u16 {
-    var spin_count: u32 = 0;
-
-    while (true) : (spin_count += 1) {
+    for (0..5 * std.time.ms_per_s) |_| {
         const port = server.listeningPort();
         if (port != 0) {
             return port;
         }
 
-        try std.testing.expect(spin_count < 10_000);
-        std.Thread.yield() catch {};
+        sleepOneMs();
     }
+
+    return error.TestUnexpectedResult;
 }
 
-fn waitForActiveConnection(server: *const Server) !void {
-    var spin_count: u32 = 0;
-
-    while (true) : (spin_count += 1) {
-        if (server.getStats().active_connections != 0) {
+fn waitForAcceptedConnection(server: *const Server) !void {
+    for (0..5 * std.time.ms_per_s) |_| {
+        if (server.getStats().total_connections != 0) {
             return;
         }
 
-        try std.testing.expect(spin_count < 10_000);
-        std.Thread.yield() catch {};
+        sleepOneMs();
+    }
+
+    return error.TestUnexpectedResult;
+}
+
+fn sleepOneMs() void {
+    var remaining: std.posix.timespec = .{
+        .sec = 0,
+        .nsec = std.time.ns_per_ms,
+    };
+
+    while (true) {
+        switch (std.posix.errno(std.posix.system.nanosleep(&remaining, &remaining))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return,
+        }
     }
 }
 
@@ -487,7 +569,7 @@ test "stop cancels idle async connections" {
         client_stream.close(io);
     };
 
-    try waitForActiveConnection(&server);
+    try waitForAcceptedConnection(&server);
 
     server.stop();
     server_thread.join();

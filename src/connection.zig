@@ -1,61 +1,7 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const os = std.os;
 const net = std.net;
 const posix = std.posix;
-const native_endian = builtin.cpu.arch.endian();
-const has_sse42 = blk: {
-    if (builtin.cpu.arch == .x86_64) {
-        break :blk std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_2);
-    }
-    break :blk false;
-};
-fn validate_preface_simd(preface: []const u8, expected: []const u8) bool {
-    if (comptime has_sse42) {
-        if (preface.len == 24) {
-            if (expected.len == 24) {
-                // Use SIMD for 24-byte preface comparison.
-                const preface_ptr: *const [24]u8 = @ptrCast(preface.ptr);
-                const expected_ptr: *const [24]u8 = @ptrCast(expected.ptr);
-
-                // Compare in 16-byte chunks using SIMD.
-                const preface_v1 = @as(@Vector(16, u8), preface_ptr[0..16].*);
-                const expected_v1 = @as(@Vector(16, u8), expected_ptr[0..16].*);
-                const eq1 = @reduce(.And, preface_v1 == expected_v1);
-
-                // Compare remaining 8 bytes.
-                const preface_v2 = @as(@Vector(8, u8), preface_ptr[16..24].*);
-                const expected_v2 = @as(@Vector(8, u8), expected_ptr[16..24].*);
-                const eq2 = @reduce(.And, preface_v2 == expected_v2);
-
-                return eq1 and eq2;
-            }
-        }
-    }
-
-    // Fallback to standard comparison.
-    return std.mem.eql(u8, preface, expected);
-}
-fn compare_header_name_simd(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    if (comptime has_sse42 and a.len >= 16) {
-        // Process 16-byte chunks with SIMD
-        var i: usize = 0;
-        while (i + 16 <= a.len) {
-            const a_chunk = @as(@Vector(16, u8), a[i .. i + 16].*);
-            const b_chunk = @as(@Vector(16, u8), b[i .. i + 16].*);
-            if (!@reduce(.And, a_chunk == b_chunk)) return false;
-            i += 16;
-        }
-        // Handle remaining bytes
-        while (i < a.len) {
-            if (a[i] != b[i]) return false;
-            i += 1;
-        }
-        return true;
-    }
-    return std.mem.eql(u8, a, b);
-}
 pub const Stream = @import("stream.zig").Stream;
 pub const DefaultStream = @import("stream.zig").DefaultStream;
 const transitionState = @import("stream.zig").transitionState;
@@ -78,6 +24,35 @@ const MAX_IN_FLIGHT_FRAMES = 64;
 const max_streams_per_connection = memory_budget.MemBudget.max_streams_per_conn;
 const max_frame_size_default = http2.max_frame_size_default;
 const log = std.log.scoped(.connection);
+
+// Open-addressed hash table for `stream_id -> stream_slot_index` lookup. Keeps
+// per-frame stream resolution at O(1) on the hot path instead of an O(N) scan
+// over the full stream slot array.
+//
+// Capacity must be a power of two and large enough that the table stays well
+// below 50% load with `max_streams_per_connection` live entries. This keeps
+// the average probe length under two for any reasonable hash. Stream IDs are
+// always > 0, so we use 0 as the "empty" sentinel and `0xff` as the unused
+// slot-index sentinel (slot indices are < `max_streams_per_connection`, <= 100).
+const stream_lookup_capacity: u32 = 256;
+const stream_lookup_mask: u32 = stream_lookup_capacity - 1;
+const stream_lookup_shift: u5 = 32 - 8; // log2(stream_lookup_capacity) = 8.
+const stream_slot_index_empty: u8 = std.math.maxInt(u8);
+
+comptime {
+    assert(@popCount(stream_lookup_capacity) == 1);
+    assert(stream_lookup_capacity >= max_streams_per_connection * 2);
+    assert(max_streams_per_connection < stream_slot_index_empty);
+    assert((@as(u32, 1) << @as(u5, 32 - @as(u32, stream_lookup_shift))) == stream_lookup_capacity);
+}
+
+// Knuth multiplicative hash; the constant is `floor(2^32 / phi)` and gives a
+// strong avalanche on the upper bits, which is exactly what we shift into the
+// table index. Cheap (one imul) and well-distributed for the sequential odd
+// stream IDs that dominate real traffic.
+inline fn streamLookupHash(stream_id: u32) u32 {
+    return (stream_id *% 0x9E3779B1) >> stream_lookup_shift;
+}
 const assert = std.debug.assert;
 const http2_preface: []const u8 = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const priority_frame_payload_size: usize = 5;
@@ -212,6 +187,11 @@ pub const Connection = struct {
         slots: [max_streams_per_connection]DefaultStream.StreamInstance,
         ids: [max_streams_per_connection]u32,
         in_use: [max_streams_per_connection]bool,
+        // O(1) lookup table mapping stream_id to an index into `slots`.
+        // `lookup_ids[i] == 0` marks an empty bucket; otherwise the entry maps
+        // `lookup_ids[i]` to `lookup_slot_indices[i]`.
+        lookup_ids: [stream_lookup_capacity]u32,
+        lookup_slot_indices: [stream_lookup_capacity]u8,
     };
     pub const PendingPriorityUpdate = struct {
         stream_id: u32 = 0,
@@ -234,6 +214,16 @@ pub const Connection = struct {
     // Keep hot lookup metadata compact so stream scans do not walk the full stream storage.
     stream_slot_ids: []u32,
     stream_slots_in_use: []bool,
+    // Live count of occupied stream slots. Maintained in lockstep with
+    // `stream_slots_in_use` so the per-frame `MAX_CONCURRENT_STREAMS` check
+    // is O(1); walking the slot array touches one cache line per 24 KiB
+    // stream struct, which dominated the new-stream path. The counter is a
+    // conservative upper bound: closed-but-not-yet-released streams count
+    // toward the limit until the next `flush_ready_streams` releases them.
+    stream_slots_in_use_count: u8 = 0,
+    // O(1) `stream_id -> slot_index` table; see `streamLookupHash` for layout.
+    stream_lookup_ids: []u32,
+    stream_lookup_slot_indices: []u8,
     owned_stream_storage: ?*StreamStorage = null,
     pending_stream_slots: [max_streams_per_connection]u8,
     pending_stream_queued: [max_streams_per_connection]bool,
@@ -262,6 +252,10 @@ pub const Connection = struct {
             .slots = undefined,
             .ids = [_]u32{0} ** max_streams_per_connection,
             .in_use = [_]bool{false} ** max_streams_per_connection,
+            // Empty bucket sentinel is `0` for ids (stream IDs are always > 0)
+            // and `stream_slot_index_empty` for slot indices.
+            .lookup_ids = [_]u32{0} ** stream_lookup_capacity,
+            .lookup_slot_indices = [_]u8{stream_slot_index_empty} ** stream_lookup_capacity,
         };
     }
 
@@ -286,6 +280,9 @@ pub const Connection = struct {
             .stream_slots = stream_storage.slots[0..],
             .stream_slot_ids = stream_storage.ids[0..],
             .stream_slots_in_use = stream_storage.in_use[0..],
+            .stream_slots_in_use_count = 0,
+            .stream_lookup_ids = stream_storage.lookup_ids[0..],
+            .stream_lookup_slot_indices = stream_storage.lookup_slot_indices[0..],
             .owned_stream_storage = null,
             .pending_stream_slots = undefined,
             .pending_stream_queued = [_]bool{false} ** max_streams_per_connection,
@@ -306,6 +303,8 @@ pub const Connection = struct {
         assert(target.stream_slots.len == max_streams_per_connection);
         assert(target.stream_slot_ids.len == max_streams_per_connection);
         assert(target.stream_slots_in_use.len == max_streams_per_connection);
+        assert(target.stream_lookup_ids.len == stream_lookup_capacity);
+        assert(target.stream_lookup_slot_indices.len == stream_lookup_capacity);
         if (frame_arena_storage) |storage| {
             target.frame_arena = initFrameArena(storage);
             target.frame_arena_available = true;
@@ -431,6 +430,8 @@ pub const Connection = struct {
             self.stream_slot_ids[stream_index] = 0;
             self.stream_slots_in_use[stream_index] = false;
         }
+        self.stream_slots_in_use_count = 0;
+        self.streamLookupReset();
         self.pending_stream_count = 0;
         self.pending_stream_queued = [_]bool{false} ** max_streams_per_connection;
         self.completed_responses_pending = 0;
@@ -456,18 +457,8 @@ pub const Connection = struct {
     }
 
     fn active_stream_count(self: *@This()) u32 {
-        var count: u32 = 0;
-
-        var stream_index: u32 = 0;
-        while (stream_index < max_streams_per_connection) : (stream_index += 1) {
-            if (!self.stream_slots_in_use[stream_index]) continue;
-
-            const stream_slot = &self.stream_slots[stream_index];
-            if (stream_slot.state == .Closed) continue;
-            count += 1;
-        }
-
-        return count;
+        assert(self.stream_slots_in_use_count <= max_streams_per_connection);
+        return self.stream_slots_in_use_count;
     }
 
     fn send_preface(self: *const @This()) !void {
@@ -478,17 +469,91 @@ pub const Connection = struct {
         return self.last_stream_id;
     }
 
+    // O(1) average lookup over the open-addressed hash table. Linear probing
+    // terminates at the first empty bucket because deletions backshift to keep
+    // the probe chain contiguous (see `streamLookupRemove`).
     fn streamFindIndex(self: *const @This(), stream_id: u32) ?u8 {
         assert(stream_id > 0);
 
-        var stream_index: u32 = 0;
-        while (stream_index < max_streams_per_connection) : (stream_index += 1) {
-            if (!self.stream_slots_in_use[stream_index]) continue;
-            if (self.stream_slot_ids[stream_index] != stream_id) continue;
-            return @intCast(stream_index);
+        var probe: u32 = streamLookupHash(stream_id);
+        var probes: u32 = 0;
+        while (probes < stream_lookup_capacity) : (probes += 1) {
+            const bucket_id = self.stream_lookup_ids[probe];
+            if (bucket_id == 0) return null;
+            if (bucket_id == stream_id) {
+                const slot_index = self.stream_lookup_slot_indices[probe];
+                assert(slot_index < max_streams_per_connection);
+                assert(self.stream_slots_in_use[slot_index]);
+                assert(self.stream_slot_ids[slot_index] == stream_id);
+                return slot_index;
+            }
+            probe = (probe + 1) & stream_lookup_mask;
+        }
+        // Load factor < 0.5 means a full sweep without finding an empty bucket
+        // is impossible; reaching here would mean the table is corrupt.
+        unreachable;
+    }
+
+    // Insert a `(stream_id, slot_index)` pair. Caller must guarantee
+    // `stream_id` is not already present in the table.
+    fn streamLookupInsert(self: *@This(), stream_id: u32, slot_index: u8) void {
+        assert(stream_id > 0);
+        assert(slot_index < max_streams_per_connection);
+
+        var probe: u32 = streamLookupHash(stream_id);
+        var probes: u32 = 0;
+        while (probes < stream_lookup_capacity) : (probes += 1) {
+            const bucket_id = self.stream_lookup_ids[probe];
+            assert(bucket_id != stream_id);
+            if (bucket_id == 0) {
+                self.stream_lookup_ids[probe] = stream_id;
+                self.stream_lookup_slot_indices[probe] = slot_index;
+                return;
+            }
+            probe = (probe + 1) & stream_lookup_mask;
+        }
+        // With at most `max_streams_per_connection` live entries and capacity
+        // at least 2x that, an insert can always find a free bucket.
+        unreachable;
+    }
+
+    // Remove `stream_id` and backshift any displaced followers to preserve the
+    // invariant that probing stops at the first empty bucket.
+    fn streamLookupRemove(self: *@This(), stream_id: u32) void {
+        assert(stream_id > 0);
+
+        var hole: u32 = streamLookupHash(stream_id);
+        var probes: u32 = 0;
+        while (self.stream_lookup_ids[hole] != stream_id) {
+            assert(self.stream_lookup_ids[hole] != 0);
+            hole = (hole + 1) & stream_lookup_mask;
+            probes += 1;
+            assert(probes < stream_lookup_capacity);
         }
 
-        return null;
+        var next: u32 = (hole + 1) & stream_lookup_mask;
+        while (self.stream_lookup_ids[next] != 0) {
+            const next_id = self.stream_lookup_ids[next];
+            const next_home = streamLookupHash(next_id);
+            // An entry at `next` can fill `hole` iff its home position lies
+            // outside the open interval `(hole, next]` cyclically, so its
+            // displacement from home reaches at least as far as the hole.
+            const displacement = (next -% next_home) & stream_lookup_mask;
+            const gap_distance = (next -% hole) & stream_lookup_mask;
+            if (displacement >= gap_distance) {
+                self.stream_lookup_ids[hole] = next_id;
+                self.stream_lookup_slot_indices[hole] = self.stream_lookup_slot_indices[next];
+                hole = next;
+            }
+            next = (next + 1) & stream_lookup_mask;
+        }
+        self.stream_lookup_ids[hole] = 0;
+        self.stream_lookup_slot_indices[hole] = stream_slot_index_empty;
+    }
+
+    fn streamLookupReset(self: *@This()) void {
+        @memset(self.stream_lookup_ids, 0);
+        @memset(self.stream_lookup_slot_indices, stream_slot_index_empty);
     }
 
     fn streamFind(self: *@This(), stream_id: u32) ?*DefaultStream.StreamInstance {
@@ -704,8 +769,11 @@ pub const Connection = struct {
 
         self.pendingStreamRemove(stream_index);
         stream.deinit();
+        self.streamLookupRemove(stream_id);
         self.stream_slot_ids[stream_index] = 0;
         self.stream_slots_in_use[stream_index] = false;
+        assert(self.stream_slots_in_use_count > 0);
+        self.stream_slots_in_use_count -= 1;
         log.debug("Released closed stream {d}\n", .{stream_id});
     }
 
@@ -744,6 +812,9 @@ pub const Connection = struct {
 
             self.stream_slot_ids[stream_index] = stream_id;
             self.stream_slots_in_use[stream_index] = true;
+            assert(self.stream_slots_in_use_count < max_streams_per_connection);
+            self.stream_slots_in_use_count += 1;
+            self.streamLookupInsert(stream_id, @intCast(stream_index));
             stream_slot.init(self, stream_id);
             if (self.pending_priority_update_take(stream_id)) |priority| {
                 stream_slot.applyPriority(priority);
@@ -781,19 +852,11 @@ pub const Connection = struct {
 
     pub fn receiveFrameStatic(self: *@This(), buffer: []u8) !Frame {
         if (buffer.len < 9) return error.BufferTooSmall;
-        const header_bytes = buffer[0..9];
-        var header_read: usize = 0;
-        while (header_read < 9) {
-            const bytes_read = try self.reader.readSliceShort(header_bytes[header_read..]);
-            if (bytes_read == 0) {
-                if (header_read == 0) {
-                    return error.UnexpectedEOF;
-                } else {
-                    return error.WouldBlock;
-                }
-            }
-            header_read += bytes_read;
-        }
+
+        const header_bytes = self.reader.peek(9) catch |err| switch (err) {
+            error.EndOfStream => return error.UnexpectedEOF,
+            error.ReadFailed => return error.ReadFailed,
+        };
 
         const parsed = SIMDFrameParser.parseFrameHeaderLenient(header_bytes) catch |err| {
             switch (err) {
@@ -814,19 +877,30 @@ pub const Connection = struct {
             try self.finishAfterGoaway();
             return error.FrameSizeError;
         }
-        if (parsed.length + 9 > buffer.len) return error.BufferTooSmall;
 
-        if (parsed.length > 0) {
-            const payload_buffer = buffer[9 .. 9 + parsed.length];
-            var payload_read: usize = 0;
-            while (payload_read < parsed.length) {
-                const bytes_read = try self.reader.readSliceShort(payload_buffer[payload_read..]);
-                if (bytes_read == 0) {
-                    return error.UnexpectedEOF;
-                }
-                payload_read += bytes_read;
-            }
-        }
+        const frame_size = parsed.length + 9;
+        if (frame_size > buffer.len) return error.BufferTooSmall;
+
+        // Take the entire frame from the per-connection reader buffer. The
+        // first `peek(9)` fills that buffer with as much data as the transport
+        // has ready, so pipelined frames are parsed from memory until the
+        // buffer drains instead of issuing one read for every 9-byte header and
+        // again for every payload.
+        const payload = if (frame_size <= self.reader.buffer.len) payload: {
+            const frame_bytes = self.reader.take(frame_size) catch |err| switch (err) {
+                error.EndOfStream => return error.UnexpectedEOF,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            break :payload if (parsed.length > 0) frame_bytes[9..frame_size] else &[_]u8{};
+        } else payload: {
+            self.reader.toss(9);
+            const payload_buffer = buffer[9..frame_size];
+            self.reader.readSliceAll(payload_buffer) catch |err| switch (err) {
+                error.EndOfStream => return error.UnexpectedEOF,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            break :payload payload_buffer;
+        };
 
         const frame_type = FrameType.fromU8(parsed.frame_type) orelse {
             log.debug("Received unknown frame type {} on stream {}, ignoring per RFC 9113", .{ parsed.frame_type, parsed.stream_id });
@@ -852,7 +926,7 @@ pub const Connection = struct {
                 .reserved = parsed.reserved,
                 .stream_id = parsed.stream_id,
             },
-            .payload = if (parsed.length > 0) buffer[9 .. 9 + parsed.length] else &[_]u8{},
+            .payload = payload,
         };
     }
 
@@ -1201,7 +1275,7 @@ pub const Connection = struct {
                 return err;
             };
             try self.flush_ready_streams();
-            try self.flush_output();
+            try self.flush_output_if_idle_or_full();
             if (frame.header.frame_type == FrameType.SETTINGS) {
                 if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
                     self.client_settings_received = true;
@@ -1253,7 +1327,15 @@ pub const Connection = struct {
                 return err;
             };
             try self.flush_ready_streams();
-            try self.flush_output();
+
+            // Coalesce TLS writes across pipelined requests. With h2load
+            // -m 100 the read buffer typically holds several complete frames
+            // when we get here; flushing per-frame turns each response into
+            // a separate SSL_write/TLS record (~22 bytes overhead each).
+            // Hold the flush until the read side drains *or* the writer is
+            // ~half full, then a single flush emits one TLS record covering
+            // multiple HEADERS+DATA frames.
+            try self.flush_output_if_idle_or_full();
 
             if (self.goaway_sent) {
                 if (self.goaway_received) {
@@ -1264,6 +1346,21 @@ pub const Connection = struct {
         }
         try self.flush_output();
         log.debug("SIMD-optimized connection handler terminated gracefully.", .{});
+    }
+
+    /// Flush only when there is no point holding the bytes back any longer:
+    /// either the inbound side has nothing buffered (so the next read will
+    /// block on the network and the peer is waiting for our reply), or the
+    /// writer has accumulated enough output that further coalescing wouldn't
+    /// fit in a single TLS record anyway.
+    const flush_coalesce_threshold: usize = 8 * 1024;
+
+    fn flush_output_if_idle_or_full(self: *@This()) !void {
+        const buffered_out = self.writer.buffered().len;
+        if (buffered_out == 0) return;
+        if (self.reader.bufferedLen() == 0 or buffered_out >= flush_coalesce_threshold) {
+            try self.flush_output();
+        }
     }
 
     fn finishAfterGoaway(self: *@This()) !void {
@@ -1318,7 +1415,7 @@ pub const Connection = struct {
                 try handle_stream_level_frame(self, frame);
             }
             try self.flush_ready_streams();
-            try self.flush_output();
+            try self.flush_output_if_idle_or_full();
 
             if (frame.header.frame_type == FrameType.SETTINGS) {
                 if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
@@ -1349,7 +1446,7 @@ pub const Connection = struct {
         }
 
         try self.flush_ready_streams();
-        try self.flush_output();
+        try self.flush_output_if_idle_or_full();
 
         if (frame.header.frame_type == FrameType.SETTINGS) {
             if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
@@ -1449,7 +1546,7 @@ pub const Connection = struct {
                 try self.handle_connection_original_phase_frames_stream_level(frame);
             }
             try self.flush_ready_streams();
-            try self.flush_output();
+            try self.flush_output_if_idle_or_full();
 
             if (self.goaway_sent and self.goaway_received) {
                 log.debug("Both GOAWAY sent and received, stopping frame processing.\n", .{});
@@ -1866,10 +1963,6 @@ pub const Connection = struct {
                 log.debug("Client closed the connection (UnexpectedEOF)\n", .{});
                 return error.UnexpectedEOF;
             },
-            error.WouldBlock => {
-                log.debug("Frame receive would block\n", .{});
-                return error.WouldBlock;
-            },
             else => {
                 log.err("Error receiving frame: {s}\n", .{@errorName(err)});
                 return err;
@@ -2023,16 +2116,41 @@ pub const Connection = struct {
         stream: *DefaultStream.StreamInstance,
     ) !handler.Response {
         const method = try self.requestMethod(stream);
-        var normalized_path_storage: [memory_budget.MemBudget.max_header_size]u8 = undefined;
-        const target = try self.requestTarget(stream, &normalized_path_storage);
+        const raw_target = stream.request_path orelse return error.MissingPath;
+        if (normalized_request_target(raw_target)) |target| {
+            return self.dispatch_request_target(request_dispatcher, stream, method, target);
+        }
+        return self.dispatch_request_slow(request_dispatcher, stream, method, raw_target);
+    }
+
+    fn dispatch_request_slow(
+        self: *@This(),
+        request_dispatcher: handler.RequestDispatcher,
+        stream: *DefaultStream.StreamInstance,
+        method: handler.Method,
+        raw_target: []const u8,
+    ) !handler.Response {
+        var path_storage: [memory_budget.MemBudget.max_header_size]u8 = undefined;
+        const target = try normalizeRequestTarget(raw_target, &path_storage);
+        return self.dispatch_request_target(request_dispatcher, stream, method, target);
+    }
+
+    fn dispatch_request_target(
+        self: *@This(),
+        request_dispatcher: handler.RequestDispatcher,
+        stream: *DefaultStream.StreamInstance,
+        method: handler.Method,
+        target: RequestTarget,
+    ) !handler.Response {
         var context = handler.Context.init(
             self.allocator,
             method,
             target.normalized_path,
             target.query,
+            stream.headers.items,
             stream.request_body_storage[0..stream.request_body_len],
+            stream.response_body_storage[0..],
         );
-        self.copyRequestHeaders(&context, stream);
 
         return request_dispatcher.call(&context) catch |err| {
             log.err("Request dispatcher failed on stream {d}: {s}\n", .{
@@ -2044,21 +2162,14 @@ pub const Connection = struct {
     }
 
     fn requestMethod(self: *@This(), stream: *DefaultStream.StreamInstance) !handler.Method {
-        const method_bytes = self.requestPseudoHeader(stream, ":method") orelse {
+        _ = self;
+        if (stream.request_method) |method| {
+            return method;
+        }
+        if (stream.request_method_bytes == null) {
             return error.MissingMethod;
-        };
-        return handler.Method.fromBytes(method_bytes) orelse error.UnsupportedMethod;
-    }
-
-    fn requestTarget(
-        self: *@This(),
-        stream: *DefaultStream.StreamInstance,
-        normalized_path_storage: []u8,
-    ) !RequestTarget {
-        const raw_target = self.requestPseudoHeader(stream, ":path") orelse {
-            return error.MissingPath;
-        };
-        return normalizeRequestTarget(raw_target, normalized_path_storage);
+        }
+        return error.UnsupportedMethod;
     }
 
     fn requestPseudoHeader(
@@ -2073,23 +2184,6 @@ pub const Connection = struct {
             }
         }
         return null;
-    }
-
-    fn copyRequestHeaders(
-        self: *@This(),
-        context: *handler.Context,
-        stream: *const DefaultStream.StreamInstance,
-    ) void {
-        _ = self;
-        for (stream.headers.items) |header_field| {
-            if (header_field.name.len == 0) {
-                continue;
-            }
-            if (header_field.name[0] == ':') {
-                continue;
-            }
-            context.headers.put(header_field.name, header_field.value);
-        }
     }
 
     fn simpleResponse(self: *@This(), status: handler.Status, body: []const u8) !handler.Response {
@@ -2110,14 +2204,16 @@ pub const Connection = struct {
             .{@intFromEnum(response.status)},
         );
 
-        try Hpack.encodeHeaderFieldWithoutIndexing(
+        try Hpack.encodeHeaderField(
             .{ .name = ":status", .value = status_code },
+            &self.hpack_encoder_table,
             &encoded,
             self.allocator,
         );
         for (response.headers()) |header_field| {
-            try Hpack.encodeHeaderFieldWithoutIndexing(
+            try Hpack.encodeHeaderField(
                 .{ .name = header_field.name, .value = header_field.value },
+                &self.hpack_encoder_table,
                 &encoded,
                 self.allocator,
             );
@@ -2144,8 +2240,8 @@ pub const Connection = struct {
     }
 
     fn shouldSuppressResponseBody(self: *@This(), stream: *DefaultStream.StreamInstance) bool {
-        const method = self.requestPseudoHeader(stream, ":method") orelse return false;
-        return std.mem.eql(u8, method, "HEAD");
+        _ = self;
+        return stream.request_method == .head;
     }
 
     fn streamResponseComplete(self: *@This(), stream: *const DefaultStream.StreamInstance) bool {
@@ -2888,6 +2984,69 @@ fn normalizeRequestTarget(
     };
 }
 
+fn normalized_request_target(raw_target: []const u8) ?RequestTarget {
+    const query_index = std.mem.indexOfScalar(u8, raw_target, '?') orelse raw_target.len;
+    const raw_path = raw_target[0..query_index];
+    if (!request_path_is_normalized(raw_path)) {
+        return null;
+    }
+
+    const query = if (query_index < raw_target.len)
+        raw_target[query_index + 1 ..]
+    else
+        "";
+
+    return .{
+        .normalized_path = raw_path,
+        .query = query,
+    };
+}
+
+fn request_path_is_normalized(raw_path: []const u8) bool {
+    if (raw_path.len == 0) {
+        return false;
+    }
+    if (raw_path[0] != '/') {
+        return false;
+    }
+
+    var segment_start: usize = 1;
+    var index: usize = 1;
+    while (index <= raw_path.len) : (index += 1) {
+        if (index < raw_path.len) {
+            const byte = raw_path[index];
+            if (byte == 0) {
+                return false;
+            }
+            if (byte == '%') {
+                return false;
+            }
+            if (byte != '/') {
+                continue;
+            }
+        }
+
+        if (request_path_segment_is_special(raw_path[segment_start..index])) {
+            return false;
+        }
+        segment_start = index + 1;
+    }
+
+    return true;
+}
+
+fn request_path_segment_is_special(segment: []const u8) bool {
+    if (segment.len == 1) {
+        return segment[0] == '.';
+    }
+    if (segment.len == 2) {
+        if (segment[0] == '.') {
+            return segment[1] == '.';
+        }
+    }
+    return false;
+}
+
 fn decodePathByte(raw_path: []const u8, source_index: *usize) !u8 {
     std.debug.assert(source_index.* < raw_path.len);
 
@@ -3238,7 +3397,7 @@ test "send RST_STREAM frame with correct frame_type" {
     try std.testing.expectEqual(written_data[initial_pos + 3], 3);
 }
 
-test "default response header encoding decodes without dynamic table churn" {
+test "default response header encoding uses dynamic table after first response" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -3251,6 +3410,7 @@ test "default response header encoding decodes without dynamic table churn" {
     var response = try connection.build_default_response();
     defer response.deinit();
     try connection.encode_response(stream, &response);
+    const first_header_block_len = stream.response_header_block_len;
 
     var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
     defer dynamic_table.deinit();
@@ -3280,7 +3440,29 @@ test "default response header encoding decodes without dynamic table churn" {
     }
 
     try std.testing.expectEqual(stream.response_header_block_len, offset);
-    try std.testing.expectEqual(@as(usize, 0), dynamic_table.count);
+    try std.testing.expect(dynamic_table.count > 0);
+
+    const second_stream = try connection.get_stream(3);
+    var second_response = try connection.build_default_response();
+    defer second_response.deinit();
+    try connection.encode_response(second_stream, &second_response);
+
+    try std.testing.expect(second_stream.response_header_block_len < first_header_block_len);
+}
+
+test "normalized request target fast path accepts canonical target" {
+    const target = normalized_request_target("/baseline2?a=1&b=2").?;
+
+    try std.testing.expectEqualStrings("/baseline2", target.normalized_path);
+    try std.testing.expectEqualStrings("a=1&b=2", target.query);
+}
+
+test "normalized request target fast path rejects slow-path targets" {
+    try std.testing.expect(normalized_request_target("") == null);
+    try std.testing.expect(normalized_request_target("baseline2?a=1") == null);
+    try std.testing.expect(normalized_request_target("/a/../b") == null);
+    try std.testing.expect(normalized_request_target("/a/%62") == null);
+    try std.testing.expect(normalized_request_target("/a/./b") == null);
 }
 
 test "flush_ready_streams reports completed responses once" {

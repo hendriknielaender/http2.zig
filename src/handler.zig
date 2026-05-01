@@ -4,6 +4,7 @@
 //! with zero-allocation patterns and optimal performance.
 
 const std = @import("std");
+const Hpack = @import("hpack.zig").Hpack;
 
 /// HTTP status codes commonly used in responses.
 pub const Status = enum(u16) {
@@ -122,6 +123,11 @@ pub const Context = struct {
     body: []const u8,
     response: ResponseBuilder,
     allocator: std.mem.Allocator,
+    // Pre-allocated scratch for the handler to format small response bodies
+    // into. Backed by stream-attached storage with stable address, so a slice
+    // returned via `Response.body` survives the dispatcher returning by value.
+    // Use `ctx.allocator` only when the body cannot fit here.
+    response_body_buffer: []u8,
 
     const Self = @This();
 
@@ -131,16 +137,20 @@ pub const Context = struct {
         method: Method,
         path: []const u8,
         query: []const u8,
+        headers: []const RequestHeader,
         body: []const u8,
+        response_body_buffer: []u8,
     ) Self {
+        std.debug.assert(response_body_buffer.len > 0);
         return Self{
             .method = method,
             .path = path,
             .query = query,
-            .headers = HeaderMap.init(),
+            .headers = HeaderMap.init(headers),
             .body = body,
             .response = ResponseBuilder.init(allocator),
             .allocator = allocator,
+            .response_body_buffer = response_body_buffer,
         };
     }
 
@@ -166,37 +176,21 @@ pub const Context = struct {
 };
 
 /// Simple header map for request headers.
-pub const HeaderMap = struct {
-    entries: [64]HeaderEntry,
-    count: u32,
+pub const RequestHeader = Hpack.HeaderField;
 
-    const HeaderEntry = struct {
-        name: []const u8,
-        value: []const u8,
-    };
+pub const HeaderMap = struct {
+    entries: []const RequestHeader,
 
     const Self = @This();
 
-    pub fn init() Self {
-        return Self{
-            .entries = std.mem.zeroes([64]HeaderEntry),
-            .count = 0,
-        };
-    }
-
-    pub fn put(self: *Self, name: []const u8, value: []const u8) void {
-        std.debug.assert(self.count < self.entries.len);
-        if (self.count >= self.entries.len) return;
-
-        self.entries[self.count] = HeaderEntry{
-            .name = name,
-            .value = value,
-        };
-        self.count += 1;
+    pub fn init(entries: []const RequestHeader) Self {
+        return .{ .entries = entries };
     }
 
     pub fn get(self: *const Self, name: []const u8) ?[]const u8 {
-        for (self.entries[0..self.count]) |entry| {
+        for (self.entries) |entry| {
+            if (entry.name.len == 0) continue;
+            if (entry.name[0] == ':') continue;
             if (std.ascii.eqlIgnoreCase(entry.name, name)) {
                 return entry.value;
             }
@@ -364,6 +358,7 @@ pub const RequestDispatcherFn = *const fn (
 pub const RequestDispatcher = struct {
     state: ?*const anyopaque,
     dispatch_fn: RequestDispatcherFn,
+    needs_headers: bool,
 
     const Self = @This();
 
@@ -375,6 +370,7 @@ pub const RequestDispatcher = struct {
         return .{
             .state = state,
             .dispatch_fn = dispatch_fn,
+            .needs_headers = true,
         };
     }
 
@@ -388,6 +384,21 @@ pub const RequestDispatcher = struct {
         return .{
             .state = null,
             .dispatch_fn = Adapter.dispatch,
+            .needs_headers = true,
+        };
+    }
+
+    pub fn fromHandlerWithoutHeaders(comptime handler: HandlerFn) Self {
+        const Adapter = struct {
+            fn dispatch(_: ?*const anyopaque, ctx: *const Context) anyerror!Response {
+                return handler(ctx);
+            }
+        };
+
+        return .{
+            .state = null,
+            .dispatch_fn = Adapter.dispatch,
+            .needs_headers = false,
         };
     }
 
@@ -410,6 +421,7 @@ pub const RequestDispatcher = struct {
         return .{
             .state = state,
             .dispatch_fn = Adapter.dispatch,
+            .needs_headers = true,
         };
     }
 
@@ -450,12 +462,16 @@ test "method bytes" {
 }
 
 test "header map operations" {
-    var headers = HeaderMap.init();
-    headers.put("content-type", "text/html");
-    headers.put("content-length", "1024");
+    const entries = [_]RequestHeader{
+        .{ .name = ":method", .value = "GET" },
+        .{ .name = "content-type", .value = "text/html" },
+        .{ .name = "content-length", .value = "1024" },
+    };
+    const headers = HeaderMap.init(&entries);
 
     try std.testing.expectEqualStrings("text/html", headers.get("content-type").?);
     try std.testing.expectEqualStrings("text/html", headers.get("Content-Type").?);
+    try std.testing.expect(headers.get(":method") == null);
     try std.testing.expect(headers.get("nonexistent") == null);
 }
 
@@ -469,7 +485,8 @@ test "request dispatcher wraps a stateless handler" {
     }.handler;
 
     const dispatcher = RequestDispatcher.fromHandler(test_handler);
-    var context = Context.init(allocator, .get, "/", "", "");
+    var body_scratch: [32]u8 = undefined;
+    var context = Context.init(allocator, .get, "/", "", &.{}, "", &body_scratch);
     var response = try dispatcher.call(&context);
     defer response.deinit();
 
@@ -490,7 +507,8 @@ test "request dispatcher binds typed state" {
 
     const app = App{ .body = "bound" };
     const dispatcher = RequestDispatcher.bind(App, &app, App.dispatch);
-    var context = Context.init(allocator, .get, "/", "", "");
+    var body_scratch: [32]u8 = undefined;
+    var context = Context.init(allocator, .get, "/", "", &.{}, "", &body_scratch);
     var response = try dispatcher.call(&context);
     defer response.deinit();
 

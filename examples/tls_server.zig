@@ -15,15 +15,83 @@ pub const Config = struct {
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
-    threaded: std.Io.Threaded,
+    backend: Backend,
     config: Config,
     acceptor: http2_boring.Acceptor,
+    connection_slots: []ConnectionSlot,
     connection_group: std.Io.Group,
     running: std.atomic.Value(bool),
     bound_port: std.atomic.Value(u16),
+    next_connection_slot: u32,
     stats: Stats,
 
     const Self = @This();
+
+    const Backend = if (http2.has_kqueue_backend) struct {
+        allocator: std.mem.Allocator,
+        evented: ?*http2.Kqueue,
+
+        fn init(allocator: std.mem.Allocator) Backend {
+            return .{
+                .allocator = allocator,
+                .evented = null,
+            };
+        }
+
+        fn start(self: *Backend) !void {
+            std.debug.assert(self.evented == null);
+
+            const evented = try self.allocator.create(http2.Kqueue);
+            errdefer self.allocator.destroy(evented);
+
+            try evented.init(self.allocator, .{
+                .n_threads = null,
+            });
+            errdefer evented.deinit();
+
+            self.evented = evented;
+        }
+
+        fn deinit(self: *Backend) void {
+            const evented = self.evented orelse return;
+
+            evented.deinit();
+            self.allocator.destroy(evented);
+            self.evented = null;
+        }
+
+        fn io(self: *Backend) std.Io {
+            return self.evented.?.io();
+        }
+    } else struct {
+        allocator: std.mem.Allocator,
+        threaded: std.Io.Threaded,
+        started: bool,
+
+        fn init(allocator: std.mem.Allocator) Backend {
+            return .{
+                .allocator = allocator,
+                .threaded = undefined,
+                .started = false,
+            };
+        }
+
+        fn start(self: *Backend) !void {
+            std.debug.assert(!self.started);
+            self.threaded = .init(self.allocator, .{});
+            self.started = true;
+        }
+
+        fn deinit(self: *Backend) void {
+            if (!self.started) return;
+            self.threaded.deinit();
+            self.started = false;
+        }
+
+        fn io(self: *Backend) std.Io {
+            return self.threaded.io();
+        }
+    };
 
     const Stats = struct {
         total_connections: std.atomic.Value(u64),
@@ -39,22 +107,16 @@ pub const Server = struct {
         }
     };
 
-    const ConnectionTask = struct {
-        server: *Self,
-        stream: std.Io.net.Stream,
+    const ConnectionSlot = struct {
+        in_use: std.atomic.Value(bool),
         stream_storage: http2.Connection.StreamStorage = undefined,
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         std.debug.assert(config.max_connections > 0);
+        std.debug.assert(config.max_connections <= 10000);
 
         boring.init();
-
-        var threaded = std.Io.Threaded.init(allocator, .{
-            .argv0 = .empty,
-            .environ = .empty,
-        });
-        errdefer threaded.deinit();
 
         var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
         defer builder.deinit();
@@ -66,25 +128,39 @@ pub const Server = struct {
         var acceptor = http2_boring.Acceptor.initWithBuilder(&builder);
         errdefer acceptor.deinit();
 
+        const connection_slots = try allocator.alloc(
+            ConnectionSlot,
+            @as(usize, @intCast(config.max_connections)),
+        );
+        errdefer allocator.free(connection_slots);
+
+        initConnectionSlots(connection_slots);
+
         return .{
             .allocator = allocator,
-            .threaded = threaded,
+            .backend = Backend.init(allocator),
             .config = config,
             .acceptor = acceptor,
+            .connection_slots = connection_slots,
             .connection_group = .init,
             .running = .init(false),
             .bound_port = .init(0),
+            .next_connection_slot = 0,
             .stats = Stats.init(),
         };
     }
 
     pub fn deinit(self: *Self) void {
+        self.backend.deinit();
+        self.allocator.free(self.connection_slots);
         self.acceptor.deinit();
-        self.threaded.deinit();
     }
 
     pub fn run(self: *Self) !void {
-        const io = self.threaded.io();
+        try self.backend.start();
+        defer self.backend.deinit();
+
+        const io = self.backend.io();
 
         var listener = try self.config.address.listen(io, .{
             .kernel_backlog = 4096,
@@ -112,29 +188,26 @@ pub const Server = struct {
                 else => return err,
             };
 
-            if (!self.reserveConnectionSlot()) {
+            const connection_slot = self.acquireConnectionSlot() orelse {
                 var stream_copy = stream;
                 stream_copy.close(io);
                 continue;
-            }
-
-            const task = self.allocator.create(ConnectionTask) catch |err| {
-                var stream_copy = stream;
-                stream_copy.close(io);
-                self.releaseConnectionSlot();
-                return err;
-            };
-            task.* = .{
-                .server = self,
-                .stream = stream,
             };
 
-            self.connection_group.concurrent(io, serveConnectionTask, .{task}) catch |err| {
+            self.connection_group.concurrent(io, serveConnectionTask, .{
+                self,
+                stream,
+                connection_slot,
+            }) catch |err| {
                 var stream_copy = stream;
                 stream_copy.close(io);
-                self.releaseConnectionSlot();
-                self.allocator.destroy(task);
-                return err;
+                self.releaseConnectionSlot(connection_slot);
+                switch (err) {
+                    error.ConcurrencyUnavailable => {
+                        log.warn("Rejected TLS connection: concurrency unavailable", .{});
+                        continue;
+                    },
+                }
             };
         }
     }
@@ -151,18 +224,33 @@ pub const Server = struct {
         return self.bound_port.load(.acquire);
     }
 
-    fn reserveConnectionSlot(self: *Self) bool {
-        const previous_active = self.stats.active_connections.fetchAdd(1, .acq_rel);
-        if (previous_active >= self.config.max_connections) {
-            _ = self.stats.active_connections.fetchSub(1, .acq_rel);
-            return false;
+    fn acquireConnectionSlot(self: *Self) ?*ConnectionSlot {
+        const slot_count: u32 = @intCast(self.connection_slots.len);
+        std.debug.assert(slot_count > 0);
+
+        var probe_count: u32 = 0;
+        while (probe_count < slot_count) : (probe_count += 1) {
+            const slot_index = self.next_connection_slot;
+            self.next_connection_slot = if (slot_index + 1 < slot_count)
+                slot_index + 1
+            else
+                0;
+
+            const connection_slot = &self.connection_slots[@as(usize, @intCast(slot_index))];
+            if (connection_slot.in_use.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) {
+                continue;
+            }
+
+            _ = self.stats.active_connections.fetchAdd(1, .acq_rel);
+            _ = self.stats.total_connections.fetchAdd(1, .acq_rel);
+            return connection_slot;
         }
 
-        _ = self.stats.total_connections.fetchAdd(1, .acq_rel);
-        return true;
+        return null;
     }
 
-    fn releaseConnectionSlot(self: *Self) void {
+    fn releaseConnectionSlot(self: *Self, connection_slot: *ConnectionSlot) void {
+        connection_slot.in_use.store(false, .release);
         _ = self.stats.active_connections.fetchSub(1, .acq_rel);
     }
 
@@ -171,19 +259,21 @@ pub const Server = struct {
         _ = self.stats.requests_processed.fetchAdd(completed_responses, .acq_rel);
     }
 
-    fn serveConnectionTask(task: *ConnectionTask) std.Io.Cancelable!void {
-        const server = task.server;
-        const io = server.threaded.io();
+    fn serveConnectionTask(
+        server: *Self,
+        stream: std.Io.net.Stream,
+        connection_slot: *ConnectionSlot,
+    ) std.Io.Cancelable!void {
+        const io = server.backend.io();
 
         defer {
-            server.releaseConnectionSlot();
-            server.allocator.destroy(task);
+            server.releaseConnectionSlot(connection_slot);
         }
 
         var connection: http2_boring.Connection = .{};
         defer connection.deinit(io);
 
-        server.acceptor.accept(&connection, io, task.stream) catch |err| {
+        server.acceptor.accept(&connection, io, stream) catch |err| {
             logConnectionError(err);
             return;
         };
@@ -197,7 +287,7 @@ pub const Server = struct {
             connection.writer(),
             .{
                 .dispatcher = server.config.dispatcher,
-                .stream_storage = &task.stream_storage,
+                .stream_storage = &connection_slot.stream_storage,
                 .completed_responses_out = &completed_responses,
             },
         ) catch |err| {
@@ -206,6 +296,16 @@ pub const Server = struct {
         };
     }
 };
+
+fn initConnectionSlots(connection_slots: []Server.ConnectionSlot) void {
+    std.debug.assert(connection_slots.len > 0);
+
+    for (connection_slots) |*connection_slot| {
+        connection_slot.* = .{
+            .in_use = .init(false),
+        };
+    }
+}
 
 fn logConnectionError(err: anyerror) void {
     switch (err) {

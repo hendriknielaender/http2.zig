@@ -101,6 +101,13 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
         const HeaderBufferSize = memory_budget.MemBudget.max_header_size;
         const HeaderCountMax = 64;
 
+        // Per-stream scratch the dispatcher can format small response bodies
+        // into without touching the heap. 256 bytes covers numeric, status, or
+        // short text replies (the hot benchmark path); larger payloads must
+        // continue to use the request allocator. Sizing is a compile-time
+        // tradeoff between covering the common case and per-connection memory.
+        const ResponseBodyStorageSize: usize = 256;
+
         // Static memory allocation for streams
         const StreamPool = struct {
             streams: [MaxStreamCount]?*Self.StreamInstance = [_]?*Self.StreamInstance{null} ** MaxStreamCount,
@@ -156,9 +163,16 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             headers_storage: [HeaderCountMax]Hpack.HeaderField,
             headers: std.ArrayList(Hpack.HeaderField),
             content_length: ?usize,
+            request_method_bytes: ?[]const u8,
+            request_method: ?handler.Method,
+            request_path: ?[]const u8,
             total_data_received: usize,
             request_body_storage: [memory_budget.MemBudget.max_data_buffer]u8,
             request_body_len: usize,
+            // Scratch the request handler formats small response bodies into,
+            // owned by the stream so the body slice on `response` stays valid
+            // until the stream slot is released. See `ResponseBodyStorageSize`.
+            response_body_storage: [ResponseBodyStorageSize]u8,
             request_headers_complete: bool,
             request_complete: bool,
             response: ?handler.Response,
@@ -199,9 +213,13 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     .headers_storage = undefined,
                     .headers = .empty,
                     .content_length = null,
+                    .request_method_bytes = null,
+                    .request_method = null,
+                    .request_path = null,
                     .total_data_received = 0,
                     .request_body_storage = undefined,
                     .request_body_len = 0,
+                    .response_body_storage = undefined,
                     .request_headers_complete = false,
                     .request_complete = false,
                     .response = null,
@@ -246,6 +264,9 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 }
                 self.response = null;
                 self.headers.clearRetainingCapacity();
+                self.request_method_bytes = null;
+                self.request_method = null;
+                self.request_path = null;
                 self.request_headers_complete = false;
                 self.cleaned_up = true;
             }
@@ -736,6 +757,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 const header_block = self.header_block_fragments_buf[0..self.header_block_fragments_len];
                 var cursor: usize = 0;
                 var saw_header_field = false;
+                var pseudo_headers = RequestPseudoHeaders{};
+                var priority_header_seen = false;
 
                 self.headers.clearRetainingCapacity();
                 self.headers_bytes_len = 0;
@@ -755,13 +778,20 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     // Filter out empty headers from HPACK dynamic table size updates.
                     if (decoded_header.header.name.len > 0) {
                         saw_header_field = true;
-                        if (self.headers.items.len >= self.headers.capacity) {
-                            log.err("Too many headers: INTERNAL_ERROR\n", .{});
-                            try self.sendRstStream(0x2);
-                            return error.TooManyHeaders;
+
+                        if (self.request_headers_complete) {
+                            try self.validateTrailerHeader(decoded_header.header);
+                        } else {
+                            try self.validateRequestHeader(
+                                decoded_header.header,
+                                &pseudo_headers,
+                                &priority_header_seen,
+                            );
                         }
 
-                        try self.storeHeader(decoded_header.header);
+                        if (self.shouldStoreRequestHeaders()) {
+                            try self.storeHeader(decoded_header.header);
+                        }
                     } else if (saw_header_field) {
                         try self.conn.send_goaway(0, 0x09, "Compression Error: COMPRESSION_ERROR");
                         return error.CompressionError;
@@ -770,15 +800,21 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     cursor += decoded_header.bytes_consumed;
                 }
 
-                if (self.request_headers_complete) {
-                    try self.validateTrailers(self.headers.items);
-                } else {
-                    try self.validateHeaders(self.headers.items);
-                    self.request_headers_complete = true;
+                if (!self.request_headers_complete) {
+                    try self.finishRequestHeaders(
+                        &pseudo_headers,
+                        priority_header_seen,
+                    );
                 }
             }
 
             fn storeHeader(self: *Self.StreamInstance, header: Hpack.HeaderField) !void {
+                if (self.headers.items.len >= self.headers.capacity) {
+                    log.err("Too many headers: INTERNAL_ERROR\n", .{});
+                    try self.sendRstStream(0x2);
+                    return error.TooManyHeaders;
+                }
+
                 const total_len = header.name.len + header.value.len;
                 if (self.headers_bytes_len + total_len > self.headers_bytes_storage.len) {
                     return error.HeadersTooLarge;
@@ -805,6 +841,11 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     .name = self.headers_bytes_storage[name_start..name_end],
                     .value = self.headers_bytes_storage[value_start..value_end],
                 });
+            }
+
+            fn shouldStoreRequestHeaders(self: *const Self.StreamInstance) bool {
+                const request_dispatcher = self.conn.request_dispatcher orelse return true;
+                return request_dispatcher.needs_headers;
             }
 
             const RequestPseudoHeaders = struct {
@@ -867,30 +908,77 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 var priority_header_seen = false;
 
                 for (headers) |header| {
-                    if (header.name.len == 0) {
-                        try self.fail_protocol_error("Empty header name");
-                    }
-
-                    if (header.name[0] == ':') {
-                        pseudo_headers.add(header) catch {
-                            try self.fail_protocol_error("Invalid pseudo-header field");
-                        };
-                        continue;
-                    }
-
-                    pseudo_headers.markRegularHeader();
-                    try self.validateRegularHeader(header);
-                    try self.validateContentLength(header);
-                    if (self.applyPriorityHeader(header)) {
-                        priority_header_seen = true;
-                    }
+                    try self.validateRequestHeader(
+                        header,
+                        &pseudo_headers,
+                        &priority_header_seen,
+                    );
                 }
 
+                try self.finishRequestHeaders(
+                    &pseudo_headers,
+                    priority_header_seen,
+                );
+            }
+
+            fn validateRequestHeader(
+                self: *Self.StreamInstance,
+                header: Hpack.HeaderField,
+                pseudo_headers: *RequestPseudoHeaders,
+                priority_header_seen: *bool,
+            ) !void {
+                if (header.name.len == 0) {
+                    try self.fail_protocol_error("Empty header name");
+                }
+
+                if (header.name[0] == ':') {
+                    const value_stable = try self.storeHeaderValue(header.value);
+                    pseudo_headers.add(.{
+                        .name = header.name,
+                        .value = value_stable,
+                    }) catch {
+                        try self.fail_protocol_error("Invalid pseudo-header field");
+                    };
+                    return;
+                }
+
+                pseudo_headers.markRegularHeader();
+                try self.validateRegularHeader(header);
+                try self.validateContentLength(header);
+                if (self.applyPriorityHeader(header)) {
+                    priority_header_seen.* = true;
+                }
+            }
+
+            fn storeHeaderValue(
+                self: *Self.StreamInstance,
+                value: []const u8,
+            ) ![]const u8 {
+                if (self.headers_bytes_len + value.len > self.headers_bytes_storage.len) {
+                    return error.HeadersTooLarge;
+                }
+
+                const start = self.headers_bytes_len;
+                const end = start + value.len;
+                std.mem.copyForwards(u8, self.headers_bytes_storage[start..end], value);
+                self.headers_bytes_len = end;
+                return self.headers_bytes_storage[start..end];
+            }
+
+            fn finishRequestHeaders(
+                self: *Self.StreamInstance,
+                pseudo_headers: *const RequestPseudoHeaders,
+                priority_header_seen: bool,
+            ) !void {
                 pseudo_headers.validateRequest() catch {
                     try self.fail_protocol_error("Invalid request pseudo-header fields");
                 };
+                self.request_method_bytes = pseudo_headers.method;
+                self.request_method = handler.Method.fromBytes(pseudo_headers.method.?);
+                self.request_path = pseudo_headers.path;
+                self.request_headers_complete = true;
                 self.applyDefaultRequestPriority(
-                    &pseudo_headers,
+                    pseudo_headers,
                     priority_header_seen,
                 );
             }
@@ -924,16 +1012,20 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
             fn validateTrailers(self: *Self.StreamInstance, headers: []const Hpack.HeaderField) !void {
                 for (headers) |header| {
-                    if (header.name.len == 0) {
-                        try self.fail_protocol_error("Empty trailer header name");
-                    }
-                    if (header.name[0] == ':') {
-                        try self.fail_protocol_error("Pseudo-header field in trailers");
-                    }
-
-                    try self.validateRegularHeader(header);
-                    try self.validateContentLength(header);
+                    try self.validateTrailerHeader(header);
                 }
+            }
+
+            fn validateTrailerHeader(self: *Self.StreamInstance, header: Hpack.HeaderField) !void {
+                if (header.name.len == 0) {
+                    try self.fail_protocol_error("Empty trailer header name");
+                }
+                if (header.name[0] == ':') {
+                    try self.fail_protocol_error("Pseudo-header field in trailers");
+                }
+
+                try self.validateRegularHeader(header);
+                try self.validateContentLength(header);
             }
 
             fn fail_protocol_error(self: *Self.StreamInstance, message: []const u8) !noreturn {
