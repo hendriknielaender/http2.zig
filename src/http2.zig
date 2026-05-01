@@ -9,17 +9,11 @@
 //! - 190k+ requests per second performance
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 // Local fork of `std.Io.Kqueue` (see `src/io/Kqueue.zig`). Re-exported so
 // out-of-tree modules (e.g. `examples/tls_server.zig`) consume the same
 // patched backend as the in-tree HTTP/2 server.
-pub const has_kqueue_backend = switch (builtin.os.tag) {
-    .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
-    else => false,
-};
-
-pub const Kqueue = if (has_kqueue_backend) @import("io/Kqueue.zig") else opaque {};
+pub const Kqueue = @import("io/Kqueue.zig");
 
 // Core HTTP/2 Protocol Components
 pub const Connection = @import("connection.zig").Connection;
