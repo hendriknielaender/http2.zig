@@ -216,10 +216,6 @@ pub const Server = struct {
                     listener.socket.close(self.backend.io());
                 }
             } else {
-                // `std.Io.net.Server.AcceptError` documents socket shutdown as the
-                // concurrent cancellation mechanism for a blocking accept. Closing
-                // the fd from this thread races with Linux accept4 and can surface
-                // as EBADF -> error.Unexpected in std.Io.Threaded.
                 _ = std.posix.system.shutdown(listener.socket.handle, std.posix.SHUT.RDWR);
             }
         }

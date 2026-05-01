@@ -202,12 +202,7 @@ pub const Server = struct {
                 var stream_copy = stream;
                 stream_copy.close(io);
                 self.releaseConnectionSlot(connection_slot);
-                switch (err) {
-                    error.ConcurrencyUnavailable => {
-                        log.warn("Rejected TLS connection: concurrency unavailable", .{});
-                        continue;
-                    },
-                }
+                return err;
             };
         }
     }

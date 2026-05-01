@@ -108,16 +108,14 @@ for c in $CONNECTIONS; do
     # The status-codes line is:
     #   "status codes: N 2xx, N 3xx, N 4xx, N 5xx"  -> $3, $5, $7, $9
     # Latency line varies by h2load version:
-    #   newer:  "time for request:   min  max  mean  sd  +/- sd  ..."
-    #   older:  "request     :   min  max  median  p95  p99  mean  sd  +/- sd"
-    # We grab mean and p99 from whichever shape is present.
-    duration=$(awk '/^finished in/{gsub(/s,?$/,"",$3); print $3; exit}' <<<"$out")
-    bw=$(awk      '/^finished in/{print $(NF); exit}' <<<"$out")
-    ok=$(awk      '/status codes:/{print $3; exit}' <<<"$out")
-    s4=$(awk      '/status codes:/{print $7; exit}' <<<"$out")
-    s5=$(awk      '/status codes:/{print $9; exit}' <<<"$out")
+    #   v1.59+  "time for request:   min  max  mean  sd  +/-sd"
+    #   older:  "request     :   min  max  median  p95  p99  mean  sd  +/-sd"
     avg=$(awk     '/time for request:/{print $6; exit} /^request +:/{print $8; exit}' <<<"$out")
-    p99=$(awk     '/time for request:/{print $9; exit} /^request +:/{print $7; exit}' <<<"$out")
+    max_lat=$(awk     '/time for request:/{print $5; exit} /^request +:/{print $4; exit}' <<<"$out")
+    p99=$(awk     '/^request +:/{print $7; exit}' <<<"$out")
+    if [[ -z "${p99:-}" ]]; then
+        p99="${max_lat:-0ms}"
+    fi
     rps=$(awk -v ok="${ok:-0}" -v dur="${duration:-1}" \
         'BEGIN { if (dur+0 > 0) printf "%d", ok/dur; else print 0 }')
 

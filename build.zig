@@ -8,6 +8,13 @@
 
 const std = @import("std");
 
+const CiDeps = struct {
+    fmt_check: ?*std.Build.Step = null,
+    @"test": ?*std.Build.Step = null,
+    dst: ?*std.Build.Step = null,
+    dpt_compare: ?*std.Build.Step = null,
+};
+
 // Project metadata
 const project_name = "http2";
 const project_version = "0.0.6";
@@ -85,6 +92,8 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(http2_lib);
 
+    var ci = CiDeps{};
+
     // Example applications
     add_examples(
         b,
@@ -105,15 +114,82 @@ pub fn build(b: *std.Build) void {
         boringssl_source_path,
         boringssl_lib_path,
     );
+    add_simulators(b, target, optimize, &ci);
 
     // Test suite
-    add_tests(b, target, optimize);
+    add_tests(b, target, optimize, &ci);
 
     // Documentation
     add_documentation(b, http2_lib);
 
     // Code quality checks
-    add_code_quality_checks(b);
+    add_code_quality_checks(b, &ci);
+
+    // CI orchestration
+    add_ci(b, ci);
+}
+
+/// Add deterministic simulation and deterministic performance test runners.
+fn add_simulators(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    ci: *CiDeps,
+) void {
+    const sim_module = b.createModule(.{
+        .root_source_file = b.path("src/http2_sim.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const sim_exe = b.addExecutable(.{
+        .name = "http2_sim",
+        .root_module = sim_module,
+    });
+    b.installArtifact(sim_exe);
+
+    const run_dst = b.addRunArtifact(sim_exe);
+    run_dst.addArg("--dst");
+    if (b.args) |args| run_dst.addArgs(args);
+    hide_stderr(run_dst);
+    const dst_step = b.step("dst", "Run deterministic HTTP/2 simulation testing");
+    dst_step.dependOn(&run_dst.step);
+    ci.dst = dst_step;
+
+    const run_dst_swarm = b.addRunArtifact(sim_exe);
+    run_dst_swarm.addArg("--dst");
+    run_dst_swarm.addArg("--swarm");
+    if (b.args) |args| run_dst_swarm.addArgs(args);
+    hide_stderr(run_dst_swarm);
+    const dst_swarm_step = b.step("dst-swarm", "Run deterministic HTTP/2 swarm simulation testing");
+    dst_swarm_step.dependOn(&run_dst_swarm.step);
+
+    const run_dpt = b.addRunArtifact(sim_exe);
+    run_dpt.addArg("--dpt");
+    run_dpt.addArg("--profile=hpack_pressure");
+    if (b.args) |args| run_dpt.addArgs(args);
+    hide_stderr(run_dpt);
+    const dpt_step = b.step("dpt", "Run deterministic HTTP/2 performance testing");
+    dpt_step.dependOn(&run_dpt.step);
+
+    const run_dpt_baseline = b.addRunArtifact(sim_exe);
+    run_dpt_baseline.addArg("--dpt");
+    run_dpt_baseline.addArg("--dpt-baseline");
+    run_dpt_baseline.addArg("--profile=hpack_pressure");
+    if (b.args) |args| run_dpt_baseline.addArgs(args);
+    hide_stderr(run_dpt_baseline);
+    const dpt_baseline_step = b.step("dpt-baseline", "Print deterministic HTTP/2 performance baseline");
+    dpt_baseline_step.dependOn(&run_dpt_baseline.step);
+
+    const run_dpt_compare = b.addRunArtifact(sim_exe);
+    run_dpt_compare.addArg("--dpt");
+    run_dpt_compare.addArg("--dpt-compare");
+    run_dpt_compare.addArg("--profile=hpack_pressure");
+    if (b.args) |args| run_dpt_compare.addArgs(args);
+    hide_stderr(run_dpt_compare);
+    const dpt_compare_step = b.step("dpt-compare", "Compare deterministic HTTP/2 performance against thresholds");
+    dpt_compare_step.dependOn(&run_dpt_compare.step);
+    ci.dpt_compare = dpt_compare_step;
 }
 
 /// Add example applications
@@ -366,6 +442,7 @@ fn add_tests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    ci: *CiDeps,
 ) void {
     // Unit tests for core modules
     const test_modules = [_][]const u8{
@@ -380,9 +457,17 @@ fn add_tests(
         "src/memory_budget.zig",
         "src/server.zig",
         "src/transport.zig",
+        "src/testing/prng.zig",
+        "src/testing/time_sim.zig",
+        "src/testing/packet_simulator.zig",
+        "src/testing/network_sim.zig",
+        "src/testing/cluster_sim.zig",
+        "src/http2_sim.zig",
+        "src/http2_cluster_sim.zig",
     };
 
     var all_tests_step = b.step("test", "Run all unit tests");
+    ci.@"test" = all_tests_step;
 
     for (test_modules) |module_path| {
         const test_module = b.createModule(.{
@@ -412,8 +497,58 @@ fn add_documentation(b: *std.Build, http2_lib: *std.Build.Step.Compile) void {
     docs_step.dependOn(&docs.step);
 }
 
+fn add_ci(b: *std.Build, ci: CiDeps) void {
+    const step_ci = b.step("ci", "Run the full suite of CI checks");
+
+    const CIMode = enum { smoke, @"test", full };
+
+    const mode: CIMode = if (b.args) |args| mode: {
+        if (args.len != 1) {
+            step_ci.dependOn(&b.addFail("usage: zig build ci -- <smoke|test|full>").step);
+            return;
+        }
+        break :mode std.meta.stringToEnum(CIMode, args[0]) orelse {
+            step_ci.dependOn(&b.addFail("usage: zig build ci -- <smoke|test|full>").step);
+            return;
+        };
+    } else .@"test";
+
+    const all = mode == .full;
+    const default = all or mode == .@"test";
+
+    if (all or mode == .smoke or default) {
+        step_ci.dependOn(ci.fmt_check.?);
+        step_ci.dependOn(ci.dst.?);
+    }
+    if (default or all) {
+        step_ci.dependOn(ci.@"test".?);
+        step_ci.dependOn(ci.dpt_compare.?);
+    }
+}
+
+// Hide a step's stderr unless it fails, keeping CI output clean.
+fn hide_stderr(run: *std.Build.Step.Run) void {
+    const b = run.step.owner;
+    run.addCheck(.{ .expect_term = .{ .exited = 0 } });
+    run.has_side_effects = true;
+
+    const Override = struct {
+        var global_map: std.AutoHashMapUnmanaged(usize, std.Build.Step.MakeFn) = .{};
+
+        fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+            const original = global_map.get(@intFromPtr(step)).?;
+            try original(step, options);
+            step.result_stderr = "";
+        }
+    };
+
+    const original = run.step.makeFn;
+    Override.global_map.put(b.allocator, @intFromPtr(&run.step), original) catch @panic("OOM");
+    run.step.makeFn = &Override.make;
+}
+
 /// Add code quality and formatting checks
-fn add_code_quality_checks(b: *std.Build) void {
+fn add_code_quality_checks(b: *std.Build, ci: *CiDeps) void {
     // Format check
     const fmt_check = b.addFmt(.{
         .paths = &[_][]const u8{
@@ -426,6 +561,7 @@ fn add_code_quality_checks(b: *std.Build) void {
     });
     const fmt_check_step = b.step("fmt-check", "Check code formatting");
     fmt_check_step.dependOn(&fmt_check.step);
+    ci.fmt_check = fmt_check_step;
 
     // Format fix
     const fmt_fix = b.addFmt(.{
