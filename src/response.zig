@@ -141,13 +141,6 @@ pub const ResponseWriter = struct {
     }
 };
 
-/// Convenience functions that operate on a `StreamInstance` through its
-/// `response_writer` field.  These remain because the per-connection
-/// flush path still drives response I/O via stream pointers.
-pub fn shouldSuppressResponseBody(stream: *const StreamInstanceType) bool {
-    return stream.request_method == .head;
-}
-
 pub fn streamResponseComplete(stream: *const StreamInstanceType) bool {
     if (stream.state == .Closed) return true;
     return stream.response_writer.isComplete();

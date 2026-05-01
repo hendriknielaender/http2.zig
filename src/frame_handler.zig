@@ -35,7 +35,7 @@ comptime {
     assert(settings_no_rfc7540_priorities_id == 0x9);
 }
 
-pub const FrameHandler = enum(u8) {
+const FrameHandler = enum(u8) {
     data = @intFromEnum(FrameType.DATA),
     headers = @intFromEnum(FrameType.HEADERS),
     priority = @intFromEnum(FrameType.PRIORITY),

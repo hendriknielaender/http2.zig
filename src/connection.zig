@@ -1,7 +1,4 @@
 const std = @import("std");
-const os = std.os;
-const net = std.net;
-const posix = std.posix;
 pub const Stream = @import("stream.zig").Stream;
 pub const DefaultStream = @import("stream.zig").DefaultStream;
 pub const Frame = @import("frame.zig").Frame;
@@ -9,7 +6,6 @@ pub const FrameHeader = @import("frame.zig").FrameHeader;
 pub const FrameFlags = @import("frame.zig").FrameFlags;
 pub const FrameType = @import("frame.zig").FrameType;
 const SIMDFrameParser = @import("simd_frame_parser.zig").SIMDFrameParser;
-pub const FrameTypes = @import("frame.zig");
 pub const Hpack = @import("hpack.zig").Hpack;
 const handler = @import("handler.zig");
 const resp = @import("response.zig");
@@ -55,74 +51,6 @@ comptime {
 }
 
 const RequestTarget = @import("path.zig").RequestTarget;
-pub const Config = struct {
-    // Socket options - configured at comptime for zero-cost abstractions
-    pub const SocketOpts = struct {
-        reuse_port: bool = true,
-        no_delay: bool = true,
-        fast_open: bool = true,
-        quick_ack: bool = true,
-        defer_accept: bool = true,
-        recv_buffer_size: u32 = 1024 * 1024, // 1MB
-        send_buffer_size: u32 = 1024 * 1024, // 1MB
-    };
-    // Event loop configuration
-    pub const EventLoop = struct {
-        max_events: u32 = 1024,
-        timeout_ms: i32 = 1000,
-        batch_accept_size: u32 = 32,
-    };
-    // Static allocation sizes
-    pub const StaticSizes = struct {
-        max_connections: u32 = 10000,
-        frame_buffer_size: u32 = 64 * 1024, // 64KB
-        header_buffer_size: u32 = 8 * 1024, // 8KB
-    };
-};
-pub fn setSockopts(comptime opts: Config.SocketOpts) type {
-    return struct {
-        pub fn apply(socket: os.socket_t) anyerror!void {
-            if (opts.reuse_port) {
-                try os.setsockopt(socket, os.SOL.SOCKET, os.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
-            }
-            if (opts.no_delay) {
-                try os.setsockopt(socket, os.IPPROTO.TCP, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
-            }
-            if (opts.quick_ack) {
-                try os.setsockopt(socket, os.IPPROTO.TCP, os.TCP.QUICKACK, &std.mem.toBytes(@as(c_int, 1)));
-            }
-            if (opts.defer_accept) {
-                try os.setsockopt(socket, os.IPPROTO.TCP, os.TCP.DEFER_ACCEPT, &std.mem.toBytes(@as(c_int, 1)));
-            }
-            // Buffer sizes
-            try os.setsockopt(socket, os.SOL.SOCKET, os.SO.RCVBUF, &std.mem.toBytes(@as(c_int, @intCast(opts.recv_buffer_size))));
-            try os.setsockopt(socket, os.SOL.SOCKET, os.SO.SNDBUF, &std.mem.toBytes(@as(c_int, @intCast(opts.send_buffer_size))));
-            if (opts.fast_open) {
-                os.setsockopt(socket, os.IPPROTO.TCP, os.TCP.FASTOPEN, &std.mem.toBytes(@as(c_int, 1))) catch |err| {
-                    switch (err) {
-                        error.ProtocolNotSupported, error.InvalidArgument => {
-                            // Fast open not supported on this system, continue
-                            log.debug("TCP_FASTOPEN not supported, continuing without it\n", .{});
-                        },
-                        else => return err,
-                    }
-                };
-            }
-        }
-    }.apply;
-}
-pub fn acceptMany(listener: std.net.Server, connections: []std.net.Server.Connection) !u32 {
-    var accepted: u32 = 0;
-    while (accepted < connections.len) {
-        const conn = listener.accept() catch |err| switch (err) {
-            error.WouldBlock => break, // No more connections available
-            else => return err,
-        };
-        connections[accepted] = conn;
-        accepted += 1;
-    }
-    return accepted;
-}
 pub const Connection = struct {
     pub const StreamStorage = @import("stream_storage.zig").StreamStorage;
     pub const PendingPriorityUpdate = fh.ConnectionPendingPriorityUpdate;
@@ -241,24 +169,6 @@ pub const Connection = struct {
         } else {
             try self.send_preface();
         }
-        try self.send_settings();
-        try self.flush_output();
-        return self;
-    }
-
-    /// Initialize the connection state for an event-driven server that already validated
-    /// the client preface and only needs the protocol engine plus the initial SETTINGS frame.
-    pub fn initServerEventDriven(
-        allocator: std.mem.Allocator,
-        reader: *std.Io.Reader,
-        writer: *std.Io.Writer,
-    ) !@This() {
-        var self: @This() = undefined;
-        const stream_storage = try allocator.create(StreamStorage);
-        errdefer allocator.destroy(stream_storage);
-
-        initBase(&self, stream_storage, allocator, reader, writer);
-        self.owned_stream_storage = stream_storage;
         try self.send_settings();
         try self.flush_output();
         return self;
@@ -1102,28 +1012,6 @@ pub const Connection = struct {
             },
         }
     }
-    /// Sends a PING frame over the connection. The opaque data must always be exactly 8 bytes.
-    /// If `ack` is true, the ACK flag will be set in the PING frame.
-    /// The opaque data should be echoed exactly in case of a PING response.
-    pub fn send_ping(self: *@This(), opaque_data: []const u8, ack: bool) !void {
-        // Ensure the opaque data is 8 bytes long
-        if (opaque_data.len != 8) {
-            return error.InvalidPingPayloadSize;
-        }
-        var frame_header = FrameHeader{
-            .length = 8, // PING payload length is always 8
-            .frame_type = FrameType.PING,
-            .flags = if (ack) FrameFlags{ .value = FrameFlags.ACK } else FrameFlags{ .value = 0 }, // Set ACK flag if true
-            .reserved = false,
-            .stream_id = 0, // PING frames must always be on stream 0
-        };
-        // Write the frame header
-        try frame_header.write(self.writer);
-        // Write the opaque data
-        try self.writer.writeAll(opaque_data);
-        log.debug("Sent PING frame (flags: {d}, opaque_data: {any})\n", .{ frame_header.flags.value, opaque_data });
-    }
-
     pub fn process_request(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
         assert(stream.request_complete);
         assert(stream.request_headers_complete);
@@ -1543,23 +1431,6 @@ pub const Connection = struct {
     fn apply_frame_settings_max_header_list_size(self: *@This(), value: u32) void {
         self.settings.max_header_list_size = value;
     }
-    pub fn send_settings_ack(self: *@This()) !void {
-        if (self.goaway_sent) return;
-        var frame_header = FrameHeader{
-            .length = 0,
-            .frame_type = FrameType.SETTINGS,
-            .flags = FrameFlags{ .value = FrameFlags.ACK }, // Set ACK flag
-            .reserved = false,
-            .stream_id = 0,
-        };
-        frame_header.write(self.writer) catch |err| {
-            if (err == error.BrokenPipe) {
-                log.err("Client disconnected (BrokenPipe)\n", .{});
-                return err;
-            }
-            return err;
-        };
-    }
     /// Sends a GOAWAY frame with the given parameters.
     pub fn send_goaway(self: *@This(), last_stream_id: u32, error_code: u32, debug_data: []const u8) !void {
         const debug_data_max = 96;
@@ -1586,26 +1457,6 @@ pub const Connection = struct {
         };
         try goaway_frame.write(self.writer);
         self.goaway_sent = true;
-    }
-    pub fn close(self: *@This()) !void {
-        if (self.connection_closed) {
-            return; // Already closed
-        }
-        // Mark as closed to prevent double-closing
-        self.connection_closed = true;
-        // Error code 0 indicates graceful shutdown
-        const error_code: u32 = 0; // 0: NO_ERROR, indicating graceful shutdown
-        const debug_data = "Connection closing: graceful shutdown";
-        // Send the GOAWAY frame with the highest stream ID and debug information
-        if (!self.goaway_sent) {
-            self.send_goaway(self.highest_stream_id(), error_code, debug_data) catch |err| {
-                log.debug("Failed to send GOAWAY frame: {any}\n", .{err});
-            };
-        }
-        self.flush_output() catch |err| {
-            log.debug("Failed to flush GOAWAY frame: {any}\n", .{err});
-        };
-        log.debug("Connection closed gracefully\n", .{});
     }
     pub fn get_stream(self: *@This(), stream_id: u32) !*DefaultStream.StreamInstance {
         // Ensure the stream ID is valid (odd numbers for client-initiated streams)

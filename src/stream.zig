@@ -3,7 +3,6 @@ const assert = std.debug.assert;
 const Frame = @import("frame.zig").Frame;
 const FrameHeader = @import("frame.zig").FrameHeader;
 const FrameType = @import("frame.zig").FrameType;
-const FrameTypes = @import("frame.zig");
 const FrameFlags = @import("frame.zig").FrameFlags;
 const Connection = @import("connection.zig").Connection;
 const Hpack = @import("hpack.zig").Hpack;
@@ -27,7 +26,7 @@ pub const StreamState = enum(u3) {
 };
 
 // Compile-time stream event enumeration for state machine
-pub const StreamEvent = enum(u4) {
+const StreamEvent = enum(u4) {
     RecvHeaders = 0,
     RecvData = 1,
     RecvEndStream = 2,
