@@ -880,18 +880,26 @@ pub const Connection = struct {
 
         const frame_size = parsed.length + 9;
         if (frame_size > buffer.len) return error.BufferTooSmall;
-        if (frame_size > self.reader.buffer.len) {
-            return error.BufferTooSmall;
-        }
 
         // Take the entire frame from the per-connection reader buffer. The
         // first `peek(9)` fills that buffer with as much data as the transport
         // has ready, so pipelined frames are parsed from memory until the
         // buffer drains instead of issuing one read for every 9-byte header and
         // again for every payload.
-        const frame_bytes = self.reader.take(frame_size) catch |err| switch (err) {
-            error.EndOfStream => return error.UnexpectedEOF,
-            error.ReadFailed => return error.ReadFailed,
+        const payload = if (frame_size <= self.reader.buffer.len) payload: {
+            const frame_bytes = self.reader.take(frame_size) catch |err| switch (err) {
+                error.EndOfStream => return error.UnexpectedEOF,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            break :payload if (parsed.length > 0) frame_bytes[9..frame_size] else &[_]u8{};
+        } else payload: {
+            self.reader.toss(9);
+            const payload_buffer = buffer[9..frame_size];
+            self.reader.readSliceAll(payload_buffer) catch |err| switch (err) {
+                error.EndOfStream => return error.UnexpectedEOF,
+                error.ReadFailed => return error.ReadFailed,
+            };
+            break :payload payload_buffer;
         };
 
         const frame_type = FrameType.fromU8(parsed.frame_type) orelse {
@@ -918,7 +926,7 @@ pub const Connection = struct {
                 .reserved = parsed.reserved,
                 .stream_id = parsed.stream_id,
             },
-            .payload = if (parsed.length > 0) frame_bytes[9..frame_size] else &[_]u8{},
+            .payload = payload,
         };
     }
 
