@@ -34,6 +34,7 @@ pub const Priority = @import("http_priority.zig").Priority;
 // Memory Management
 pub const memory_budget = @import("memory_budget.zig");
 pub const budget_assertions = @import("budget_assertions.zig");
+pub const MemBudget = @import("memory_budget.zig").MemBudget;
 
 // Error Types
 pub const error_types = @import("error.zig");
@@ -43,6 +44,12 @@ pub const Http2Error = error_types.Http2Error;
 pub const transport = @import("transport.zig");
 pub const ServeConnectionOptions = transport.ServeConnectionOptions;
 pub const serveConnection = transport.serveConnection;
+
+// Request-target path normalization.
+pub const path = @import("path.zig");
+
+// Per-connection stream slot storage with O(1) lookup.
+pub const stream_storage = @import("stream_storage.zig");
 
 // Handler API
 pub const handler = @import("handler.zig");
@@ -58,88 +65,7 @@ pub const max_frame_size_default = 16384;
 pub const max_header_list_size_default = 8192;
 pub const initial_window_size_default = 65535;
 
-// Import the high-performance server.
-const TransportServer = @import("server.zig").Server;
-
-/// High-performance HTTP/2 server.
-/// Uses the configured Zig `std.Io` backend.
-pub const Server = struct {
-    inner: TransportServer,
-    allocator: std.mem.Allocator,
-
-    const Self = @This();
-
-    pub const Config = struct {
-        /// Address to bind to
-        address: std.Io.net.IpAddress,
-        /// Request dispatcher for application routing or request handling.
-        dispatcher: RequestDispatcher,
-        /// Maximum concurrent connections
-        max_connections: u32 = 1000,
-        /// Buffer size per connection
-        buffer_size: u32 = 32 * 1024,
-    };
-
-    /// Initialize a new HTTP/2 server
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
-        return Self{
-            .inner = try TransportServer.init(allocator, .{
-                .address = config.address,
-                .dispatcher = config.dispatcher,
-                .max_connections = config.max_connections,
-                .buffer_size = config.buffer_size,
-            }),
-            .allocator = allocator,
-        };
-    }
-
-    /// Clean up server resources
-    pub fn deinit(self: *Self) void {
-        self.inner.deinit();
-    }
-
-    /// Run the server event loop
-    pub fn run(self: *Self) !void {
-        try self.inner.run();
-    }
-
-    /// Stop the server
-    pub fn stop(self: *Self) void {
-        self.inner.stop();
-    }
-
-    /// Get server statistics
-    pub fn getStats(self: *Self) ServerStats {
-        return self.inner.getStats();
-    }
-};
-
-/// Experimental async HTTP/2 server.
-pub const AsyncServer = struct {
-    inner: TransportServer,
-
-    const Self = @This();
-
-    pub const Config = TransportServer.Config;
-
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
-        return Self{
-            .inner = try TransportServer.init(allocator, config),
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.inner.deinit();
-    }
-
-    pub fn run(self: *Self) !void {
-        try self.inner.run();
-    }
-
-    pub fn getStats(self: *Self) ServerStats {
-        return self.inner.getStats();
-    }
-};
+pub const Server = @import("server.zig").Server;
 
 /// Server statistics
 pub const ServerStats = struct {
@@ -151,14 +77,28 @@ pub const ServerStats = struct {
     requests_processed: u64 = 0,
 };
 
-/// Initialize the HTTP/2 system
+/// Initialize the HTTP/2 system.
+/// Wraps the caller's allocator in a phase-gated StaticAllocator so that
+/// all heap work can be frozen before the event loop starts.
 pub fn init(allocator: std.mem.Allocator) !void {
-    try memory_budget.initGlobalMemoryPool(allocator);
+    try memory_budget.initStaticAllocator(allocator);
 }
 
-/// Deinitialize the HTTP/2 system
+/// Return the phase-gated allocator.  All server init should use this so that
+/// `freeze()` can prevent accidental runtime allocations.
+pub fn staticAllocator() std.mem.Allocator {
+    return memory_budget.staticAllocatorPtr().allocator();
+}
+
+/// Freeze allocations.  Any alloc/resize after this will assert-fail.
+pub fn freeze() void {
+    memory_budget.freezeStaticAllocator();
+}
+
+/// Deinitialize the HTTP/2 system.  Unfreezes the allocator and frees all
+/// tracked memory.
 pub fn deinit() void {
-    memory_budget.deinitGlobalMemoryPool();
+    memory_budget.deinitStaticAllocator();
 }
 
 // Compile-time validation and assertions for design integrity

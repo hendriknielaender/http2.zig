@@ -1,27 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const http2 = @import("http2.zig");
-const log = std.log.scoped(.frame);
 const max_frame_size_default = http2.max_frame_size_default;
-const MAX_IN_FLIGHT_FRAMES = 64; // Reasonable limit for concurrent frames
-threadlocal var frame_scratch: [max_frame_size_default]u8 = undefined;
-
-/// Frame metadata for arena tracking
-pub const FrameMeta = struct {
-    allocated_size: u32,
-    timestamp: u64,
-    frame_type: FrameType,
-    stream_id: u32,
-};
-
-/// Fixed buffer allocator for frames per connection
-pub const FrameArena = std.heap.FixedBufferAllocator;
-
-/// Initialize frame arena with compile-time size limits
-pub fn initFrameArena(buffer: []u8) FrameArena {
-    assert(buffer.len >= MAX_IN_FLIGHT_FRAMES * (max_frame_size_default + @sizeOf(FrameMeta)));
-    return std.heap.FixedBufferAllocator.init(buffer);
-}
 pub const FrameType = enum(u8) {
     DATA = 0x0,
     HEADERS = 0x1,
@@ -67,17 +47,7 @@ pub const FrameType = enum(u8) {
         };
     }
 };
-pub const FRAME_TYPE_DATA = @intFromEnum(FrameType.DATA);
-pub const FRAME_TYPE_HEADERS = @intFromEnum(FrameType.HEADERS);
-pub const FRAME_TYPE_PRIORITY = @intFromEnum(FrameType.PRIORITY);
-pub const FRAME_TYPE_RST_STREAM = @intFromEnum(FrameType.RST_STREAM);
-pub const FRAME_TYPE_SETTINGS = @intFromEnum(FrameType.SETTINGS);
-pub const FRAME_TYPE_PUSH_PROMISE = @intFromEnum(FrameType.PUSH_PROMISE);
-pub const FRAME_TYPE_PING = @intFromEnum(FrameType.PING);
-pub const FRAME_TYPE_GOAWAY = @intFromEnum(FrameType.GOAWAY);
-pub const FRAME_TYPE_WINDOW_UPDATE = @intFromEnum(FrameType.WINDOW_UPDATE);
-pub const FRAME_TYPE_CONTINUATION = @intFromEnum(FrameType.CONTINUATION);
-pub const FRAME_TYPE_PRIORITY_UPDATE = @intFromEnum(FrameType.PRIORITY_UPDATE);
+
 /// Represents the flags of an HTTP/2 frame
 pub const FrameFlags = struct {
     value: u8,
@@ -141,33 +111,6 @@ pub const FrameHeader = struct {
         }
         const frame_type_u8: u8 = buffer[3];
         const frame_type = FrameType.fromU8(frame_type_u8) orelse return error.InvalidFrameType;
-        const flags = FrameFlags.init(buffer[4]);
-        // Parse the 31-bit stream ID from the last four bytes
-        const stream_id_raw = std.mem.readInt(u32, buffer[5..9], .big);
-        const reserved: bool = (stream_id_raw & 0x80000000) != 0;
-        const stream_id: u32 = stream_id_raw & 0x7FFFFFFF;
-        return FrameHeader{
-            .length = length,
-            .frame_type = frame_type,
-            .flags = flags,
-            .reserved = reserved,
-            .stream_id = stream_id,
-        };
-    }
-    pub fn read2(reader: *std.Io.Reader) !FrameHeader {
-        var buffer: [9]u8 = undefined;
-        try reader.readSliceAll(&buffer);
-        // Parse the 24-bit length from the first three bytes
-        const length: u32 = (@as(u32, buffer[0]) << 16) | (@as(u32, buffer[1]) << 8) | @as(u32, buffer[2]);
-        // Ensure the length is within 24 bits
-        if (length > 0xFFFFFF) {
-            return error.InvalidFrameLength;
-        }
-        const frame_type_value: u8 = buffer[3];
-        const frame_type = FrameType.fromU8(frame_type_value) orelse {
-            log.err("Invalid frame_type_value: {}\n", .{frame_type_value});
-            return error.InvalidEnumValue;
-        };
         const flags = FrameFlags.init(buffer[4]);
         // Parse the 31-bit stream ID from the last four bytes
         const stream_id_raw = std.mem.readInt(u32, buffer[5..9], .big);

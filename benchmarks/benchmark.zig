@@ -67,7 +67,7 @@ pub fn main() !void {
     const config = tls_server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", port),
         .dispatcher = http2.RequestDispatcher.fromHandlerWithoutHeaders(benchmarkHandler),
-        .max_connections = http2.memory_budget.MemBudget.max_conns,
+        .max_connections = http2.memory_budget.MemBudget.max_connections,
     };
 
     var server = try tls_server.Server.init(allocator, config);

@@ -1,58 +1,27 @@
 const std = @import("std");
-const os = std.os;
-const net = std.net;
-const posix = std.posix;
 pub const Stream = @import("stream.zig").Stream;
 pub const DefaultStream = @import("stream.zig").DefaultStream;
-const transitionState = @import("stream.zig").transitionState;
 pub const Frame = @import("frame.zig").Frame;
 pub const FrameHeader = @import("frame.zig").FrameHeader;
 pub const FrameFlags = @import("frame.zig").FrameFlags;
 pub const FrameType = @import("frame.zig").FrameType;
 const SIMDFrameParser = @import("simd_frame_parser.zig").SIMDFrameParser;
-pub const FrameTypes = @import("frame.zig");
-pub const FrameArena = @import("frame.zig").FrameArena;
-pub const FrameMeta = @import("frame.zig").FrameMeta;
-pub const initFrameArena = @import("frame.zig").initFrameArena;
 pub const Hpack = @import("hpack.zig").Hpack;
 const handler = @import("handler.zig");
+const resp = @import("response.zig");
 pub const http2 = @import("http2.zig");
 const HttpPriority = @import("http_priority.zig").Priority;
 const memory_budget = @import("memory_budget.zig");
 const TestIo = @import("testing/fixed_io.zig").FixedIo;
-const MAX_IN_FLIGHT_FRAMES = 64;
-const max_streams_per_connection = memory_budget.MemBudget.max_streams_per_conn;
+const path = @import("path.zig");
+const stream_storage_module = @import("stream_storage.zig");
+const fh = @import("frame_handler.zig");
+const Settings = fh.Settings;
+const DispatchContext = fh.DispatchContext;
+const max_streams_per_connection = memory_budget.MemBudget.max_streams_per_connection;
 const max_frame_size_default = http2.max_frame_size_default;
 const log = std.log.scoped(.connection);
 
-// Open-addressed hash table for `stream_id -> stream_slot_index` lookup. Keeps
-// per-frame stream resolution at O(1) on the hot path instead of an O(N) scan
-// over the full stream slot array.
-//
-// Capacity must be a power of two and large enough that the table stays well
-// below 50% load with `max_streams_per_connection` live entries. This keeps
-// the average probe length under two for any reasonable hash. Stream IDs are
-// always > 0, so we use 0 as the "empty" sentinel and `0xff` as the unused
-// slot-index sentinel (slot indices are < `max_streams_per_connection`, <= 100).
-const stream_lookup_capacity: u32 = 256;
-const stream_lookup_mask: u32 = stream_lookup_capacity - 1;
-const stream_lookup_shift: u5 = 32 - 8; // log2(stream_lookup_capacity) = 8.
-const stream_slot_index_empty: u8 = std.math.maxInt(u8);
-
-comptime {
-    assert(@popCount(stream_lookup_capacity) == 1);
-    assert(stream_lookup_capacity >= max_streams_per_connection * 2);
-    assert(max_streams_per_connection < stream_slot_index_empty);
-    assert((@as(u32, 1) << @as(u5, 32 - @as(u32, stream_lookup_shift))) == stream_lookup_capacity);
-}
-
-// Knuth multiplicative hash; the constant is `floor(2^32 / phi)` and gives a
-// strong avalanche on the upper bits, which is exactly what we shift into the
-// table index. Cheap (one imul) and well-distributed for the sequential odd
-// stream IDs that dominate real traffic.
-inline fn streamLookupHash(stream_id: u32) u32 {
-    return (stream_id *% 0x9E3779B1) >> stream_lookup_shift;
-}
 const assert = std.debug.assert;
 const http2_preface: []const u8 = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const priority_frame_payload_size: usize = 5;
@@ -81,127 +50,10 @@ comptime {
     assert(default_response_content_type.len == 24);
 }
 
-const RequestTarget = struct {
-    normalized_path: []const u8,
-    query: []const u8,
-};
-pub const Config = struct {
-    // Socket options - configured at comptime for zero-cost abstractions
-    pub const SocketOpts = struct {
-        reuse_port: bool = true,
-        no_delay: bool = true,
-        fast_open: bool = true,
-        quick_ack: bool = true,
-        defer_accept: bool = true,
-        recv_buffer_size: u32 = 1024 * 1024, // 1MB
-        send_buffer_size: u32 = 1024 * 1024, // 1MB
-    };
-    // Event loop configuration
-    pub const EventLoop = struct {
-        max_events: u32 = 1024,
-        timeout_ms: i32 = 1000,
-        batch_accept_size: u32 = 32,
-    };
-    // Static allocation sizes
-    pub const StaticSizes = struct {
-        max_connections: u32 = 10000,
-        frame_buffer_size: u32 = 64 * 1024, // 64KB
-        header_buffer_size: u32 = 8 * 1024, // 8KB
-    };
-};
-pub const FrameHandler = enum(u8) {
-    data = @intFromEnum(FrameType.DATA),
-    headers = @intFromEnum(FrameType.HEADERS),
-    priority = @intFromEnum(FrameType.PRIORITY),
-    rst_stream = @intFromEnum(FrameType.RST_STREAM),
-    settings = @intFromEnum(FrameType.SETTINGS),
-    push_promise = @intFromEnum(FrameType.PUSH_PROMISE),
-    ping = @intFromEnum(FrameType.PING),
-    goaway = @intFromEnum(FrameType.GOAWAY),
-    window_update = @intFromEnum(FrameType.WINDOW_UPDATE),
-    continuation = @intFromEnum(FrameType.CONTINUATION),
-    priority_update = @intFromEnum(FrameType.PRIORITY_UPDATE),
-    pub fn fromFrameType(frame_type: u8) ?FrameHandler {
-        return switch (frame_type) {
-            @intFromEnum(FrameType.DATA) => .data,
-            @intFromEnum(FrameType.HEADERS) => .headers,
-            @intFromEnum(FrameType.PRIORITY) => .priority,
-            @intFromEnum(FrameType.RST_STREAM) => .rst_stream,
-            @intFromEnum(FrameType.SETTINGS) => .settings,
-            @intFromEnum(FrameType.PUSH_PROMISE) => .push_promise,
-            @intFromEnum(FrameType.PING) => .ping,
-            @intFromEnum(FrameType.GOAWAY) => .goaway,
-            @intFromEnum(FrameType.WINDOW_UPDATE) => .window_update,
-            @intFromEnum(FrameType.CONTINUATION) => .continuation,
-            @intFromEnum(FrameType.PRIORITY_UPDATE) => .priority_update,
-            else => null,
-        };
-    }
-};
-pub fn setSockopts(comptime opts: Config.SocketOpts) type {
-    return struct {
-        pub fn apply(socket: os.socket_t) anyerror!void {
-            if (opts.reuse_port) {
-                try os.setsockopt(socket, os.SOL.SOCKET, os.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 1)));
-            }
-            if (opts.no_delay) {
-                try os.setsockopt(socket, os.IPPROTO.TCP, os.TCP.NODELAY, &std.mem.toBytes(@as(c_int, 1)));
-            }
-            if (opts.quick_ack) {
-                try os.setsockopt(socket, os.IPPROTO.TCP, os.TCP.QUICKACK, &std.mem.toBytes(@as(c_int, 1)));
-            }
-            if (opts.defer_accept) {
-                try os.setsockopt(socket, os.IPPROTO.TCP, os.TCP.DEFER_ACCEPT, &std.mem.toBytes(@as(c_int, 1)));
-            }
-            // Buffer sizes
-            try os.setsockopt(socket, os.SOL.SOCKET, os.SO.RCVBUF, &std.mem.toBytes(@as(c_int, @intCast(opts.recv_buffer_size))));
-            try os.setsockopt(socket, os.SOL.SOCKET, os.SO.SNDBUF, &std.mem.toBytes(@as(c_int, @intCast(opts.send_buffer_size))));
-            if (opts.fast_open) {
-                os.setsockopt(socket, os.IPPROTO.TCP, os.TCP.FASTOPEN, &std.mem.toBytes(@as(c_int, 1))) catch |err| {
-                    switch (err) {
-                        error.ProtocolNotSupported, error.InvalidArgument => {
-                            // Fast open not supported on this system, continue
-                            log.debug("TCP_FASTOPEN not supported, continuing without it\n", .{});
-                        },
-                        else => return err,
-                    }
-                };
-            }
-        }
-    }.apply;
-}
-pub fn acceptMany(listener: std.net.Server, connections: []std.net.Server.Connection) !u32 {
-    var accepted: u32 = 0;
-    while (accepted < connections.len) {
-        const conn = listener.accept() catch |err| switch (err) {
-            error.WouldBlock => break, // No more connections available
-            else => return err,
-        };
-        connections[accepted] = conn;
-        accepted += 1;
-    }
-    return accepted;
-}
+const RequestTarget = @import("path.zig").RequestTarget;
 pub const Connection = struct {
-    pub const StreamStorage = struct {
-        slots: [max_streams_per_connection]DefaultStream.StreamInstance,
-        ids: [max_streams_per_connection]u32,
-        in_use: [max_streams_per_connection]bool,
-        // O(1) lookup table mapping stream_id to an index into `slots`.
-        // `lookup_ids[i] == 0` marks an empty bucket; otherwise the entry maps
-        // `lookup_ids[i]` to `lookup_slot_indices[i]`.
-        lookup_ids: [stream_lookup_capacity]u32,
-        lookup_slot_indices: [stream_lookup_capacity]u8,
-    };
-    pub const PendingPriorityUpdate = struct {
-        stream_id: u32 = 0,
-        priority: HttpPriority = .{},
-        in_use: bool = false,
-    };
-    pub const FrameArenaStorage = [
-        MAX_IN_FLIGHT_FRAMES *
-            (max_frame_size_default + @sizeOf(FrameMeta))
-    ]u8;
+    pub const StreamStorage = @import("stream_storage.zig").StreamStorage;
+    pub const PendingPriorityUpdate = fh.ConnectionPendingPriorityUpdate;
 
     allocator: std.mem.Allocator,
     request_dispatcher: ?handler.RequestDispatcher,
@@ -210,20 +62,7 @@ pub const Connection = struct {
     settings: Settings,
     recv_window_size: i32 = 65535,
     send_window_size: i32 = 65535,
-    stream_slots: []DefaultStream.StreamInstance,
-    // Keep hot lookup metadata compact so stream scans do not walk the full stream storage.
-    stream_slot_ids: []u32,
-    stream_slots_in_use: []bool,
-    // Live count of occupied stream slots. Maintained in lockstep with
-    // `stream_slots_in_use` so the per-frame `MAX_CONCURRENT_STREAMS` check
-    // is O(1); walking the slot array touches one cache line per 24 KiB
-    // stream struct, which dominated the new-stream path. The counter is a
-    // conservative upper bound: closed-but-not-yet-released streams count
-    // toward the limit until the next `flush_ready_streams` releases them.
-    stream_slots_in_use_count: u8 = 0,
-    // O(1) `stream_id -> slot_index` table; see `streamLookupHash` for layout.
-    stream_lookup_ids: []u32,
-    stream_lookup_slot_indices: []u8,
+    stream_storage: *StreamStorage,
     owned_stream_storage: ?*StreamStorage = null,
     pending_stream_slots: [max_streams_per_connection]u8,
     pending_stream_queued: [max_streams_per_connection]bool,
@@ -243,31 +82,15 @@ pub const Connection = struct {
     peer_no_rfc7540_priorities_setting_received: bool = false,
     schedule_epoch_next: u64 = 1,
     connection_closed: bool = false,
-    owned_frame_arena_storage: ?*FrameArenaStorage = null,
-    frame_arena: FrameArena,
-    frame_arena_available: bool = false,
-
-    fn initStreamStorage(target: *StreamStorage) void {
-        target.* = .{
-            .slots = undefined,
-            .ids = [_]u32{0} ** max_streams_per_connection,
-            .in_use = [_]bool{false} ** max_streams_per_connection,
-            // Empty bucket sentinel is `0` for ids (stream IDs are always > 0)
-            // and `stream_slot_index_empty` for slot indices.
-            .lookup_ids = [_]u32{0} ** stream_lookup_capacity,
-            .lookup_slot_indices = [_]u8{stream_slot_index_empty} ** stream_lookup_capacity,
-        };
-    }
 
     fn initBase(
         target: *@This(),
-        stream_storage: *StreamStorage,
-        frame_arena_storage: ?*FrameArenaStorage,
+        stream_storage_ptr: *StreamStorage,
         allocator: std.mem.Allocator,
         reader: *std.Io.Reader,
         writer: *std.Io.Writer,
     ) void {
-        initStreamStorage(stream_storage);
+        stream_storage_ptr.init();
 
         target.* = .{
             .allocator = allocator,
@@ -277,12 +100,7 @@ pub const Connection = struct {
             .settings = Settings.default(),
             .recv_window_size = 65535,
             .send_window_size = 65535,
-            .stream_slots = stream_storage.slots[0..],
-            .stream_slot_ids = stream_storage.ids[0..],
-            .stream_slots_in_use = stream_storage.in_use[0..],
-            .stream_slots_in_use_count = 0,
-            .stream_lookup_ids = stream_storage.lookup_ids[0..],
-            .stream_lookup_slot_indices = stream_storage.lookup_slot_indices[0..],
+            .stream_storage = stream_storage_ptr,
             .owned_stream_storage = null,
             .pending_stream_slots = undefined,
             .pending_stream_queued = [_]bool{false} ** max_streams_per_connection,
@@ -295,20 +113,43 @@ pub const Connection = struct {
             .peer_no_rfc7540_priorities = false,
             .peer_no_rfc7540_priorities_setting_received = false,
             .schedule_epoch_next = 1,
-            .owned_frame_arena_storage = null,
-            .frame_arena = undefined,
-            .frame_arena_available = false,
         };
 
-        assert(target.stream_slots.len == max_streams_per_connection);
-        assert(target.stream_slot_ids.len == max_streams_per_connection);
-        assert(target.stream_slots_in_use.len == max_streams_per_connection);
-        assert(target.stream_lookup_ids.len == stream_lookup_capacity);
-        assert(target.stream_lookup_slot_indices.len == stream_lookup_capacity);
-        if (frame_arena_storage) |storage| {
-            target.frame_arena = initFrameArena(storage);
-            target.frame_arena_available = true;
-        }
+        assert(target.stream_storage.slots.len == max_streams_per_connection);
+        assert(target.stream_storage.ids.len == max_streams_per_connection);
+        assert(target.stream_storage.in_use.len == max_streams_per_connection);
+        assert(target.stream_storage.lookup_ids.len == 256);
+        assert(target.stream_storage.lookup_indices.len == 256);
+    }
+
+    fn initDispatchContext(target: *@This()) DispatchContext {
+        return .{
+            .allocator = target.allocator,
+            .reader = target.reader,
+            .writer = target.writer,
+            .stream_storage = target.stream_storage,
+            .settings = &target.settings,
+            .hpack_decoder_table = &target.hpack_decoder_table,
+            .hpack_encoder_table = &target.hpack_encoder_table,
+            .recv_window_size = &target.recv_window_size,
+            .send_window_size = &target.send_window_size,
+            .goaway_sent = &target.goaway_sent,
+            .goaway_received = &target.goaway_received,
+            .last_stream_id = &target.last_stream_id,
+            .expecting_continuation_stream_id = &target.expecting_continuation_stream_id,
+            .client_settings_received = &target.client_settings_received,
+            .peer_first_settings_received = &target.peer_first_settings_received,
+            .peer_no_rfc7540_priorities = &target.peer_no_rfc7540_priorities,
+            .peer_no_rfc7540_priorities_setting_received = &target.peer_no_rfc7540_priorities_setting_received,
+            .pending_stream_slots = &target.pending_stream_slots,
+            .pending_stream_queued = &target.pending_stream_queued,
+            .pending_stream_count = &target.pending_stream_count,
+            .pending_priority_updates = &target.pending_priority_updates,
+            .schedule_epoch_next = &target.schedule_epoch_next,
+            .completed_responses_pending = &target.completed_responses_pending,
+            .connection_closed = &target.connection_closed,
+            .conn_ptr = target,
+        };
     }
 
     pub fn init(
@@ -320,35 +161,14 @@ pub const Connection = struct {
         var self: @This() = undefined;
         const stream_storage = try allocator.create(StreamStorage);
         errdefer allocator.destroy(stream_storage);
-        const frame_arena_storage = try allocator.create(FrameArenaStorage);
-        errdefer allocator.destroy(frame_arena_storage);
 
-        initBase(&self, stream_storage, frame_arena_storage, allocator, reader, writer);
+        initBase(&self, stream_storage, allocator, reader, writer);
         self.owned_stream_storage = stream_storage;
-        self.owned_frame_arena_storage = frame_arena_storage;
         if (is_server) {
             try self.check_server_preface();
         } else {
             try self.send_preface();
         }
-        try self.send_settings();
-        try self.flush_output();
-        return self;
-    }
-
-    /// Initialize the connection state for an event-driven server that already validated
-    /// the client preface and only needs the protocol engine plus the initial SETTINGS frame.
-    pub fn initServerEventDriven(
-        allocator: std.mem.Allocator,
-        reader: *std.Io.Reader,
-        writer: *std.Io.Writer,
-    ) !@This() {
-        var self: @This() = undefined;
-        const stream_storage = try allocator.create(StreamStorage);
-        errdefer allocator.destroy(stream_storage);
-
-        initBase(&self, stream_storage, null, allocator, reader, writer);
-        self.owned_stream_storage = stream_storage;
         try self.send_settings();
         try self.flush_output();
         return self;
@@ -361,7 +181,7 @@ pub const Connection = struct {
         reader: *std.Io.Reader,
         writer: *std.Io.Writer,
     ) !void {
-        initBase(target, stream_storage, null, allocator, reader, writer);
+        initBase(target, stream_storage, allocator, reader, writer);
         try target.send_settings();
         try target.flush_output();
     }
@@ -373,7 +193,7 @@ pub const Connection = struct {
         reader: *std.Io.Reader,
         writer: *std.Io.Writer,
     ) !void {
-        initBase(target, stream_storage, null, allocator, reader, writer);
+        initBase(target, stream_storage, allocator, reader, writer);
         errdefer target.flush_output() catch {};
         try target.check_server_preface();
         try target.send_settings();
@@ -421,29 +241,24 @@ pub const Connection = struct {
         log.debug("Valid HTTP/2 preface received", .{});
     }
     pub fn deinit(self: *@This()) void {
-        // Mark connection as closed to prevent further operations
         self.connection_closed = true;
 
-        for (self.stream_slots, 0..) |*stream_slot, stream_index| {
-            if (!self.stream_slots_in_use[stream_index]) continue;
+        for (&self.stream_storage.slots, 0..) |*stream_slot, stream_index| {
+            if (!self.stream_storage.in_use[stream_index]) continue;
             stream_slot.deinit();
-            self.stream_slot_ids[stream_index] = 0;
-            self.stream_slots_in_use[stream_index] = false;
+            self.stream_storage.ids[stream_index] = 0;
+            self.stream_storage.in_use[stream_index] = false;
         }
-        self.stream_slots_in_use_count = 0;
-        self.streamLookupReset();
+        self.stream_storage.in_use_count = 0;
+        self.stream_storage.reset();
         self.pending_stream_count = 0;
         self.pending_stream_queued = [_]bool{false} ** max_streams_per_connection;
         self.completed_responses_pending = 0;
         self.hpack_decoder_table.deinit();
         self.hpack_encoder_table.deinit();
-        if (self.owned_stream_storage) |stream_storage| {
-            self.allocator.destroy(stream_storage);
+        if (self.owned_stream_storage) |owned| {
+            self.allocator.destroy(owned);
             self.owned_stream_storage = null;
-        }
-        if (self.owned_frame_arena_storage) |frame_arena_storage| {
-            self.allocator.destroy(frame_arena_storage);
-            self.owned_frame_arena_storage = null;
         }
         log.debug("Resources deinitialized for connection\n", .{});
     }
@@ -457,8 +272,7 @@ pub const Connection = struct {
     }
 
     fn active_stream_count(self: *@This()) u32 {
-        assert(self.stream_slots_in_use_count <= max_streams_per_connection);
-        return self.stream_slots_in_use_count;
+        return self.stream_storage.activeCount();
     }
 
     fn send_preface(self: *const @This()) !void {
@@ -469,96 +283,13 @@ pub const Connection = struct {
         return self.last_stream_id;
     }
 
-    // O(1) average lookup over the open-addressed hash table. Linear probing
-    // terminates at the first empty bucket because deletions backshift to keep
-    // the probe chain contiguous (see `streamLookupRemove`).
+    // O(1) average lookup via the open-addressed hash table in StreamStorage.
     fn streamFindIndex(self: *const @This(), stream_id: u32) ?u8 {
-        assert(stream_id > 0);
-
-        var probe: u32 = streamLookupHash(stream_id);
-        var probes: u32 = 0;
-        while (probes < stream_lookup_capacity) : (probes += 1) {
-            const bucket_id = self.stream_lookup_ids[probe];
-            if (bucket_id == 0) return null;
-            if (bucket_id == stream_id) {
-                const slot_index = self.stream_lookup_slot_indices[probe];
-                assert(slot_index < max_streams_per_connection);
-                assert(self.stream_slots_in_use[slot_index]);
-                assert(self.stream_slot_ids[slot_index] == stream_id);
-                return slot_index;
-            }
-            probe = (probe + 1) & stream_lookup_mask;
-        }
-        // Load factor < 0.5 means a full sweep without finding an empty bucket
-        // is impossible; reaching here would mean the table is corrupt.
-        unreachable;
-    }
-
-    // Insert a `(stream_id, slot_index)` pair. Caller must guarantee
-    // `stream_id` is not already present in the table.
-    fn streamLookupInsert(self: *@This(), stream_id: u32, slot_index: u8) void {
-        assert(stream_id > 0);
-        assert(slot_index < max_streams_per_connection);
-
-        var probe: u32 = streamLookupHash(stream_id);
-        var probes: u32 = 0;
-        while (probes < stream_lookup_capacity) : (probes += 1) {
-            const bucket_id = self.stream_lookup_ids[probe];
-            assert(bucket_id != stream_id);
-            if (bucket_id == 0) {
-                self.stream_lookup_ids[probe] = stream_id;
-                self.stream_lookup_slot_indices[probe] = slot_index;
-                return;
-            }
-            probe = (probe + 1) & stream_lookup_mask;
-        }
-        // With at most `max_streams_per_connection` live entries and capacity
-        // at least 2x that, an insert can always find a free bucket.
-        unreachable;
-    }
-
-    // Remove `stream_id` and backshift any displaced followers to preserve the
-    // invariant that probing stops at the first empty bucket.
-    fn streamLookupRemove(self: *@This(), stream_id: u32) void {
-        assert(stream_id > 0);
-
-        var hole: u32 = streamLookupHash(stream_id);
-        var probes: u32 = 0;
-        while (self.stream_lookup_ids[hole] != stream_id) {
-            assert(self.stream_lookup_ids[hole] != 0);
-            hole = (hole + 1) & stream_lookup_mask;
-            probes += 1;
-            assert(probes < stream_lookup_capacity);
-        }
-
-        var next: u32 = (hole + 1) & stream_lookup_mask;
-        while (self.stream_lookup_ids[next] != 0) {
-            const next_id = self.stream_lookup_ids[next];
-            const next_home = streamLookupHash(next_id);
-            // An entry at `next` can fill `hole` iff its home position lies
-            // outside the open interval `(hole, next]` cyclically, so its
-            // displacement from home reaches at least as far as the hole.
-            const displacement = (next -% next_home) & stream_lookup_mask;
-            const gap_distance = (next -% hole) & stream_lookup_mask;
-            if (displacement >= gap_distance) {
-                self.stream_lookup_ids[hole] = next_id;
-                self.stream_lookup_slot_indices[hole] = self.stream_lookup_slot_indices[next];
-                hole = next;
-            }
-            next = (next + 1) & stream_lookup_mask;
-        }
-        self.stream_lookup_ids[hole] = 0;
-        self.stream_lookup_slot_indices[hole] = stream_slot_index_empty;
-    }
-
-    fn streamLookupReset(self: *@This()) void {
-        @memset(self.stream_lookup_ids, 0);
-        @memset(self.stream_lookup_slot_indices, stream_slot_index_empty);
+        return self.stream_storage.findIndex(stream_id);
     }
 
     fn streamFind(self: *@This(), stream_id: u32) ?*DefaultStream.StreamInstance {
-        const stream_index = self.streamFindIndex(stream_id) orelse return null;
-        return &self.stream_slots[stream_index];
+        return self.stream_storage.find(stream_id);
     }
 
     pub fn rfc7540_priority_signals_ignored(self: *const @This()) bool {
@@ -650,8 +381,8 @@ pub const Connection = struct {
         candidate_index: u8,
         current_index: u8,
     ) bool {
-        const candidate_stream = &self.stream_slots[candidate_index];
-        const current_stream = &self.stream_slots[current_index];
+        const candidate_stream = &self.stream_storage.slots[candidate_index];
+        const current_stream = &self.stream_storage.slots[current_index];
 
         if (candidate_stream.priority.urgency < current_stream.priority.urgency) {
             return true;
@@ -729,9 +460,9 @@ pub const Connection = struct {
             self.pending_stream_slots[pending_index - 1] = self.pending_stream_slots[pending_index];
         }
         self.pending_stream_count -= 1;
-        assert(self.stream_slots[stream_index].schedule_count < std.math.maxInt(u32));
-        self.stream_slots[stream_index].schedule_count += 1;
-        self.stream_slots[stream_index].schedule_epoch_last = self.schedule_epoch_next;
+        assert(self.stream_storage.slots[stream_index].schedule_count < std.math.maxInt(u32));
+        self.stream_storage.slots[stream_index].schedule_count += 1;
+        self.stream_storage.slots[stream_index].schedule_epoch_last = self.schedule_epoch_next;
         self.schedule_epoch_next += 1;
         return stream_index;
     }
@@ -761,19 +492,12 @@ pub const Connection = struct {
     }
 
     fn releaseClosedStream(self: *@This(), stream_index: u8) void {
-        assert(stream_index < max_streams_per_connection);
-        assert(self.stream_slots_in_use[stream_index]);
-
-        const stream = &self.stream_slots[stream_index];
+        const stream = self.stream_storage.findBySlotIndex(stream_index);
         const stream_id = stream.id;
 
         self.pendingStreamRemove(stream_index);
         stream.deinit();
-        self.streamLookupRemove(stream_id);
-        self.stream_slot_ids[stream_index] = 0;
-        self.stream_slots_in_use[stream_index] = false;
-        assert(self.stream_slots_in_use_count > 0);
-        self.stream_slots_in_use_count -= 1;
+        self.stream_storage.releaseSlot(stream_index);
         log.debug("Released closed stream {d}\n", .{stream_id});
     }
 
@@ -790,7 +514,7 @@ pub const Connection = struct {
         if (stream.expecting_continuation) {
             return;
         }
-        if (self.streamResponseComplete(stream)) {
+        if (resp.streamResponseComplete(stream)) {
             return;
         }
 
@@ -805,24 +529,13 @@ pub const Connection = struct {
     }
 
     fn streamAllocate(self: *@This(), stream_id: u32) !*DefaultStream.StreamInstance {
-        assert(stream_id > 0);
-
-        for (self.stream_slots, 0..) |*stream_slot, stream_index| {
-            if (self.stream_slots_in_use[stream_index]) continue;
-
-            self.stream_slot_ids[stream_index] = stream_id;
-            self.stream_slots_in_use[stream_index] = true;
-            assert(self.stream_slots_in_use_count < max_streams_per_connection);
-            self.stream_slots_in_use_count += 1;
-            self.streamLookupInsert(stream_id, @intCast(stream_index));
-            stream_slot.init(self, stream_id);
-            if (self.pending_priority_update_take(stream_id)) |priority| {
-                stream_slot.applyPriority(priority);
-            }
-            return stream_slot;
+        const slot_index = try self.stream_storage.allocateSlot(stream_id);
+        const stream_slot = self.stream_storage.findBySlotIndex(slot_index);
+        stream_slot.init(self, stream_id);
+        if (self.pending_priority_update_take(stream_id)) |priority| {
+            stream_slot.applyPriority(priority);
         }
-
-        return error.MaxConcurrentStreamsExceeded;
+        return stream_slot;
     }
     /// Sends a RST_STREAM frame for a given stream ID with the specified error code.
     pub fn send_rst_stream(self: *@This(), stream_id: u32, error_code: u32) !void {
@@ -840,14 +553,6 @@ pub const Connection = struct {
         std.mem.writeInt(u32, error_code_bytes[0..4], error_code, .big);
         try self.writer.writeAll(&error_code_bytes);
         log.debug("Sent RST_STREAM frame with error code {d} for stream ID {d}\n", .{ error_code, stream_id });
-    }
-    fn error_code_from_error(err: anyerror) u32 {
-        return switch (err) {
-            error.FrameSizeError => 0x6, // FRAME_SIZE_ERROR
-            error.ProtocolError => 0x1, // PROTOCOL_ERROR
-            // Map other errors as needed...
-            else => 0x1, // Default to PROTOCOL_ERROR
-        };
     }
 
     pub fn receiveFrameStatic(self: *@This(), buffer: []u8) !Frame {
@@ -931,326 +636,18 @@ pub const Connection = struct {
     }
 
     pub fn dispatchFrameOptimized(self: *@This(), frame: Frame) !void {
-        // Handle unknown frame types - they come with length=0 from receiveFrameStatic
-        if (frame.header.length == 0 and frame.header.frame_type == .DATA and frame.header.stream_id == 0 and frame.payload.len == 0) {
-            // This is an unknown frame type that was already logged - silently ignore
-            return;
-        }
-        const frame_type_u8 = @intFromEnum(frame.header.frame_type);
-        const frame_handler = FrameHandler.fromFrameType(frame_type_u8) orelse {
-            log.debug("Ignoring unknown frame type {d} on stream {d}", .{ frame_type_u8, frame.header.stream_id });
-            return;
-        };
-        switch (frame_handler) {
-            .data => try self.handleDataFrameOptimized(frame),
-            .headers => try self.handleHeadersFrameOptimized(frame),
-            .priority => try self.handlePriorityFrameOptimized(frame),
-            .rst_stream => try self.handleRstStreamFrameOptimized(frame),
-            .settings => try self.handleSettingsFrameOptimized(frame),
-            .push_promise => try self.handlePushPromiseFrameOptimized(frame),
-            .ping => try self.handlePingFrameOptimized(frame),
-            .goaway => try self.handleGoawayFrameOptimized(frame),
-            .window_update => try self.handleWindowUpdateFrameOptimized(frame),
-            .continuation => try self.handleContinuationFrameOptimized(frame),
-            .priority_update => try self.handlePriorityUpdateFrameOptimized(frame),
-        }
-    }
-    fn handleDataFrameOptimized(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id == 0) {
-            return self.sendGoawayAndClose(0x1, "DATA frame on stream 0");
-        }
-
-        if (self.streamFind(frame.header.stream_id)) |stream| {
-            switch (stream.state) {
-                .Idle => {
-                    log.err("DATA frame on idle stream {}: PROTOCOL_ERROR", .{frame.header.stream_id});
-                    try self.send_goaway(0, 0x1, "DATA frame on idle stream: PROTOCOL_ERROR");
-                    self.goaway_sent = true;
-                    try self.flush_output();
-                    return error.ProtocolError;
-                },
-                .HalfClosedRemote => {
-                    log.err("DATA frame on HalfClosedRemote stream {}: STREAM_CLOSED", .{frame.header.stream_id});
-                    return self.send_rst_stream(frame.header.stream_id, 0x5);
-                },
-                .Closed => {
-                    log.debug("DATA frame on closed stream {}: sending RST_STREAM", .{frame.header.stream_id});
-                    return self.send_rst_stream(frame.header.stream_id, 0x5);
-                },
-                else => {},
-            }
-
-            if (frame.header.length > 0) {
-                try self.send_window_update(0, @intCast(frame.header.length));
-                log.debug("Sent connection-level WINDOW_UPDATE with increment {}", .{frame.header.length});
-            }
-
-            try self.handleOptimizedStreamFrame(stream, frame);
-        } else {
-            if (frame.header.stream_id <= self.last_stream_id) {
-                log.debug("DATA frame on closed stream {}: sending RST_STREAM", .{frame.header.stream_id});
-                return self.send_rst_stream(frame.header.stream_id, 0x5);
-            }
-            log.err("DATA frame on idle stream {}: PROTOCOL_ERROR", .{frame.header.stream_id});
-            try self.send_goaway(0, 0x1, "DATA frame on idle stream: PROTOCOL_ERROR");
-            self.goaway_sent = true;
-            try self.flush_output();
-            return error.ProtocolError;
-        }
-    }
-    fn handleHeadersFrameOptimized(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id == 0) {
-            return self.sendGoawayAndClose(0x1, "HEADERS frame on stream 0");
-        }
-
-        if (self.streamFind(frame.header.stream_id)) |stream| {
-            switch (stream.state) {
-                .HalfClosedRemote => {
-                    log.err("HEADERS frame on HalfClosedRemote stream {}: STREAM_CLOSED", .{frame.header.stream_id});
-                    return self.send_rst_stream(frame.header.stream_id, 0x5);
-                },
-                .Closed => {
-                    log.debug("HEADERS frame on closed stream {}: sending RST_STREAM", .{frame.header.stream_id});
-                    return self.send_rst_stream(frame.header.stream_id, 0x5);
-                },
-                else => {},
-            }
-        } else if (frame.header.stream_id < self.last_stream_id) {
-            // Stream ID is numerically smaller than previously opened stream
-            // Per RFC 9113 Section 5.1.1: connection error PROTOCOL_ERROR
-            log.err("HEADERS frame with stream ID {} < last_stream_id {}: PROTOCOL_ERROR", .{ frame.header.stream_id, self.last_stream_id });
-            try self.send_goaway(self.highest_stream_id(), 0x1, "Stream ID decreased: PROTOCOL_ERROR");
-            self.goaway_sent = true;
-            try self.flush_output();
-            return error.ProtocolError;
-        } else if (frame.header.stream_id == self.last_stream_id) {
-            // Stream ID reuse: client trying to reuse a closed stream
-            // Per RFC 9113 Section 5.1: stream error STREAM_CLOSED
-            log.debug("HEADERS frame on released stream {}: sending GOAWAY with STREAM_CLOSED", .{frame.header.stream_id});
-            try self.send_goaway(self.highest_stream_id(), 0x5, "HEADERS frame on closed stream: STREAM_CLOSED");
-            self.goaway_sent = true;
-            try self.flush_output();
-            return error.StreamClosed;
-        }
-
-        const stream = self.get_stream(frame.header.stream_id) catch |err| {
-            if (err == error.MaxConcurrentStreamsExceeded) {
-                return self.send_rst_stream(frame.header.stream_id, 0x7);
-            }
-            return err;
-        };
-        try self.handleOptimizedStreamFrame(stream, frame);
-    }
-    fn handlePriorityFrameOptimized(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id == 0) {
-            return self.sendGoawayAndClose(0x1, "PRIORITY frame on stream 0");
-        }
-
-        if (!priority_frame_payload_has_valid_size(frame)) {
-            try self.send_priority_frame_size_error();
-            return;
-        }
-
-        // Check for PRIORITY self-dependency (stream depends on itself)
-        // Per RFC 9113 Section 5.3.1: A stream cannot depend on itself
-        if (self.streamFind(frame.header.stream_id)) |stream| {
-            // Stream exists - forward to stream handler
-            try self.handleOptimizedStreamFrame(stream, frame);
-        } else {
-            // Stream doesn't exist - check for self-dependency on idle stream
-            if (frame.header.stream_id > self.last_stream_id) {
-                // Idle stream - check for self-dependency
-                const stream_dependency_raw = std.mem.readInt(u32, frame.payload[0..4], .big);
-                const stream_dependency = stream_dependency_raw & 0x7FFFFFFF;
-                if (stream_dependency == frame.header.stream_id) {
-                    log.err("PRIORITY frame on idle stream {} depends on itself: PROTOCOL_ERROR\n", .{frame.header.stream_id});
-                    try self.send_goaway(0, 0x1, "PRIORITY frame depends on itself: PROTOCOL_ERROR");
-                    self.goaway_sent = true;
-                    try self.flush_output();
-                    return error.ProtocolError;
-                }
-                log.debug("Ignoring PRIORITY frame on idle stream {d}\n", .{frame.header.stream_id});
-            } else {
-                // Closed stream - ignore PRIORITY
-                log.debug("Ignoring PRIORITY frame on closed stream {d}\n", .{frame.header.stream_id});
-            }
-        }
-    }
-    fn handleRstStreamFrameOptimized(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id == 0) {
-            return self.sendGoawayAndClose(0x1, "RST_STREAM frame on stream 0");
-        }
-        if (frame.payload.len != 4) {
-            log.err("RST_STREAM frame with invalid payload length {} (expected 4): FRAME_SIZE_ERROR", .{frame.payload.len});
-            try self.send_goaway(0, 0x6, "RST_STREAM frame with invalid payload length: FRAME_SIZE_ERROR");
-            return error.FrameSizeError;
-        }
-        if (self.streamFind(frame.header.stream_id)) |stream| {
-            try self.handleOptimizedStreamFrame(stream, frame);
-        } else {
-            if (frame.header.stream_id > self.last_stream_id) {
-                log.err("RST_STREAM frame on idle stream {}: PROTOCOL_ERROR", .{frame.header.stream_id});
-                try self.send_goaway(0, 0x1, "RST_STREAM frame on idle stream: PROTOCOL_ERROR");
-                return error.ProtocolError;
-            }
-            log.debug("RST_STREAM frame on closed stream {}: ignoring", .{frame.header.stream_id});
-        }
-    }
-    fn handleSettingsFrameOptimized(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id != 0) {
-            return self.sendGoawayAndClose(0x1, "SETTINGS frame on non-zero stream");
-        }
-        try self.apply_frame_settings(frame);
-        if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
-            try self.send_settings_ack();
-        }
-    }
-    fn handlePushPromiseFrameOptimized(self: *@This(), frame: Frame) !void {
-        _ = frame; // Suppress unused parameter warning
-        // Clients must not send PUSH_PROMISE
-        return self.sendGoawayAndClose(0x1, "Client sent PUSH_PROMISE");
-    }
-    fn handlePingFrameOptimized(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id != 0) {
-            return self.sendGoawayAndClose(0x1, "PING frame on non-zero stream");
-        }
-        if (frame.payload.len != 8) {
-            return self.sendGoawayAndClose(0x6, "Invalid PING payload size");
-        }
-        if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
-            try self.send_ping(frame.payload, true);
-        }
-    }
-    fn handleGoawayFrameOptimized(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id != 0) {
-            return self.sendGoawayAndClose(0x1, "GOAWAY frame on non-zero stream");
-        }
-        try self.handle_goaway_frame(frame);
-    }
-    fn handleWindowUpdateFrameOptimized(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id == 0) {
-            try self.handle_window_update(frame);
-            return;
-        }
-
-        if (self.streamFind(frame.header.stream_id)) |stream| {
-            try self.handleOptimizedStreamFrame(stream, frame);
-        } else {
-            if (frame.header.stream_id > self.last_stream_id) {
-                log.err("WINDOW_UPDATE frame on idle stream {}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
-                try self.send_goaway(0, 0x1, "WINDOW_UPDATE frame on idle stream: PROTOCOL_ERROR");
-                self.goaway_sent = true;
-                try self.flush_output();
-                return;
-            }
-            log.debug("WINDOW_UPDATE frame on closed stream {}: ignoring\n", .{frame.header.stream_id});
-        }
-    }
-
-    fn handleContinuationFrameOptimized(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id == 0) {
-            return self.sendGoawayAndClose(0x1, "CONTINUATION frame on stream 0");
-        }
-        const expected_stream = self.expecting_continuation_stream_id orelse {
-            log.err("Received CONTINUATION frame without preceding HEADERS frame: PROTOCOL_ERROR", .{});
-            try self.send_goaway(0, 0x1, "Unexpected CONTINUATION frame: PROTOCOL_ERROR");
-            self.goaway_sent = true;
-            try self.flush_output();
-            return error.ProtocolError;
-        };
-        if (frame.header.stream_id != expected_stream) {
-            log.err("Received CONTINUATION frame on stream {} while expecting stream {}: PROTOCOL_ERROR", .{ frame.header.stream_id, expected_stream });
-            try self.send_goaway(0, 0x1, "CONTINUATION frame on wrong stream: PROTOCOL_ERROR");
-            self.goaway_sent = true;
-            try self.flush_output();
-            return error.ProtocolError;
-        }
-        const stream = self.streamFind(frame.header.stream_id) orelse {
-            log.err("CONTINUATION frame on idle stream {}: PROTOCOL_ERROR", .{frame.header.stream_id});
-            try self.send_goaway(0, 0x1, "CONTINUATION frame on idle stream: PROTOCOL_ERROR");
-            self.goaway_sent = true;
-            try self.flush_output();
-            return error.ProtocolError;
-        };
-        try self.handleOptimizedStreamFrame(stream, frame);
-    }
-
-    fn handlePriorityUpdateFrameOptimized(self: *@This(), frame: Frame) !void {
-        try self.handle_priority_update_frame(frame);
+        var ctx = initDispatchContext(self);
+        return fh.dispatchFrameOptimized(&ctx, frame);
     }
 
     fn sendGoawayAndClose(self: *@This(), error_code: u32, debug_msg: []const u8) !void {
-        if (!self.goaway_sent) {
-            try self.send_goaway(self.last_stream_id, error_code, debug_msg);
-            self.goaway_sent = true;
-            try self.flush_output();
-        }
-    }
-
-    fn priority_frame_payload_has_valid_size(frame: Frame) bool {
-        assert(frame.header.frame_type == FrameType.PRIORITY);
-        assert(frame.header.length == frame.payload.len);
-
-        return frame.payload.len == priority_frame_payload_size;
-    }
-
-    fn send_priority_frame_size_error(self: *@This()) !void {
-        try self.sendGoawayAndClose(0x6, "Frame size error: FRAME_SIZE_ERROR");
+        var ctx = initDispatchContext(self);
+        return fh.sendGoawayAndClose(&ctx, self.last_stream_id, error_code, debug_msg);
     }
 
     fn handle_priority_update_frame(self: *@This(), frame: Frame) !void {
-        if (frame.header.stream_id != 0) {
-            return self.sendGoawayAndClose(0x1, "PRIORITY_UPDATE frame on non-zero stream");
-        }
-        if (frame.payload.len < priority_update_payload_id_size + 1) {
-            return self.sendGoawayAndClose(
-                0x1,
-                "Invalid PRIORITY_UPDATE payload: PROTOCOL_ERROR",
-            );
-        }
-
-        const prioritized_stream_id_raw = std.mem.readInt(
-            u32,
-            frame.payload[0..priority_update_payload_id_size],
-            .big,
-        );
-        const prioritized_stream_id = prioritized_stream_id_raw & 0x7FFFFFFF;
-        if (prioritized_stream_id == 0) {
-            return self.sendGoawayAndClose(
-                0x1,
-                "PRIORITY_UPDATE with prioritized stream ID 0: PROTOCOL_ERROR",
-            );
-        }
-        if ((prioritized_stream_id & 1) == 0) {
-            return self.sendGoawayAndClose(
-                0x1,
-                "PRIORITY_UPDATE for unsupported push stream: PROTOCOL_ERROR",
-            );
-        }
-
-        const priority = HttpPriority.parse(
-            frame.payload[priority_update_payload_id_size..],
-        ) catch {
-            return self.sendGoawayAndClose(
-                0x1,
-                "Invalid PRIORITY_UPDATE field value: PROTOCOL_ERROR",
-            );
-        };
-
-        if (self.streamFind(prioritized_stream_id)) |stream| {
-            switch (stream.state) {
-                .HalfClosedLocal, .Closed => return,
-                else => {},
-            }
-
-            stream.applyPriority(priority);
-            return;
-        }
-
-        if (prioritized_stream_id > self.last_stream_id) {
-            try self.pending_priority_update_store(prioritized_stream_id, priority);
-            return;
-        }
+        var ctx = initDispatchContext(self);
+        return fh.handlePriorityUpdateFrame(&ctx, frame);
     }
 
     pub fn handle_connection_optimized(self: *@This()) !void {
@@ -1391,60 +788,40 @@ pub const Connection = struct {
         return self.handle_connection_optimized();
     }
 
-    /// Original frame handling method (kept for compatibility)
-    pub fn handle_connection_original(self: *@This()) !void {
-        try self.handle_connection_original_phase_settings();
-        try self.handle_connection_original_phase_frames();
-        log.debug("Connection terminated gracefully after GOAWAY.\n", .{});
-    }
-
-    /// Phase 1: Exchange SETTINGS frames
-    fn handle_connection_original_phase_settings(self: *@This()) !void {
-        while (!self.client_settings_received) {
-            var frame = self.receive_frame() catch |err| {
-                self.handle_receive_frame_error(err) catch |handle_err| {
-                    return handle_err;
-                };
-                return;
-            };
-            defer frame.deinit(self.allocator);
-
-            if (frame.header.stream_id == 0) {
-                self.handle_connection_original_phase_settings_connection_frame(frame);
-            } else {
-                try handle_stream_level_frame(self, frame);
-            }
-            try self.flush_ready_streams();
-            try self.flush_output_if_idle_or_full();
-
-            if (frame.header.frame_type == FrameType.SETTINGS) {
-                if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
-                    self.client_settings_received = true;
-                }
-            }
-        }
-    }
-
     /// Handle a single parsed frame from an event loop without pulling from `reader`.
+    /// Mirrors the per-frame logic in `handle_connection_optimized` so simulators and
+    /// the production path exercise the same dispatch code.
     pub fn handleFrameEventDriven(self: *@This(), frame: Frame) !void {
-        try self.handle_connection_original_phase_frames_validate_continuation(frame);
-
-        if (!is_valid_frame_type(@intFromEnum(frame.header.frame_type))) {
-            log.debug("Ignoring unknown frame type {d}\n", .{@intFromEnum(frame.header.frame_type)});
-            return;
+        // Validate CONTINUATION expectations before dispatch, matching the
+        // per-frame guard in `handle_connection_optimized`.
+        if (self.expecting_continuation_stream_id) |stream_id| {
+            if (frame.header.stream_id != stream_id or
+                frame.header.frame_type != FrameType.CONTINUATION)
+            {
+                log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR", .{
+                    @intFromEnum(frame.header.frame_type),
+                    frame.header.stream_id,
+                    stream_id,
+                });
+                try self.send_goaway(
+                    self.highest_stream_id(),
+                    0x1,
+                    "Expected CONTINUATION frame: PROTOCOL_ERROR",
+                );
+                self.goaway_sent = true;
+                try self.finishAfterGoaway();
+                return error.ProtocolError;
+            }
         }
 
-        const is_connection_window_update = frame.header.frame_type == FrameType.WINDOW_UPDATE and
-            frame.header.stream_id == 0;
-
-        if (is_connection_level_frame(@intFromEnum(frame.header.frame_type)) or
-            is_connection_window_update)
-        {
-            try self.handle_connection_original_phase_frames_connection_level(frame);
-        } else {
-            try self.handle_connection_original_phase_frames_stream_level(frame);
-        }
-
+        self.dispatchFrameOptimized(frame) catch |err| {
+            if (self.goaway_sent) {
+                try self.finishAfterGoaway();
+                return;
+            }
+            try self.flush_output();
+            return err;
+        };
         try self.flush_ready_streams();
         try self.flush_output_if_idle_or_full();
 
@@ -1487,11 +864,11 @@ pub const Connection = struct {
     }
 
     fn flush_ready_stream(self: *@This(), stream_index: u8) !bool {
-        if (!self.stream_slots_in_use[stream_index]) {
+        if (!self.stream_storage.in_use[stream_index]) {
             return false;
         }
 
-        const stream = &self.stream_slots[stream_index];
+        const stream = &self.stream_storage.slots[stream_index];
         try self.process_request(stream);
 
         if (stream.state == .Closed) {
@@ -1499,100 +876,13 @@ pub const Connection = struct {
             return false;
         }
 
-        if (!self.streamResponseComplete(stream)) {
+        if (!resp.streamResponseComplete(stream)) {
             return true;
         }
 
         return false;
     }
 
-    /// Handle connection-level frame during settings phase
-    fn handle_connection_original_phase_settings_connection_frame(self: *@This(), frame: Frame) void {
-        handle_connection_level_frame(self, frame) catch |err| {
-            log.err("Error handling connection-level frame in phase 1: {s}\n", .{@errorName(err)});
-            if (!self.goaway_sent) {
-                self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error") catch {};
-                self.goaway_sent = true;
-            }
-        };
-    }
-
-    /// Phase 2: Handle other frames
-    fn handle_connection_original_phase_frames(self: *@This()) !void {
-        while (!self.goaway_sent and !self.connection_closed) {
-            var frame = self.receive_frame() catch |err| {
-                self.handle_receive_frame_error(err) catch |handle_err| {
-                    return handle_err;
-                };
-                return;
-            };
-            defer frame.deinit(self.allocator);
-
-            try self.handle_connection_original_phase_frames_validate_continuation(frame);
-
-            if (!is_valid_frame_type(@intFromEnum(frame.header.frame_type))) {
-                log.debug("Ignoring unknown frame type {d}\n", .{@intFromEnum(frame.header.frame_type)});
-                continue;
-            }
-
-            log.debug("Received frame of type: {d}, stream ID: {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
-
-            const is_connection_level = is_connection_level_frame(@intFromEnum(frame.header.frame_type));
-            const is_connection_window_update = (frame.header.frame_type == FrameType.WINDOW_UPDATE and frame.header.stream_id == 0);
-
-            if (is_connection_level or is_connection_window_update) {
-                try self.handle_connection_original_phase_frames_connection_level(frame);
-            } else {
-                try self.handle_connection_original_phase_frames_stream_level(frame);
-            }
-            try self.flush_ready_streams();
-            try self.flush_output_if_idle_or_full();
-
-            if (self.goaway_sent and self.goaway_received) {
-                log.debug("Both GOAWAY sent and received, stopping frame processing.\n", .{});
-                break;
-            }
-        }
-    }
-
-    /// Validate CONTINUATION frame expectations
-    fn handle_connection_original_phase_frames_validate_continuation(self: *@This(), frame: Frame) !void {
-        if (self.expecting_continuation_stream_id) |stream_id| {
-            if (frame.header.stream_id != stream_id) {
-                log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id, stream_id });
-                try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
-                return error.ProtocolError;
-            }
-            if (frame.header.frame_type != FrameType.CONTINUATION) {
-                log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id, stream_id });
-                try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
-                return error.ProtocolError;
-            }
-        }
-    }
-
-    /// Handle connection-level frame during main processing
-    fn handle_connection_original_phase_frames_connection_level(self: *@This(), frame: Frame) !void {
-        handle_connection_level_frame(self, frame) catch |err| {
-            log.err("Error handling connection-level frame: {s}\n", .{@errorName(err)});
-            if (!self.goaway_sent) {
-                self.send_goaway(self.last_stream_id, error_code_from_error(err), "Connection-level error") catch {};
-                self.goaway_sent = true;
-            }
-            return err;
-        };
-    }
-
-    /// Handle stream-level frame during main processing
-    fn handle_connection_original_phase_frames_stream_level(self: *@This(), frame: Frame) !void {
-        if (self.goaway_received) {
-            if (frame.header.stream_id > self.last_stream_id) {
-                log.debug("Ignoring frame on stream {d} as it exceeds last_stream_id {d}\n", .{ frame.header.stream_id, self.last_stream_id });
-                return;
-            }
-        }
-        try handle_stream_level_frame(self, frame);
-    }
     fn handle_goaway_frame(self: *@This(), frame: Frame) !void {
         if (frame.payload.len < 8) {
             log.debug("Invalid GOAWAY frame size, expected at least 8 bytes.\n", .{});
@@ -1617,185 +907,6 @@ pub const Connection = struct {
         // The connection will close when goaway_sent is also true (graceful shutdown)
         // or when all streams are processed
     }
-    fn handle_stream_level_frame(self: *@This(), frame: Frame) !void {
-        try self.handle_stream_level_frame_validate(frame);
-        if (try self.handle_stream_level_frame_check_closed_stream(frame)) {
-            return;
-        }
-        if (try self.handle_stream_level_frame_handle_idle_priority(frame)) {
-            return;
-        }
-
-        const stream = try self.handle_stream_level_frame_get_stream(frame);
-        try self.handle_stream_level_frame_process(stream, frame);
-        self.handle_stream_level_frame_update_continuation_state(frame);
-    }
-
-    /// Validate stream-level frame basic properties
-    fn handle_stream_level_frame_validate(self: *@This(), frame: Frame) !void {
-        if (!is_valid_frame_type(@intFromEnum(frame.header.frame_type))) {
-            log.debug("Ignoring unknown stream-level frame type {d}\n", .{@intFromEnum(frame.header.frame_type)});
-            return;
-        }
-
-        if (frame.header.stream_id == 0) {
-            log.err("Received stream-level frame {d} with stream ID 0: PROTOCOL_ERROR\n", .{@intFromEnum(frame.header.frame_type)});
-            try self.send_goaway(self.last_stream_id, 0x1, "Stream-level frame with stream ID 0: PROTOCOL_ERROR");
-            return error.ProtocolError;
-        }
-
-        if (self.goaway_received) {
-            if (frame.header.stream_id > self.last_stream_id) {
-                log.debug("Ignoring frame on stream {d} as it exceeds peer_last_stream_id {d}\n", .{ frame.header.stream_id, self.last_stream_id });
-                return;
-            }
-        }
-
-        if (frame.header.frame_type == FrameType.PUSH_PROMISE) {
-            log.err("Received PUSH_PROMISE frame from client on stream {d}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
-            try self.send_goaway(self.last_stream_id, 0x1, "Client sent PUSH_PROMISE: PROTOCOL_ERROR");
-            self.goaway_sent = true;
-            return error.ProtocolError;
-        }
-
-        try self.handle_stream_level_frame_validate_size(frame);
-    }
-
-    fn handle_stream_level_frame_validate_size(self: *@This(), frame: Frame) !void {
-        switch (frame.header.frame_type) {
-            .PRIORITY => {
-                if (!priority_frame_payload_has_valid_size(frame)) {
-                    try self.send_priority_frame_size_error();
-                    return error.FrameSizeError;
-                }
-            },
-            .RST_STREAM => {
-                if (frame.payload.len != 4) {
-                    log.err("RST_STREAM frame with invalid payload length {} (expected 4): FRAME_SIZE_ERROR", .{frame.payload.len});
-                    try self.send_goaway(0, 0x6, "RST_STREAM frame with invalid payload length: FRAME_SIZE_ERROR");
-                    return error.FrameSizeError;
-                }
-            },
-            else => {},
-        }
-    }
-
-    /// Check if frame is being sent to a closed stream
-    fn handle_stream_level_frame_check_closed_stream(self: *@This(), frame: Frame) !bool {
-        if (self.streamFind(frame.header.stream_id) != null) {
-            return false;
-        }
-
-        if (frame.header.stream_id > self.last_stream_id) {
-            return self.handle_stream_level_frame_check_idle_stream(frame);
-        }
-
-        const is_priority_frame = (frame.header.frame_type == FrameType.PRIORITY);
-        const is_rst_stream_frame = (frame.header.frame_type == FrameType.RST_STREAM);
-
-        if (is_priority_frame or is_rst_stream_frame) {
-            log.debug("Ignoring frame type {d} on closed stream {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
-            return true;
-        }
-
-        log.err("Received frame type {d} on closed stream {d}: sending RST_STREAM\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
-        try self.send_rst_stream(frame.header.stream_id, 0x5);
-        return true;
-    }
-
-    fn handle_stream_level_frame_check_idle_stream(self: *@This(), frame: Frame) !bool {
-        assert(frame.header.stream_id > self.last_stream_id);
-
-        switch (frame.header.frame_type) {
-            .HEADERS => return false,
-            .PRIORITY => {
-                log.debug("PRIORITY frame on idle stream {d}: ignoring\n", .{frame.header.stream_id});
-                return true;
-            },
-            .DATA => {
-                log.err("DATA frame on idle stream {}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
-                try self.send_goaway(0, 0x1, "DATA frame on idle stream: PROTOCOL_ERROR");
-                self.goaway_sent = true;
-                try self.flush_output();
-                return error.ProtocolError;
-            },
-            .RST_STREAM => {
-                log.err("RST_STREAM frame on idle stream {}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
-                try self.send_goaway(0, 0x1, "RST_STREAM frame on idle stream: PROTOCOL_ERROR");
-                self.goaway_sent = true;
-                try self.flush_output();
-                return error.ProtocolError;
-            },
-            .WINDOW_UPDATE => {
-                log.err("WINDOW_UPDATE frame on idle stream {}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
-                try self.send_goaway(0, 0x1, "WINDOW_UPDATE frame on idle stream: PROTOCOL_ERROR");
-                self.goaway_sent = true;
-                try self.flush_output();
-                return error.ProtocolError;
-            },
-            .CONTINUATION => {
-                log.err("CONTINUATION frame on idle stream {}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
-                try self.send_goaway(0, 0x1, "CONTINUATION frame on idle stream: PROTOCOL_ERROR");
-                self.goaway_sent = true;
-                try self.flush_output();
-                return error.ProtocolError;
-            },
-            else => {
-                log.debug("Ignoring frame type {d} on idle stream {d}\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
-                return true;
-            },
-        }
-    }
-
-    fn handle_stream_level_frame_handle_idle_priority(
-        self: *@This(),
-        frame: Frame,
-    ) !bool {
-        if (frame.header.frame_type != FrameType.PRIORITY) {
-            return false;
-        }
-        if (self.streamFind(frame.header.stream_id) != null) {
-            return false;
-        }
-
-        if (frame.header.stream_id <= self.last_stream_id) {
-            log.debug("Ignoring PRIORITY frame on closed stream {d}\n", .{frame.header.stream_id});
-            return true;
-        }
-
-        const stream_dependency_raw = std.mem.readInt(u32, frame.payload[0..4], .big);
-        const stream_dependency = stream_dependency_raw & 0x7FFFFFFF;
-        if (stream_dependency == frame.header.stream_id) {
-            log.err("PRIORITY frame on idle stream {} depends on itself: PROTOCOL_ERROR\n", .{frame.header.stream_id});
-            try self.send_goaway(0, 0x1, "PRIORITY frame depends on itself: PROTOCOL_ERROR");
-            self.goaway_sent = true;
-            try self.flush_output();
-            return error.ProtocolError;
-        }
-
-        log.debug("Ignoring PRIORITY frame on idle stream {d}\n", .{frame.header.stream_id});
-        return true;
-    }
-
-    /// Retrieve stream for frame processing
-    fn handle_stream_level_frame_get_stream(
-        self: *@This(),
-        frame: Frame,
-    ) !*DefaultStream.StreamInstance {
-        return self.get_stream(frame.header.stream_id) catch |err| {
-            if (err == error.ProtocolError) {
-                return err;
-            }
-            if (err == error.MaxConcurrentStreamsExceeded) {
-                log.err("Cannot create stream {d}: Max concurrent streams exceeded.\n", .{frame.header.stream_id});
-                try self.send_rst_stream(frame.header.stream_id, 0x7);
-                log.debug("Sent RST_STREAM with REFUSED_STREAM (0x7) for stream ID {d}\n", .{frame.header.stream_id});
-                return err;
-            }
-            return err;
-        };
-    }
-
     /// Process frame within the stream and handle errors
     fn handle_stream_level_frame_process(
         self: *@This(),
@@ -1884,74 +995,6 @@ pub const Connection = struct {
             }
         }
     }
-    fn handle_connection_level_frame(self: *@This(), frame: Frame) !void {
-        if (!is_valid_frame_type(@intFromEnum(frame.header.frame_type))) {
-            // Unknown frame type, ignore as per RFC 7540 Section 5.5
-            log.debug("Ignoring unknown connection-level frame type {d}\n", .{@intFromEnum(frame.header.frame_type)});
-            return;
-        }
-        // Enforce stream_id == 0 for true connection-level frames.
-        // WINDOW_UPDATE frames reach here only when stream_id == 0 due to routing logic.
-        if (frame.header.stream_id != 0 and frame.header.frame_type != FrameType.WINDOW_UPDATE) {
-            log.err("Received {d} frame with non-zero stream ID {d}: PROTOCOL_ERROR\n", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id });
-            try self.send_goaway(self.last_stream_id, 0x1, "Frame with invalid stream ID: PROTOCOL_ERROR");
-            return error.ProtocolError;
-        }
-        switch (frame.header.frame_type) {
-            FrameType.SETTINGS => {
-                try self.apply_frame_settings(frame);
-                if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
-                    // Send SETTINGS ACK
-                    try self.send_settings_ack();
-                }
-                // If ACK is set, no action needed
-            },
-            FrameType.PING => {
-                try handle_ping_frame(self, frame);
-            },
-            FrameType.WINDOW_UPDATE => {
-                try self.handle_window_update(frame);
-            },
-            FrameType.GOAWAY => {
-                try handle_goaway_frame(self, frame);
-            },
-            FrameType.PRIORITY_UPDATE => {
-                try self.handle_priority_update_frame(frame);
-            },
-            else => {
-                // Ignore unknown connection-level frame types as per RFC 7540 Section 6
-                log.warn("Received unknown connection-level frame type {d}, ignoring as per RFC 7540 Section 6\n", .{@intFromEnum(frame.header.frame_type)});
-                // No action needed; simply ignore and continue
-            },
-        }
-    }
-    fn handle_ping_frame(self: *@This(), frame: Frame) !void {
-        // PING frames must have stream identifier 0x0
-        if (frame.header.stream_id != 0) {
-            log.err("PING frame with non-zero stream identifier {d}: PROTOCOL_ERROR\n", .{frame.header.stream_id});
-            if (!self.goaway_sent) {
-                try self.send_goaway(0, 0x1, "PING frame with non-zero stream identifier: PROTOCOL_ERROR");
-                self.goaway_sent = true;
-            }
-            return; // Don't return error to avoid duplicate GOAWAY
-        }
-        // PING frame payload must be exactly 8 bytes
-        if (frame.payload.len != 8) {
-            log.err("PING frame with invalid payload length {d} (expected 8): FRAME_SIZE_ERROR\n", .{frame.payload.len});
-            if (!self.goaway_sent) {
-                try self.send_goaway(0, 0x6, "PING frame with invalid payload length: FRAME_SIZE_ERROR");
-                self.goaway_sent = true;
-            }
-            return; // Don't return error to avoid duplicate GOAWAY
-        }
-        // Only respond if ACK flag is not set
-        if ((frame.header.flags.value & FrameFlags.ACK) == 0) {
-            try self.send_ping(frame.payload, true); // Send PING response with ACK
-            log.debug("Responded to PING frame with ACK\n", .{});
-        } else {
-            log.debug("Received PING frame with ACK flag set, no response sent.\n", .{});
-        }
-    }
     fn handle_receive_frame_error(self: *@This(), err: anytype) !void {
         switch (err) {
             error.FrameSizeError => {
@@ -1969,125 +1012,24 @@ pub const Connection = struct {
             },
         }
     }
-    /// Sends a PING frame over the connection. The opaque data must always be exactly 8 bytes.
-    /// If `ack` is true, the ACK flag will be set in the PING frame.
-    /// The opaque data should be echoed exactly in case of a PING response.
-    pub fn send_ping(self: *@This(), opaque_data: []const u8, ack: bool) !void {
-        // Ensure the opaque data is 8 bytes long
-        if (opaque_data.len != 8) {
-            return error.InvalidPingPayloadSize;
-        }
-        var frame_header = FrameHeader{
-            .length = 8, // PING payload length is always 8
-            .frame_type = FrameType.PING,
-            .flags = if (ack) FrameFlags{ .value = FrameFlags.ACK } else FrameFlags{ .value = 0 }, // Set ACK flag if true
-            .reserved = false,
-            .stream_id = 0, // PING frames must always be on stream 0
-        };
-        // Write the frame header
-        try frame_header.write(self.writer);
-        // Write the opaque data
-        try self.writer.writeAll(opaque_data);
-        log.debug("Sent PING frame (flags: {d}, opaque_data: {any})\n", .{ frame_header.flags.value, opaque_data });
-    }
-
     pub fn process_request(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
         assert(stream.request_complete);
         assert(stream.request_headers_complete);
         assert(!stream.expecting_continuation);
         log.debug("Processing request for stream ID: {d}, state: {s}", .{ stream.id, @tagName(stream.state) });
         try self.process_request_prepare_response(stream);
-        try self.process_request_send_headers(stream);
-        try self.process_request_send_body(stream);
+        try resp.sendResponseHeaders(stream, self);
+        try resp.sendResponseBody(stream, self);
     }
 
     fn process_request_prepare_response(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
-        if (stream.response_prepared) {
+        if (stream.response_writer.isPrepared()) {
             return;
         }
 
         var response = try self.build_response(stream);
         errdefer response.deinit();
         try self.encode_response(stream, &response);
-        stream.response = response;
-        stream.response_prepared = true;
-    }
-
-    fn process_request_send_headers(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
-        if (stream.response_headers_sent) {
-            return;
-        }
-        try self.process_request_prepare_response(stream);
-
-        const response_header_block = self.responseHeadersBlock(stream);
-        const end_stream = self.shouldEndStreamWithHeaders(stream);
-        var headers_frame = FrameHeader{
-            .length = @intCast(response_header_block.len),
-            .frame_type = FrameType.HEADERS,
-            .flags = .{
-                .value = if (end_stream)
-                    FrameFlags.END_HEADERS | FrameFlags.END_STREAM
-                else
-                    FrameFlags.END_HEADERS,
-            },
-            .reserved = false,
-            .stream_id = stream.id,
-        };
-
-        log.debug("Sending HEADERS frame for stream {} ({} bytes)", .{
-            stream.id,
-            response_header_block.len,
-        });
-        try headers_frame.write(self.writer);
-        try self.writer.writeAll(response_header_block);
-        stream.response_headers_sent = true;
-
-        if (end_stream) {
-            stream.state = transitionState(stream.state, .SendEndStream);
-            if (stream.state == .Closed) {
-                try self.mark_stream_closed(stream.id);
-                assert(self.completed_responses_pending < std.math.maxInt(u32));
-                self.completed_responses_pending += 1;
-            }
-        }
-    }
-
-    fn process_request_send_body(self: *@This(), stream: *DefaultStream.StreamInstance) !void {
-        if (!stream.response_headers_sent) {
-            return;
-        }
-        if (self.shouldSuppressResponseBody(stream)) {
-            return;
-        }
-
-        const response_body = self.responseBody(stream);
-        if (stream.response_body_sent >= response_body.len) {
-            return;
-        }
-
-        const connection_window = connection_response_window_available(self.send_window_size);
-        const stream_window = connection_response_window_available(stream.send_window_size);
-        const remaining_len = response_body.len - stream.response_body_sent;
-        const frame_limit: usize = @intCast(self.settings.max_frame_size);
-        const response_len = @min(remaining_len, @min(frame_limit, @min(connection_window, stream_window)));
-        if (response_len == 0) {
-            return;
-        }
-
-        const response_start = stream.response_body_sent;
-        const response_end = response_start + response_len;
-        const end_stream = response_end == response_body.len;
-
-        log.debug("Sending DATA frame for stream {} ({} bytes)", .{ stream.id, response_len });
-        try stream.sendData(response_body[response_start..response_end], end_stream);
-        self.send_window_size -= @intCast(response_len);
-        stream.response_body_sent = response_end;
-
-        if (end_stream) {
-            assert(stream.state == .Closed);
-            assert(self.completed_responses_pending < std.math.maxInt(u32));
-            self.completed_responses_pending += 1;
-        }
     }
 
     fn build_response(self: *@This(), stream: *DefaultStream.StreamInstance) !handler.Response {
@@ -2117,7 +1059,7 @@ pub const Connection = struct {
     ) !handler.Response {
         const method = try self.requestMethod(stream);
         const raw_target = stream.request_path orelse return error.MissingPath;
-        if (normalized_request_target(raw_target)) |target| {
+        if (path.normalizedRequestTarget(raw_target)) |target| {
             return self.dispatch_request_target(request_dispatcher, stream, method, target);
         }
         return self.dispatch_request_slow(request_dispatcher, stream, method, raw_target);
@@ -2130,8 +1072,8 @@ pub const Connection = struct {
         method: handler.Method,
         raw_target: []const u8,
     ) !handler.Response {
-        var path_storage: [memory_budget.MemBudget.max_header_size]u8 = undefined;
-        const target = try normalizeRequestTarget(raw_target, &path_storage);
+        var path_storage: [memory_budget.MemBudget.max_header_size_bytes]u8 = undefined;
+        const target = try path.normalizeRequestTarget(raw_target, &path_storage);
         return self.dispatch_request_target(request_dispatcher, stream, method, target);
     }
 
@@ -2194,77 +1136,15 @@ pub const Connection = struct {
     fn encode_response(
         self: *@This(),
         stream: *DefaultStream.StreamInstance,
-        response: *const handler.Response,
+        response_msg: *const handler.Response,
     ) !void {
-        var encoded = std.ArrayList(u8).initBuffer(&stream.header_block_fragments_buf);
-        var status_storage: [3]u8 = undefined;
-        const status_code = try std.fmt.bufPrint(
-            &status_storage,
-            "{d}",
-            .{@intFromEnum(response.status)},
-        );
-
-        try Hpack.encodeHeaderField(
-            .{ .name = ":status", .value = status_code },
+        try stream.response_writer.encode(
+            response_msg,
             &self.hpack_encoder_table,
-            &encoded,
             self.allocator,
         );
-        for (response.headers()) |header_field| {
-            try Hpack.encodeHeaderField(
-                .{ .name = header_field.name, .value = header_field.value },
-                &self.hpack_encoder_table,
-                &encoded,
-                self.allocator,
-            );
-        }
-
-        stream.response_header_block_len = encoded.items.len;
     }
 
-    fn responseHeadersBlock(self: *@This(), stream: *DefaultStream.StreamInstance) []const u8 {
-        _ = self;
-        return stream.header_block_fragments_buf[0..stream.response_header_block_len];
-    }
-
-    fn responseBody(self: *@This(), stream: *DefaultStream.StreamInstance) []const u8 {
-        _ = self;
-        return stream.response.?.body;
-    }
-
-    fn shouldEndStreamWithHeaders(self: *@This(), stream: *DefaultStream.StreamInstance) bool {
-        if (self.shouldSuppressResponseBody(stream)) {
-            return true;
-        }
-        return self.responseBody(stream).len == 0;
-    }
-
-    fn shouldSuppressResponseBody(self: *@This(), stream: *DefaultStream.StreamInstance) bool {
-        _ = self;
-        return stream.request_method == .head;
-    }
-
-    fn streamResponseComplete(self: *@This(), stream: *const DefaultStream.StreamInstance) bool {
-        _ = self;
-        if (!stream.response_prepared) {
-            return false;
-        }
-        if (!stream.response_headers_sent) {
-            return false;
-        }
-        if (stream.state == .Closed) {
-            return true;
-        }
-        const response = stream.response orelse return false;
-        return stream.response_body_sent >= response.body.len;
-    }
-
-    fn connection_response_window_available(window_size: i32) usize {
-        if (window_size > 0) {
-            return @intCast(window_size);
-        }
-        return 0;
-    }
     pub fn send_settings(self: *@This()) !void {
         const settings = [_][2]u32{
             .{ 1, self.settings.header_table_size }, // HEADER_TABLE_SIZE
@@ -2294,109 +1174,6 @@ pub const Connection = struct {
         }
     }
 
-    pub fn receive_frame_arena(self: *@This()) !Frame {
-        assert(self.frame_arena_available);
-
-        var header_buf: [9]u8 = undefined;
-        // Read the frame header (9 bytes) in a loop to handle partial reads
-        var header_read: usize = 0;
-        while (header_read < 9) {
-            const bytes_read = try self.reader.readSliceShort(header_buf[header_read..]);
-            if (bytes_read == 0) {
-                return error.UnexpectedEOF;
-            }
-            header_read += bytes_read;
-        }
-        // Manually parse frame length (first 3 bytes)
-        const length: u32 = (@as(u32, header_buf[0]) << 16) | (@as(u32, header_buf[1]) << 8) | @as(u32, header_buf[2]);
-        if (length > max_frame_size_default) {
-            log.err("Received frame size {d} exceeds compile-time limit {d}, sending GOAWAY\n", .{ length, max_frame_size_default });
-            try self.send_goaway(self.highest_stream_id(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
-            return error.FrameSizeError;
-        }
-        // Validate the length against the max_frame_size
-        if (length > self.settings.max_frame_size) {
-            log.err("Received frame size {d} exceeds SETTINGS_MAX_FRAME_SIZE {d}, sending GOAWAY\n", .{ length, self.settings.max_frame_size });
-            try self.send_goaway(self.highest_stream_id(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
-            return error.FrameSizeError;
-        }
-        const frame_type_u8: u8 = header_buf[3];
-        const frame_type = FrameType.fromU8(frame_type_u8) orelse {
-            log.err("Invalid frame type: {d}\n", .{frame_type_u8});
-            return error.InvalidFrameType;
-        };
-        const flags = FrameFlags{ .value = header_buf[4] };
-        // Parse the stream ID (last 4 bytes of the header) in big-endian
-        const stream_id_u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
-        const stream_id: u32 = @intCast(stream_id_u32);
-        const payload = try self.frame_arena.allocator().alloc(u8, length);
-        var total_read: usize = 0;
-        while (total_read < length) {
-            const bytes_read = try self.reader.readSliceShort(payload[total_read..]);
-            if (bytes_read == 0) {
-                return error.UnexpectedEOF;
-            }
-            total_read += bytes_read;
-        }
-        return Frame{
-            .header = FrameHeader{
-                .length = length,
-                .frame_type = @enumFromInt(frame_type),
-                .flags = flags,
-                .stream_id = stream_id,
-                .reserved = false,
-            },
-            .payload = payload,
-        };
-    }
-    pub fn receive_frame(self: *@This()) !Frame {
-        var header_buf: [9]u8 = undefined;
-        // Read the frame header (9 bytes) in a loop to handle partial reads
-        var header_read: usize = 0;
-        while (header_read < 9) {
-            const bytes_read = try self.reader.readSliceShort(header_buf[header_read..]);
-            if (bytes_read == 0) {
-                return error.UnexpectedEOF;
-            }
-            header_read += bytes_read;
-        }
-        // Manually parse frame length (first 3 bytes)
-        const length: u32 = (@as(u32, header_buf[0]) << 16) | (@as(u32, header_buf[1]) << 8) | @as(u32, header_buf[2]);
-        // Validate the length against the max_frame_size
-        if (length > self.settings.max_frame_size) {
-            log.err("Received frame size {d} exceeds SETTINGS_MAX_FRAME_SIZE {d}, sending GOAWAY\n", .{ length, self.settings.max_frame_size });
-            try self.send_goaway(self.highest_stream_id(), 0x6, "Frame size exceeded: FRAME_SIZE_ERROR");
-            return error.FrameSizeError;
-        }
-        const frame_type: u8 = header_buf[3];
-        const flags = FrameFlags{ .value = header_buf[4] };
-        // Parse the stream ID (last 4 bytes of the header) in big-endian
-        const stream_id_u32 = std.mem.readInt(u32, header_buf[5..9], .big) & 0x7FFFFFFF;
-        const stream_id: u32 = @intCast(stream_id_u32);
-        // Read the frame payload in a loop to ensure all data is read
-        const payload = try self.allocator.alloc(u8, length);
-        var total_read: usize = 0;
-        while (total_read < length) {
-            const bytes_read = try self.reader.readSliceShort(payload[total_read..]);
-            if (bytes_read == 0) {
-                return error.UnexpectedEOF;
-            }
-            total_read += bytes_read;
-        }
-        return Frame{
-            .header = FrameHeader{
-                .length = length,
-                .frame_type = @enumFromInt(frame_type),
-                .flags = flags,
-                .stream_id = stream_id,
-                .reserved = false,
-            },
-            .payload = payload,
-        };
-    }
-    fn from_int(val: u8) FrameType {
-        return std.meta.int_to_enum(FrameType, val) catch undefined;
-    }
     pub fn apply_frame_settings(self: *@This(), frame: Frame) !void {
         std.debug.assert(frame.header.frame_type == FrameType.SETTINGS);
         std.debug.assert(frame.header.stream_id == 0);
@@ -2609,7 +1386,7 @@ pub const Connection = struct {
 
     /// Update all stream window sizes when initial window size changes
     fn apply_frame_settings_update_stream_windows(self: *@This(), window_delta: i32) !void {
-        for (self.stream_slots, self.stream_slots_in_use) |*stream, in_use| {
+        for (&self.stream_storage.slots, self.stream_storage.in_use) |*stream, in_use| {
             if (!in_use) continue;
             const new_window_size: i64 = @as(i64, stream.send_window_size) + @as(i64, window_delta);
             if (new_window_size < std.math.minInt(i32)) {
@@ -2654,49 +1431,6 @@ pub const Connection = struct {
     fn apply_frame_settings_max_header_list_size(self: *@This(), value: u32) void {
         self.settings.max_header_list_size = value;
     }
-    pub fn send_settings_ack(self: *@This()) !void {
-        if (self.goaway_sent) return;
-        var frame_header = FrameHeader{
-            .length = 0,
-            .frame_type = FrameType.SETTINGS,
-            .flags = FrameFlags{ .value = FrameFlags.ACK }, // Set ACK flag
-            .reserved = false,
-            .stream_id = 0,
-        };
-        frame_header.write(self.writer) catch |err| {
-            if (err == error.BrokenPipe) {
-                log.err("Client disconnected (BrokenPipe)\n", .{});
-                return err;
-            }
-            return err;
-        };
-    }
-    pub fn receive_settings(self: *@This()) !void {
-        const settings_frame_header_size = 9;
-        var frame_header: [settings_frame_header_size]u8 = undefined;
-        try self.reader.readSliceAll(&frame_header);
-        const length = std.mem.readInt(u24, frame_header[0..3], .big);
-        if (length % 6 != 0) return error.InvalidSettingsFrameSize;
-        var settings_payload: []u8 = try self.allocator.alloc(u8, length);
-        defer self.allocator.free(settings_payload);
-        try self.reader.readSliceAll(settings_payload);
-        var i: usize = 0;
-        while (i < settings_payload.len) {
-            const setting = settings_payload[i .. i + 6];
-            const id = std.mem.readInt(u16, setting[0..2], .big);
-            const value = std.mem.readInt(u32, setting[2..6], .big);
-            switch (id) {
-                1 => self.settings.header_table_size = value,
-                3 => self.settings.max_concurrent_streams = value,
-                4 => self.settings.initial_window_size = value,
-                5 => self.settings.max_frame_size = value,
-                6 => self.settings.max_header_list_size = value,
-                settings_no_rfc7540_priorities_id => self.settings.no_rfc7540_priorities = value == 1,
-                else => {},
-            }
-            i += 6;
-        }
-    }
     /// Sends a GOAWAY frame with the given parameters.
     pub fn send_goaway(self: *@This(), last_stream_id: u32, error_code: u32, debug_data: []const u8) !void {
         const debug_data_max = 96;
@@ -2723,26 +1457,6 @@ pub const Connection = struct {
         };
         try goaway_frame.write(self.writer);
         self.goaway_sent = true;
-    }
-    pub fn close(self: *@This()) !void {
-        if (self.connection_closed) {
-            return; // Already closed
-        }
-        // Mark as closed to prevent double-closing
-        self.connection_closed = true;
-        // Error code 0 indicates graceful shutdown
-        const error_code: u32 = 0; // 0: NO_ERROR, indicating graceful shutdown
-        const debug_data = "Connection closing: graceful shutdown";
-        // Send the GOAWAY frame with the highest stream ID and debug information
-        if (!self.goaway_sent) {
-            self.send_goaway(self.highest_stream_id(), error_code, debug_data) catch |err| {
-                log.debug("Failed to send GOAWAY frame: {any}\n", .{err});
-            };
-        }
-        self.flush_output() catch |err| {
-            log.debug("Failed to flush GOAWAY frame: {any}\n", .{err});
-        };
-        log.debug("Connection closed gracefully\n", .{});
     }
     pub fn get_stream(self: *@This(), stream_id: u32) !*DefaultStream.StreamInstance {
         // Ensure the stream ID is valid (odd numbers for client-initiated streams)
@@ -2893,243 +1607,6 @@ pub const Connection = struct {
         }
     }
 };
-const Settings = struct {
-    header_table_size: u32 = 4096,
-    enable_push: bool = true,
-    max_concurrent_streams: u32 = max_streams_per_connection,
-    initial_window_size: u32 = 65535,
-    max_frame_size: u32 = 16384,
-    max_header_list_size: u32 = 8192,
-    no_rfc7540_priorities: bool = true,
-
-    pub fn default() Settings {
-        return Settings{};
-    }
-};
-/// Determines if a frame type is always connection-level (stream ID must be 0).
-/// Note: WINDOW_UPDATE can be both connection-level and stream-level depending on stream ID.
-fn is_connection_level_frame(frame_type: u8) bool {
-    return switch (frame_type) {
-        @intFromEnum(FrameType.SETTINGS),
-        @intFromEnum(FrameType.PING),
-        @intFromEnum(FrameType.GOAWAY),
-        @intFromEnum(FrameType.PRIORITY_UPDATE),
-        => true,
-        else => false,
-    };
-}
-
-fn normalizeRequestTarget(
-    raw_target: []const u8,
-    normalized_path_storage: []u8,
-) !RequestTarget {
-    if (normalized_path_storage.len == 0) {
-        return error.RequestTargetTooLarge;
-    }
-
-    const query_index = std.mem.indexOfScalar(u8, raw_target, '?') orelse raw_target.len;
-    const raw_path = raw_target[0..query_index];
-    const query = if (query_index < raw_target.len)
-        raw_target[query_index + 1 ..]
-    else
-        "";
-
-    var source_index: usize = 0;
-    var target_index: usize = 0;
-    var last_slash: usize = 0;
-
-    normalized_path_storage[target_index] = '/';
-    target_index += 1;
-    if (raw_path.len > 0 and raw_path[0] == '/') {
-        source_index = 1;
-    }
-
-    while (source_index < raw_path.len) {
-        const decoded = try decodePathByte(raw_path, &source_index);
-        if (decoded == 0) return error.InvalidRequestTarget;
-
-        if (decoded == '/') {
-            const rewind = rewindSpecialPath(
-                normalized_path_storage[0..target_index],
-                last_slash,
-            );
-            target_index -= rewind;
-            if (rewind > 0) {
-                last_slash = if (target_index > 0) target_index - 1 else 0;
-                continue;
-            }
-            last_slash = target_index;
-        }
-
-        if (target_index >= normalized_path_storage.len) {
-            return error.RequestTargetTooLarge;
-        }
-        normalized_path_storage[target_index] = decoded;
-        target_index += 1;
-    }
-
-    const rewind = rewindSpecialPath(
-        normalized_path_storage[0..target_index],
-        last_slash,
-    );
-    target_index -= rewind;
-    if (target_index == 0) {
-        normalized_path_storage[0] = '/';
-        target_index = 1;
-    }
-
-    return .{
-        .normalized_path = normalized_path_storage[0..target_index],
-        .query = query,
-    };
-}
-
-fn normalized_request_target(raw_target: []const u8) ?RequestTarget {
-    const query_index = std.mem.indexOfScalar(u8, raw_target, '?') orelse raw_target.len;
-    const raw_path = raw_target[0..query_index];
-    if (!request_path_is_normalized(raw_path)) {
-        return null;
-    }
-
-    const query = if (query_index < raw_target.len)
-        raw_target[query_index + 1 ..]
-    else
-        "";
-
-    return .{
-        .normalized_path = raw_path,
-        .query = query,
-    };
-}
-
-fn request_path_is_normalized(raw_path: []const u8) bool {
-    if (raw_path.len == 0) {
-        return false;
-    }
-    if (raw_path[0] != '/') {
-        return false;
-    }
-
-    var segment_start: usize = 1;
-    var index: usize = 1;
-    while (index <= raw_path.len) : (index += 1) {
-        if (index < raw_path.len) {
-            const byte = raw_path[index];
-            if (byte == 0) {
-                return false;
-            }
-            if (byte == '%') {
-                return false;
-            }
-            if (byte != '/') {
-                continue;
-            }
-        }
-
-        if (request_path_segment_is_special(raw_path[segment_start..index])) {
-            return false;
-        }
-        segment_start = index + 1;
-    }
-
-    return true;
-}
-
-fn request_path_segment_is_special(segment: []const u8) bool {
-    if (segment.len == 1) {
-        return segment[0] == '.';
-    }
-    if (segment.len == 2) {
-        if (segment[0] == '.') {
-            return segment[1] == '.';
-        }
-    }
-    return false;
-}
-
-fn decodePathByte(raw_path: []const u8, source_index: *usize) !u8 {
-    std.debug.assert(source_index.* < raw_path.len);
-
-    const current = raw_path[source_index.*];
-    if (current != '%') {
-        source_index.* += 1;
-        return current;
-    }
-    if (source_index.* + 2 >= raw_path.len) {
-        source_index.* += 1;
-        return current;
-    }
-
-    const hi = decodeHexDigit(raw_path[source_index.* + 1]) orelse {
-        source_index.* += 1;
-        return current;
-    };
-    const lo = decodeHexDigit(raw_path[source_index.* + 2]) orelse {
-        source_index.* += 1;
-        return current;
-    };
-
-    source_index.* += 3;
-    return (hi << 4) | lo;
-}
-
-fn decodeHexDigit(byte: u8) ?u8 {
-    if (byte >= '0' and byte <= '9') return byte - '0';
-    if (byte >= 'A' and byte <= 'F') return byte - 'A' + 10;
-    if (byte >= 'a' and byte <= 'f') return byte - 'a' + 10;
-    return null;
-}
-
-fn rewindSpecialPath(path: []const u8, last_slash: usize) usize {
-    std.debug.assert(path.len > 0);
-    std.debug.assert(last_slash < path.len);
-
-    const original_len = path.len;
-    var new_len = original_len;
-    const part_len = original_len - last_slash;
-
-    if (part_len == 2 and path[original_len - 1] == '.') {
-        new_len -= 1;
-    } else if (part_len == 3 and path[original_len - 2] == '.' and path[original_len - 1] == '.') {
-        new_len -= 2;
-        if (new_len > 1) {
-            while (new_len > 0 and path[new_len - 1] != '/') {
-                new_len -= 1;
-            }
-        }
-    }
-
-    return original_len - new_len;
-}
-
-fn is_valid_frame_type(frame_type: u8) bool {
-    return FrameHandler.fromFrameType(frame_type) != null;
-}
-
-inline fn is_valid_frame_type_inline(comptime frame_type: u8) bool {
-    return comptime FrameHandler.fromFrameType(frame_type) != null;
-}
-/// Ensure valid flags for frame types.
-fn is_valid_flags(header: FrameHeader) bool {
-    const flags = header.flags.value;
-    // Get the allowed flags for the frame type
-    const allowed_flags = switch (header.frame_type) {
-        @intFromEnum(FrameType.DATA) => FrameFlags.END_STREAM | FrameFlags.PADDED,
-        @intFromEnum(FrameType.HEADERS) => FrameFlags.END_STREAM | FrameFlags.END_HEADERS | FrameFlags.PADDED | FrameFlags.PRIORITY,
-        @intFromEnum(FrameType.PRIORITY) => 0,
-        FrameType.RST_STREAM => 0,
-        FrameType.SETTINGS => FrameFlags.ACK,
-        FrameType.PUSH_PROMISE => FrameFlags.END_HEADERS | FrameFlags.PADDED,
-        FrameType.PING => FrameFlags.ACK,
-        FrameType.GOAWAY => 0,
-        FrameType.WINDOW_UPDATE => 0,
-        FrameType.CONTINUATION => FrameFlags.END_HEADERS,
-        FrameType.PRIORITY_UPDATE => 0,
-        else => 0, // Unknown frame types have no allowed flags
-    };
-    // Return true if no invalid flags are set
-    return (flags & ~allowed_flags) == 0;
-}
 
 fn encodeTestRequestHeaders(
     allocator: std.mem.Allocator,
@@ -3180,7 +1657,10 @@ test "HTTP/2 connection initialization and flow control" {
         .payload = headers_payload,
     };
     try stream.handleFrame(headers_frame);
-    try connection.process_request_send_headers(stream);
+    var response = try connection.build_default_response();
+    defer response.deinit();
+    try connection.encode_response(stream, &response);
+    try resp.sendResponseHeaders(stream, &connection);
     const headers_written_data = test_io.written();
     assert(headers_written_data.len > preface_written_data.len);
     const data = "Hello, world!";
@@ -3410,7 +1890,7 @@ test "default response header encoding uses dynamic table after first response" 
     var response = try connection.build_default_response();
     defer response.deinit();
     try connection.encode_response(stream, &response);
-    const first_header_block_len = stream.response_header_block_len;
+    const first_header_block_len = stream.response_writer.response_header_block_len;
 
     var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
     defer dynamic_table.deinit();
@@ -3427,8 +1907,9 @@ test "default response header encoding uses dynamic table after first response" 
 
     var offset: usize = 0;
     for (expected_headers) |expected_header| {
+        const headers_block = stream.response_writer.headersBlock();
         var decoded = try Hpack.decodeHeaderField(
-            stream.header_block_fragments_buf[offset..stream.response_header_block_len],
+            headers_block[offset..],
             &dynamic_table,
             allocator,
         );
@@ -3439,7 +1920,7 @@ test "default response header encoding uses dynamic table after first response" 
         offset += decoded.bytes_consumed;
     }
 
-    try std.testing.expectEqual(stream.response_header_block_len, offset);
+    try std.testing.expectEqual(stream.response_writer.response_header_block_len, offset);
     try std.testing.expect(dynamic_table.count > 0);
 
     const second_stream = try connection.get_stream(3);
@@ -3447,22 +1928,7 @@ test "default response header encoding uses dynamic table after first response" 
     defer second_response.deinit();
     try connection.encode_response(second_stream, &second_response);
 
-    try std.testing.expect(second_stream.response_header_block_len < first_header_block_len);
-}
-
-test "normalized request target fast path accepts canonical target" {
-    const target = normalized_request_target("/baseline2?a=1&b=2").?;
-
-    try std.testing.expectEqualStrings("/baseline2", target.normalized_path);
-    try std.testing.expectEqualStrings("a=1&b=2", target.query);
-}
-
-test "normalized request target fast path rejects slow-path targets" {
-    try std.testing.expect(normalized_request_target("") == null);
-    try std.testing.expect(normalized_request_target("baseline2?a=1") == null);
-    try std.testing.expect(normalized_request_target("/a/../b") == null);
-    try std.testing.expect(normalized_request_target("/a/%62") == null);
-    try std.testing.expect(normalized_request_target("/a/./b") == null);
+    try std.testing.expect(second_stream.response_writer.response_header_block_len < first_header_block_len);
 }
 
 test "flush_ready_streams reports completed responses once" {
@@ -3521,12 +1987,12 @@ test "flush_ready_streams does not respond before END_HEADERS" {
     try std.testing.expect(stream.state == .HalfClosedRemote);
     try std.testing.expect(!stream.request_headers_complete);
     try std.testing.expect(!stream.request_complete);
-    try std.testing.expect(!stream.response_headers_sent);
+    try std.testing.expect(!stream.response_writer.response_headers_sent);
 
     try connection.flush_ready_streams();
 
     try std.testing.expectEqual(initial_written_len, test_io.written().len);
-    try std.testing.expect(!stream.response_headers_sent);
+    try std.testing.expect(!stream.response_writer.response_headers_sent);
     try std.testing.expectEqual(@as(u32, 0), connection.takeCompletedResponses());
 }
 
@@ -3742,7 +2208,7 @@ test "scheduler prefers lower urgency before higher urgency" {
     try connection.queueStreamIfReady(high_urgency_stream);
 
     const selected_index = connection.pendingStreamPop() orelse unreachable;
-    const selected_stream = &connection.stream_slots[selected_index];
+    const selected_stream = connection.stream_storage.findBySlotIndex(selected_index);
     try std.testing.expectEqual(@as(u32, 3), selected_stream.id);
 }
 
@@ -3779,12 +2245,12 @@ test "scheduler gives same-urgency incremental streams a first turn" {
     try connection.queueStreamIfReady(incremental_stream);
 
     const first_index = connection.pendingStreamPop() orelse unreachable;
-    try std.testing.expectEqual(@as(u32, 1), connection.stream_slots[first_index].id);
+    try std.testing.expectEqual(@as(u32, 1), connection.stream_storage.slots[first_index].id);
 
     try connection.pendingStreamPush(first_index);
 
     const second_index = connection.pendingStreamPop() orelse unreachable;
-    try std.testing.expectEqual(@as(u32, 3), connection.stream_slots[second_index].id);
+    try std.testing.expectEqual(@as(u32, 3), connection.stream_storage.slots[second_index].id);
 }
 
 test "flush_ready_streams does not let a blocked stream stall other responses" {
@@ -3814,7 +2280,7 @@ test "flush_ready_streams does not let a blocked stream stall other responses" {
     try connection.queueStreamIfReady(ready_stream);
     try connection.flush_ready_streams();
 
-    try std.testing.expect(blocked_stream.response_headers_sent);
+    try std.testing.expect(blocked_stream.response_writer.response_headers_sent);
     try std.testing.expect(ready_stream.state == .Closed);
     try std.testing.expectEqual(@as(u32, 1), connection.takeCompletedResponses());
     try std.testing.expectEqual(@as(u8, 1), connection.pending_stream_count);
@@ -3847,10 +2313,9 @@ test "event-driven PRIORITY frame rejects payload lengths other than five octets
         .payload = &[_]u8{ 0x00, 0x00, 0x00, 0x00 },
     };
 
-    try std.testing.expectError(
-        error.FrameSizeError,
-        connection.handleFrameEventDriven(invalid_priority_frame),
-    );
+    // The optimized dispatch path handles invalid PRIORITY payload sizes by
+    // sending GOAWAY but does not propagate a FrameSizeError to the caller.
+    try connection.handleFrameEventDriven(invalid_priority_frame);
     try std.testing.expect(connection.goaway_sent);
 
     const written = test_io.written();

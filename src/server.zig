@@ -6,6 +6,7 @@ const connection_module = @import("connection.zig");
 const handler = @import("handler.zig");
 const transport = @import("transport.zig");
 const http2 = @import("http2.zig");
+const memory_budget = @import("memory_budget.zig");
 // Local fork of `std.Io.Kqueue` patched to compile against the current
 // `std.Io.VTable` shape. See `src/io/Kqueue.zig` for the rationale.
 const Kqueue = http2.Kqueue;
@@ -128,14 +129,20 @@ pub const Server = struct {
     pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
         assertConfig(config);
 
-        const io_buffer_storage = try allocator.alloc(u8, totalIoBufferBytes(config));
-        errdefer allocator.free(io_buffer_storage);
+        // Use the phase-gated allocator if initialized, otherwise the raw one.
+        const slot_allocator = if (memory_budget.isStaticAllocatorInitialized())
+            http2.staticAllocator()
+        else
+            allocator;
 
-        const connection_slots = try allocator.alloc(
+        const io_buffer_storage = try slot_allocator.alloc(u8, totalIoBufferBytes(config));
+        errdefer slot_allocator.free(io_buffer_storage);
+
+        const connection_slots = try slot_allocator.alloc(
             ConnectionSlot,
             @as(usize, @intCast(config.max_connections)),
         );
-        errdefer allocator.free(connection_slots);
+        errdefer slot_allocator.free(connection_slots);
 
         initConnectionSlots(connection_slots, io_buffer_storage, config.buffer_size);
 

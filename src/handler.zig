@@ -374,7 +374,7 @@ pub const RequestDispatcher = struct {
         };
     }
 
-    pub fn fromHandler(comptime handler: HandlerFn) Self {
+    fn fromHandlerInternal(comptime handler: HandlerFn, comptime needs_headers: bool) Self {
         const Adapter = struct {
             fn dispatch(_: ?*const anyopaque, ctx: *const Context) anyerror!Response {
                 return handler(ctx);
@@ -384,22 +384,16 @@ pub const RequestDispatcher = struct {
         return .{
             .state = null,
             .dispatch_fn = Adapter.dispatch,
-            .needs_headers = true,
+            .needs_headers = needs_headers,
         };
     }
 
-    pub fn fromHandlerWithoutHeaders(comptime handler: HandlerFn) Self {
-        const Adapter = struct {
-            fn dispatch(_: ?*const anyopaque, ctx: *const Context) anyerror!Response {
-                return handler(ctx);
-            }
-        };
+    pub fn fromHandler(comptime handler: HandlerFn) Self {
+        return fromHandlerInternal(handler, true);
+    }
 
-        return .{
-            .state = null,
-            .dispatch_fn = Adapter.dispatch,
-            .needs_headers = false,
-        };
+    pub fn fromHandlerWithoutHeaders(comptime handler: HandlerFn) Self {
+        return fromHandlerInternal(handler, false);
     }
 
     pub fn bind(
@@ -430,7 +424,7 @@ pub const RequestDispatcher = struct {
     }
 };
 
-fn isAllLowercaseHeaderName(name: []const u8) bool {
+pub fn isAllLowercaseHeaderName(name: []const u8) bool {
     for (name) |byte| {
         if (std.ascii.isUpper(byte)) {
             return false;

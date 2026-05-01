@@ -151,6 +151,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    // Initialize memory budget (prints budget, sets up StaticAllocator).
     try http2.init(allocator);
     defer http2.deinit();
 
@@ -166,6 +167,9 @@ pub fn main() !void {
 
     var server = try tls_server.Server.init(allocator, config);
     defer server.deinit();
+
+    // Freeze connection-slot memory — no growth during the event loop.
+    http2.freeze();
 
     std.log.info("HTTP/2 over TLS server listening on {f}", .{config.address});
     std.log.info("Routes powered by turboapi-core:", .{});
