@@ -27,7 +27,7 @@ pub const Server = struct {
 
     const Self = @This();
 
-    const Backend = struct {
+    const Backend = if (http2.has_kqueue_backend) struct {
         allocator: std.mem.Allocator,
         evented: ?*http2.Kqueue,
 
@@ -62,6 +62,34 @@ pub const Server = struct {
 
         fn io(self: *Backend) std.Io {
             return self.evented.?.io();
+        }
+    } else struct {
+        allocator: std.mem.Allocator,
+        threaded: std.Io.Threaded,
+        started: bool,
+
+        fn init(allocator: std.mem.Allocator) Backend {
+            return .{
+                .allocator = allocator,
+                .threaded = undefined,
+                .started = false,
+            };
+        }
+
+        fn start(self: *Backend) !void {
+            std.debug.assert(!self.started);
+            self.threaded = .init(self.allocator, .{});
+            self.started = true;
+        }
+
+        fn deinit(self: *Backend) void {
+            if (!self.started) return;
+            self.threaded.deinit();
+            self.started = false;
+        }
+
+        fn io(self: *Backend) std.Io {
+            return self.threaded.io();
         }
     };
 
