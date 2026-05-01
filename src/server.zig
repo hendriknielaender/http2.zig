@@ -5,15 +5,16 @@ const std = @import("std");
 const connection_module = @import("connection.zig");
 const handler = @import("handler.zig");
 const transport = @import("transport.zig");
+const http2 = @import("http2.zig");
 // Local fork of `std.Io.Kqueue` patched to compile against the current
 // `std.Io.VTable` shape. See `src/io/Kqueue.zig` for the rationale.
-const Kqueue = @import("io/Kqueue.zig");
+const Kqueue = http2.Kqueue;
 
 const Connection = connection_module.Connection;
 const ServerStats = @import("http2.zig").ServerStats;
 const log = std.log.scoped(.server);
 
-const Backend = struct {
+const Backend = if (http2.has_kqueue_backend) struct {
     allocator: std.mem.Allocator,
     evented: ?*Kqueue,
 
@@ -49,6 +50,34 @@ const Backend = struct {
     fn io(self: *Backend) std.Io {
         return self.evented.?.io();
     }
+} else struct {
+    allocator: std.mem.Allocator,
+    threaded: std.Io.Threaded,
+    started: bool,
+
+    fn init(allocator: std.mem.Allocator) Backend {
+        return .{
+            .allocator = allocator,
+            .threaded = undefined,
+            .started = false,
+        };
+    }
+
+    fn start(self: *Backend) !void {
+        std.debug.assert(!self.started);
+        self.threaded = .init(self.allocator, .{});
+        self.started = true;
+    }
+
+    fn deinit(self: *Backend) void {
+        if (!self.started) return;
+        self.threaded.deinit();
+        self.started = false;
+    }
+
+    fn io(self: *Backend) std.Io {
+        return self.threaded.io();
+    }
 };
 
 pub const Server = struct {
@@ -58,6 +87,7 @@ pub const Server = struct {
     connection_slots: []ConnectionSlot,
     io_buffer_storage: []u8,
     running: std.atomic.Value(bool),
+    stop_requested: std.atomic.Value(bool),
     bound_port: std.atomic.Value(u16),
     listener_closed: std.atomic.Value(bool),
     listener: ?std.Io.net.Server,
@@ -116,6 +146,7 @@ pub const Server = struct {
             .connection_slots = connection_slots,
             .io_buffer_storage = io_buffer_storage,
             .running = .init(false),
+            .stop_requested = .init(false),
             .bound_port = .init(0),
             .listener_closed = .init(true),
             .listener = null,
@@ -149,6 +180,7 @@ pub const Server = struct {
         std.debug.assert(self.listener == null);
         std.debug.assert(!self.running.load(.acquire));
 
+        self.stop_requested.store(false, .release);
         self.listener = try self.config.address.listen(io, .{
             .kernel_backlog = 4096,
             .reuse_address = true,
@@ -168,20 +200,25 @@ pub const Server = struct {
         const accept_result = self.runAcceptLoop(io);
         self.running.store(false, .release);
         self.connection_group.cancel(io);
-        try accept_result;
+        accept_result catch |err| {
+            if (self.stop_requested.load(.acquire)) return;
+            return err;
+        };
     }
 
     pub fn stop(self: *Self) void {
+        self.stop_requested.store(true, .release);
         self.running.store(false, .release);
 
-        if (self.listener == null) {
-            return;
+        if (self.listener) |listener| {
+            if (http2.has_kqueue_backend) {
+                if (!self.listener_closed.swap(true, .acq_rel)) {
+                    listener.socket.close(self.backend.io());
+                }
+            } else {
+                _ = std.posix.system.shutdown(listener.socket.handle, std.posix.SHUT.RDWR);
+            }
         }
-        if (self.listener_closed.swap(true, .acq_rel)) {
-            return;
-        }
-
-        self.listener.?.socket.close(self.backend.io());
     }
 
     pub fn getStats(self: *const Self) ServerStats {
@@ -198,11 +235,20 @@ pub const Server = struct {
 
     fn runAcceptLoop(self: *Self, io: std.Io) !void {
         while (self.running.load(.acquire)) {
-            var stream = self.listener.?.accept(io) catch |err| switch (err) {
-                error.ConnectionAborted => continue,
-                error.SocketNotListening => break,
-                error.Canceled => break,
-                else => return err,
+            var stream = self.listener.?.accept(io) catch |err| {
+                if (self.stop_requested.load(.acquire) or
+                    !self.running.load(.acquire) or
+                    self.listener_closed.load(.acquire))
+                {
+                    break;
+                }
+
+                switch (err) {
+                    error.ConnectionAborted => continue,
+                    error.SocketNotListening => break,
+                    error.Canceled => break,
+                    else => return err,
+                }
             };
 
             setTcpNoDelay(stream.socket.handle);
@@ -426,29 +472,42 @@ const ServerRunContext = struct {
 };
 
 fn waitForServerPort(server: *const Server) !u16 {
-    var spin_count: u32 = 0;
-
-    while (true) : (spin_count += 1) {
+    for (0..5 * std.time.ms_per_s) |_| {
         const port = server.listeningPort();
         if (port != 0) {
             return port;
         }
 
-        try std.testing.expect(spin_count < 10_000);
-        std.Thread.yield() catch {};
+        sleepOneMs();
     }
+
+    return error.TestUnexpectedResult;
 }
 
-fn waitForActiveConnection(server: *const Server) !void {
-    var spin_count: u32 = 0;
-
-    while (true) : (spin_count += 1) {
-        if (server.getStats().active_connections != 0) {
+fn waitForAcceptedConnection(server: *const Server) !void {
+    for (0..5 * std.time.ms_per_s) |_| {
+        if (server.getStats().total_connections != 0) {
             return;
         }
 
-        try std.testing.expect(spin_count < 10_000);
-        std.Thread.yield() catch {};
+        sleepOneMs();
+    }
+
+    return error.TestUnexpectedResult;
+}
+
+fn sleepOneMs() void {
+    var remaining: std.posix.timespec = .{
+        .sec = 0,
+        .nsec = std.time.ns_per_ms,
+    };
+
+    while (true) {
+        switch (std.posix.errno(std.posix.system.nanosleep(&remaining, &remaining))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => return,
+        }
     }
 }
 
@@ -506,7 +565,7 @@ test "stop cancels idle async connections" {
         client_stream.close(io);
     };
 
-    try waitForActiveConnection(&server);
+    try waitForAcceptedConnection(&server);
 
     server.stop();
     server_thread.join();

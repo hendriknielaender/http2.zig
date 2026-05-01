@@ -4,8 +4,8 @@
     .fingerprint = 0x3f2d14a09a69408f,
     .dependencies = .{
         .boring = .{
-            .url = "https://github.com/hendriknielaender/boring/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "boring-0.1.0-K6muvnZACQDRk5_hhGfQbLYzHDZrDpuEJHDJ2xsEN-X7",
+            .url = "https://github.com/hendriknielaender/boring/archive/refs/tags/v0.1.1.tar.gz",
+            .hash = "boring-0.1.0-K6muvtBGCQAHvnOGuLmCcLZn-WgZkddupoEFKwSKpL7U",
         },
         .turboapi_core = .{
             .url = "git+https://github.com/justrach/turboapi-core.git?ref=main#ae5228141a805f6b8ff741a7534af3701b1ae912",

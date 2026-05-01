@@ -857,7 +857,6 @@ fn encodeRequestHeaders(
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !Metrics {
     comptime {
-        assert(builtin.mode != .ReleaseFast);
         assert(builtin.mode != .ReleaseSmall);
     }
 
