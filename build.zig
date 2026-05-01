@@ -452,7 +452,6 @@ fn add_tests(
         "src/connection.zig",
         "src/hpack.zig",
         "src/huffman.zig",
-        "src/worker_pool.zig",
         "src/http2.zig",
         "src/memory_budget.zig",
         "src/server.zig",
