@@ -64,16 +64,32 @@ pub const Server = struct {
             return self.evented.?.io();
         }
     } else struct {
-        fn init(_: std.mem.Allocator) Backend {
-            return .{};
+        allocator: std.mem.Allocator,
+        threaded: std.Io.Threaded,
+        started: bool,
+
+        fn init(allocator: std.mem.Allocator) Backend {
+            return .{
+                .allocator = allocator,
+                .threaded = undefined,
+                .started = false,
+            };
         }
 
-        fn start(_: *Backend) !void {}
+        fn start(self: *Backend) !void {
+            std.debug.assert(!self.started);
+            self.threaded = .init(self.allocator, .{});
+            self.started = true;
+        }
 
-        fn deinit(_: *Backend) void {}
+        fn deinit(self: *Backend) void {
+            if (!self.started) return;
+            self.threaded.deinit();
+            self.started = false;
+        }
 
-        fn io(_: *Backend) std.Io {
-            return std.Io.Threaded.global_single_threaded.io();
+        fn io(self: *Backend) std.Io {
+            return self.threaded.io();
         }
     };
 
@@ -186,7 +202,12 @@ pub const Server = struct {
                 var stream_copy = stream;
                 stream_copy.close(io);
                 self.releaseConnectionSlot(connection_slot);
-                return err;
+                switch (err) {
+                    error.ConcurrencyUnavailable => {
+                        log.warn("Rejected TLS connection: concurrency unavailable", .{});
+                        continue;
+                    },
+                }
             };
         }
     }

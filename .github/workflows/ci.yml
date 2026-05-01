@@ -174,7 +174,7 @@ jobs:
 
           ready=false
           for _ in $(seq 1 20); do
-            if curl --silent --show-error --fail --insecure "https://127.0.0.1:${PORT}/" >/dev/null; then
+            if curl --silent --show-error --fail --insecure --http2 "https://127.0.0.1:${PORT}/" >/dev/null; then
               ready=true
               break
             fi
