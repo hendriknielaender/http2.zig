@@ -691,6 +691,8 @@ fn testRequestHandler(ctx: *const handler.Context) !handler.Response {
 }
 
 test "server initialization keeps stats at zero" {
+    // The bundled server requires the static Kqueue backend.
+    if (!http2.has_kqueue_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -712,6 +714,8 @@ test "server initialization keeps stats at zero" {
 }
 
 test "connection slots reject excess work and reuse released capacity" {
+    // The bundled server requires the static Kqueue backend.
+    if (!http2.has_kqueue_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -740,6 +744,8 @@ test "connection slots reject excess work and reuse released capacity" {
 }
 
 test "server listener can stop and restart without stale cancellation" {
+    // The bundled server requires the static Kqueue backend.
+    if (!http2.has_kqueue_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -759,6 +765,8 @@ test "server listener can stop and restart without stale cancellation" {
 }
 
 test "stop cancels idle async connections" {
+    // The bundled server requires the static Kqueue backend.
+    if (!http2.has_kqueue_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

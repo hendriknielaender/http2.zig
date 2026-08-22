@@ -136,6 +136,8 @@ comptime {
 }
 
 test "HTTP/2 server creation" {
+    // The bundled server requires the static Kqueue backend.
+    if (!has_kqueue_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

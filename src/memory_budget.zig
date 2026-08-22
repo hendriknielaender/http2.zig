@@ -236,8 +236,10 @@ pub fn isStaticAllocatorInitialized() bool {
 pub fn backingAllocatorMatches(candidate: std.mem.Allocator) bool {
     if (!static_allocator_initialized) return false;
     const static_allocator = staticAllocatorPtr();
-    return static_allocator.parent_allocator.ptr == candidate.ptr and
-        static_allocator.parent_allocator.vtable == candidate.vtable;
+    // Singleton allocators (`smp_allocator`, `page_allocator`) declare
+    // `.ptr = undefined`, and ReleaseFast may materialize a different value at
+    // each use, so the context pointer is not a usable identity here.
+    return static_allocator.parent_allocator.vtable == candidate.vtable;
 }
 
 pub fn staticAllocatorPtr() *StaticAllocator {
