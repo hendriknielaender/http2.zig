@@ -292,6 +292,8 @@ pub fn main() !void {
     var server = try tls_server.Server.init(allocator, config);
     defer server.deinit();
 
+    http2.freeze();
+
     std.log.info("HTTP/2 over TLS server listening on {f}", .{config.address});
     std.log.info("Routes powered by a local Zig router:", .{});
     std.log.info("  GET  /", .{});

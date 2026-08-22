@@ -10,14 +10,88 @@ const std = @import("std");
 
 const CiDeps = struct {
     fmt_check: ?*std.Build.Step = null,
+    tigerstyle: ?*std.Build.Step = null,
     @"test": ?*std.Build.Step = null,
     dst: ?*std.Build.Step = null,
     dpt_compare: ?*std.Build.Step = null,
 };
 
+const ExampleArtifacts = struct {
+    streaming: *std.Build.Step.Compile,
+};
+
 // Project metadata
 const project_name = "http2";
 const project_version = "0.0.6";
+
+const tigerstyle_checked_paths = [_][]const u8{
+    "src/static_allocator.zig",
+    "src/memory_budget.zig",
+    "src/budget_assertions.zig",
+    "src/server.zig",
+    "src/io/EventLoop.zig",
+    "src/io/poll/kqueue.zig",
+    "src/io/poll/epoll.zig",
+    "src/http2.zig",
+    "src/transport.zig",
+    "src/frame.zig",
+    "src/hpack.zig",
+    "src/huffman.zig",
+    "src/stream_storage.zig",
+    "src/response.zig",
+    "src/handler.zig",
+    "examples/tls_server.zig",
+    "examples/streaming.zig",
+    "benchmarks/benchmark.zig",
+    "tools/static_allocator_probe.zig",
+    "tools/tigerstyle.zig",
+};
+
+const TigerStyleRegion = struct {
+    path: []const u8,
+    start_marker: []const u8,
+    end_marker: []const u8,
+};
+
+// These legacy files predate project-wide TigerStyle. Keep the allocator-facing
+// startup surface gated without making validation depend on the working-tree diff.
+const tigerstyle_checked_regions = [_]TigerStyleRegion{
+    .{
+        .path = "src/connection.zig",
+        .start_marker = "pub const Connection = struct {",
+        .end_marker = "    pub fn bindRequestDispatcher(",
+    },
+    .{
+        .path = "src/frame_handler.zig",
+        .start_marker = "pub const DispatchContext = struct {",
+        .end_marker = "pub fn dispatchFrameOptimized(",
+    },
+    .{
+        .path = "src/connection.zig",
+        .start_marker = "    fn continue_ready_streams_before_read(",
+        .end_marker = "    const FlushReadyResult = struct {",
+    },
+    .{
+        .path = "src/connection.zig",
+        .start_marker = "test \"streaming scheduler bounds fair rounds and continues without input\" {",
+        .end_marker = "test \"event-driven PRIORITY frame rejects payload lengths other than five octets\" {",
+    },
+    .{
+        .path = "src/frame_handler.zig",
+        .start_marker = "fn handleStreamLevelFrameProcess(",
+        .end_marker = "fn handleStreamLevelFrameUpdateContinuationState(",
+    },
+    .{
+        .path = "src/frame_handler.zig",
+        .start_marker = "fn handleWindowUpdate(",
+        .end_marker = "pub fn handlePriorityUpdateFrame(",
+    },
+    .{
+        .path = "src/stream.zig",
+        .start_marker = "            pub fn updateSendWindow(",
+        .end_marker = "            pub fn sendRstStream(",
+    },
+};
 
 pub fn build(b: *std.Build) void {
     // Standard target and optimization options
@@ -95,7 +169,7 @@ pub fn build(b: *std.Build) void {
     var ci = CiDeps{};
 
     // Example applications
-    add_examples(
+    const examples = add_examples(
         b,
         target,
         optimize,
@@ -117,7 +191,7 @@ pub fn build(b: *std.Build) void {
     add_simulators(b, target, optimize, &ci);
 
     // Test suite
-    add_tests(b, target, optimize, &ci);
+    add_tests(b, target, optimize, examples, &ci);
 
     // Documentation
     add_documentation(b, http2_lib);
@@ -201,7 +275,7 @@ fn add_examples(
     http2_boring_module: *std.Build.Module,
     boring_module: *std.Build.Module,
     tls_server_module: *std.Build.Module,
-) void {
+) ExampleArtifacts {
     // Basic TLS Example
     const basic_tls_module = b.createModule(.{
         .root_source_file = b.path("examples/basic_tls.zig"),
@@ -224,6 +298,8 @@ fn add_examples(
     run_basic.step.dependOn(b.getInstallStep());
     const run_step = b.step("run", "Run basic TLS server example");
     run_step.dependOn(&run_basic.step);
+
+    const streaming = add_streaming_example(b, target, optimize, http2_module);
 
     const turboapi_core_dep = b.dependency("turboapi_core", .{
         .target = target,
@@ -253,6 +329,43 @@ fn add_examples(
     run_turboapi.step.dependOn(b.getInstallStep());
     const run_turboapi_step = b.step("run-turboapi", "Run turboapi-core example");
     run_turboapi_step.dependOn(&run_turboapi.step);
+
+    return .{ .streaming = streaming };
+}
+
+fn add_streaming_example(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    http2_module: *std.Build.Module,
+) *std.Build.Step.Compile {
+    const module = b.createModule(.{
+        .root_source_file = b.path("examples/streaming.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("http2", http2_module);
+
+    const executable = b.addExecutable(.{
+        .name = "streaming_server",
+        .root_module = module,
+    });
+    b.installArtifact(executable);
+
+    const build_streaming = b.step(
+        "example-streaming",
+        "Build the static HTTP/2 streaming example",
+    );
+    build_streaming.dependOn(&executable.step);
+
+    const run_streaming = b.addRunArtifact(executable);
+    if (b.args) |args| run_streaming.addArgs(args);
+    const run_step = b.step(
+        "run-streaming",
+        "Run the static HTTP/2 streaming example",
+    );
+    run_step.dependOn(&run_streaming.step);
+    return executable;
 }
 
 /// Add benchmark application
@@ -442,6 +555,7 @@ fn add_tests(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    examples: ExampleArtifacts,
     ci: *CiDeps,
 ) void {
     // Unit tests for core modules
@@ -452,7 +566,6 @@ fn add_tests(
         "src/connection.zig",
         "src/hpack.zig",
         "src/huffman.zig",
-        "src/worker_pool.zig",
         "src/http2.zig",
         "src/memory_budget.zig",
         "src/server.zig",
@@ -468,6 +581,7 @@ fn add_tests(
 
     var all_tests_step = b.step("test", "Run all unit tests");
     ci.@"test" = all_tests_step;
+    all_tests_step.dependOn(&examples.streaming.step);
 
     for (test_modules) |module_path| {
         const test_module = b.createModule(.{
@@ -483,6 +597,42 @@ fn add_tests(
         const run_test = b.addRunArtifact(module_test);
         all_tests_step.dependOn(&run_test.step);
     }
+
+    const allocator_probe_module = b.createModule(.{
+        .root_source_file = b.path("tools/static_allocator_probe.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseFast,
+    });
+    allocator_probe_module.addImport("static-allocator", b.createModule(.{
+        .root_source_file = b.path("src/static_allocator.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseFast,
+    }));
+    const allocator_probe = b.addExecutable(.{
+        .name = "static-allocator-release-probe",
+        .root_module = allocator_probe_module,
+    });
+    const allocator_probe_step = b.step(
+        "static-allocator-probe",
+        "Verify ReleaseFast allocator phase guards",
+    );
+    const allocator_probe_cases = [_]struct {
+        operation: []const u8,
+        guard_message: []const u8,
+    }{
+        .{ .operation = "alloc", .guard_message = "allocation attempted after startup" },
+        .{ .operation = "free", .guard_message = "free attempted before teardown" },
+        .{ .operation = "resize", .guard_message = "resize attempted after startup" },
+        .{ .operation = "remap", .guard_message = "remap attempted after startup" },
+    };
+    for (allocator_probe_cases) |probe_case| {
+        const run_allocator_probe = b.addRunArtifact(allocator_probe);
+        run_allocator_probe.addArg(probe_case.operation);
+        run_allocator_probe.addCheck(.{ .expect_term = .{ .signal = .ABRT } });
+        run_allocator_probe.expectStdErrMatch(probe_case.guard_message);
+        allocator_probe_step.dependOn(&run_allocator_probe.step);
+    }
+    all_tests_step.dependOn(allocator_probe_step);
 }
 
 /// Add documentation generation
@@ -517,7 +667,7 @@ fn add_ci(b: *std.Build, ci: CiDeps) void {
     const default = all or mode == .@"test";
 
     if (all or mode == .smoke or default) {
-        step_ci.dependOn(ci.fmt_check.?);
+        step_ci.dependOn(ci.tigerstyle.?);
         step_ci.dependOn(ci.dst.?);
     }
     if (default or all) {
@@ -556,6 +706,7 @@ fn add_code_quality_checks(b: *std.Build, ci: *CiDeps) void {
             "src/",
             "examples/",
             "benchmarks/",
+            "tools/",
         },
         .check = true,
     });
@@ -570,9 +721,37 @@ fn add_code_quality_checks(b: *std.Build, ci: *CiDeps) void {
             "src/",
             "examples/",
             "benchmarks/",
+            "tools/",
         },
         .check = false,
     });
     const fmt_fix_step = b.step("fmt", "Fix code formatting");
     fmt_fix_step.dependOn(&fmt_fix.step);
+
+    const tigerstyle_checker = b.addExecutable(.{
+        .name = "tigerstyle-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/tigerstyle.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_tigerstyle = b.addRunArtifact(tigerstyle_checker);
+    for (tigerstyle_checked_paths) |path| {
+        run_tigerstyle.addFileArg(b.path(path));
+    }
+    for (tigerstyle_checked_regions) |region| {
+        run_tigerstyle.addArg("--region");
+        run_tigerstyle.addFileArg(b.path(region.path));
+        run_tigerstyle.addArg(region.start_marker);
+        run_tigerstyle.addArg(region.end_marker);
+    }
+
+    const tigerstyle_step = b.step(
+        "tigerstyle",
+        "Check formatting, 100-column lines, and 70-line functions",
+    );
+    tigerstyle_step.dependOn(&fmt_check.step);
+    tigerstyle_step.dependOn(&run_tigerstyle.step);
+    ci.tigerstyle = tigerstyle_step;
 }

@@ -1,417 +1,428 @@
-//! This module implements compile-time memory budgeting that prevents runtime OOM
-//! by pre-allocating all necessary memory based on worst-case calculations.
+//! HTTP/2 resource limits and startup-only allocator authority.
 //!
-//! - Compile-time resource planning
-//! - Static memory budgets
-//! - Fail-fast at build time
-//! - Zero runtime allocation failures
-//! - Performance through pre-allocation
+//! The server computes its concrete pool counts from `RuntimePlan`, allocates
+//! those pools during initialization, and seals `StaticAllocator` before
+//! accepting traffic. Capacity exhaustion is handled as protocol overload;
+//! it never falls back to growing a heap allocation during runtime.
+
 const std = @import("std");
-pub const KiB = 1024;
-pub const MiB = 1024 * KiB;
-pub const GiB = 1024 * MiB;
-/// Compile-time Memory Budget Calculator
+const builtin = @import("builtin");
+const StaticAllocator = @import("static_allocator.zig");
+const Hpack = @import("hpack.zig").Hpack;
+
+// Kept in sync with `http2.has_event_loop_backend`; importing it here would
+// be circular, since `http2.zig` imports this module.
+const has_event_loop_backend = switch (builtin.os.tag) {
+    .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .linux => true,
+    else => false,
+};
+const EventLoop = if (has_event_loop_backend) @import("io/EventLoop.zig") else opaque {};
+
+pub const KiB: usize = 1024;
+pub const MiB: usize = 1024 * KiB;
+pub const GiB: usize = 1024 * MiB;
+
 pub const MemBudget = struct {
-    pub const max_conns = 128;
-    pub const max_streams_per_conn = 100;
-    pub const bytes_per_conn = 64 * KiB; // Per-connection flow-control window
-    pub const max_frame_size = 16 * KiB; // Standard HTTP/2 frame size
-    pub const max_header_size = 8 * KiB; // Maximum header block size (needs 6KB minimum)
-    pub const max_data_buffer = 16 * KiB; // Per-stream data buffer (needs 16KB minimum)
-    pub const worker_count = 2;
-    pub const stack_per_thread = 128 * KiB;
-    pub const global_reserve = 256 * KiB;
-    pub const emergency_reserve = 256 * KiB;
-    // Calculate total memory requirements at compile time
-    pub const stream_memory = max_streams_per_conn * max_data_buffer;
-    pub const connection_memory = max_conns * (bytes_per_conn + stream_memory);
-    pub const worker_memory = worker_count * stack_per_thread;
-    pub const total_required = connection_memory + worker_memory + global_reserve + emergency_reserve;
+    pub const system_limit_bytes = 8 * GiB;
+    pub const max_connections: u32 = 1000;
+    pub const max_streams_per_connection: u32 = 100;
+    pub const max_frame_size_bytes: usize = 16 * KiB;
+    pub const max_header_size_bytes: usize = 8 * KiB;
+    pub const max_data_buffer_bytes: usize = 16 * KiB;
+    pub const max_io_buffer_size_bytes: u32 = 32 * KiB;
+
+    pub const worker_count: u16 = 2;
+    pub const worker_count_max: u16 = 128;
+
+    pub const wait_registrations_per_connection: u32 = 2;
+    pub const wait_registrations_listener: u32 = 1;
+    pub const event_loop_fibers_per_connection: u32 = 1;
+    pub const wait_registration_bytes_max: usize = 128;
+    pub const wait_map_fixed_bytes_max: usize = 256;
+    // Worker idle stack plus one guard page; see `event_loop_fiber_bytes_max`
+    // for why the page size drives the worst case, and `idle_stack_size` in
+    // `io/EventLoop.zig` for why the stack itself is one MiB.
+    pub const worker_stack_reservation_bytes_max: usize = 1152 * KiB;
+    pub const event_loop_control_memory_bytes_max: usize = 2 * MiB;
+
+    pub const stream_header_fragments_bytes = max_header_size_bytes;
+    pub const stream_headers_storage_bytes = max_header_size_bytes;
+    pub const stream_request_body_bytes = max_data_buffer_bytes;
+    pub const stream_response_body_capacity_bytes: usize = 256;
+    pub const stream_response_body_bytes: usize = 272;
+    pub const stream_headers_array_bytes = 64 * @sizeOf(struct {
+        name: []const u8,
+        value: []const u8,
+    });
+    pub const stream_metadata_bytes: usize = 2 * KiB;
+
+    pub const stream_instance_bytes =
+        stream_header_fragments_bytes +
+        stream_headers_storage_bytes +
+        stream_request_body_bytes +
+        stream_response_body_bytes +
+        stream_headers_array_bytes +
+        stream_metadata_bytes;
+
+    pub const stream_storage_lookup_bytes =
+        256 * (@sizeOf(u32) + @sizeOf(u8)) +
+        max_streams_per_connection * (@sizeOf(u32) + @sizeOf(bool));
+    pub const stream_storage_bytes =
+        max_streams_per_connection * stream_instance_bytes +
+        stream_storage_lookup_bytes;
+
+    pub const connection_slot_overhead_bytes: usize = 64;
+    pub const connection_slot_bytes =
+        stream_storage_bytes + connection_slot_overhead_bytes;
+    pub const stream_memory_per_connection =
+        max_streams_per_connection * stream_instance_bytes;
+    pub const connection_memory_bytes = max_connections * connection_slot_bytes;
+
+    pub const io_buffer_memory_bytes =
+        max_connections * max_io_buffer_size_bytes * 2;
+    // One fiber allocation, rounded up to a page. The page size is the
+    // platform variable here: 4 KiB on x86_64, 16 KiB on aarch64 macOS, and
+    // 64 KiB on aarch64 Linux, which is the worst case this must cover.
+    pub const event_loop_fiber_bytes_max: usize = 576 * KiB;
+    pub const event_loop_fiber_count =
+        max_connections * event_loop_fibers_per_connection;
+    pub const wait_registration_count_per_thread_max =
+        max_connections * wait_registrations_per_connection +
+        wait_registrations_listener;
+    pub const event_loop_allocator_memory_bytes_max =
+        eventLoopAllocatorBytesMax(
+            worker_count_max,
+            event_loop_fiber_count,
+            wait_registration_count_per_thread_max,
+        ) catch @compileError("maximum event-loop allocator budget overflowed");
+    pub const worker_memory_bytes_max = workerStackBytesMax(worker_count_max) catch
+        @compileError("maximum worker stack budget overflowed");
+    pub const hpack_thread_local_memory_bytes_max =
+        worker_count_max * Hpack.scratch_buffer_size;
+    pub const server_overhead_bytes: usize = 16 * KiB;
+
+    pub const total_required_bytes =
+        connection_memory_bytes +
+        io_buffer_memory_bytes +
+        event_loop_allocator_memory_bytes_max +
+        worker_memory_bytes_max +
+        hpack_thread_local_memory_bytes_max +
+        server_overhead_bytes;
+
     comptime {
-        // System memory limit (8GB for most servers)
-        const system_limit = 8 * GiB;
-        if (total_required > system_limit) {
-            @compileError("Memory budget exceeds system limit: " ++
-                std.fmt.comptimePrint("{d}MB required > {d}MB limit", .{ total_required / MiB, system_limit / MiB }));
+        if (total_required_bytes > system_limit_bytes) {
+            @compileError("maximum HTTP/2 memory budget exceeds 8 GiB");
         }
-        // Ensure we don't exceed per-connection limits - adjusted for smaller buffers
-        if (stream_memory > bytes_per_conn * 100) {
-            @compileError("Stream memory per connection exceeds reasonable limits");
-        }
-        // Validate worker configuration
-        if (worker_count == 0 or worker_count > 128) {
-            @compileError("Invalid worker count: must be between 1-128");
-        }
+        if (worker_count == 0) @compileError("worker_count must be positive");
+        if (worker_count > worker_count_max) @compileError("worker_count exceeds ceiling");
     }
-    /// Memory layout information for debugging
-    pub fn printBudget() void {
-        std.log.info("Memory Budget:", .{});
-        std.log.info("  Max Connections: {d}", .{max_conns});
-        std.log.info("  Max Streams/Conn: {d}", .{max_streams_per_conn});
-        std.log.info("  Connection Memory: {d}MB", .{connection_memory / MiB});
-        std.log.info("  Worker Threads: {d}", .{worker_count});
-        std.log.info("  Worker Memory: {d}MB", .{worker_memory / MiB});
-        std.log.info("  Global Reserve: {d}MB", .{global_reserve / MiB});
-        std.log.info("  Total Required: {d}MB", .{total_required / MiB});
-        std.log.info("  Memory Efficiency: {d}%", .{(total_required * 100) / (8 * GiB)});
+
+    pub fn printMaximum() void {
+        std.log.info("HTTP/2 static memory ceiling: {d} MiB", .{
+            total_required_bytes / MiB,
+        });
+        std.log.info("  connections: {d}", .{max_connections});
+        std.log.info("  streams per connection: {d}", .{max_streams_per_connection});
+        std.log.info("  event-loop fibers: {d}", .{event_loop_fiber_count});
+        std.log.info("  event-loop threads maximum: {d}", .{worker_count_max});
     }
 };
-/// Static Memory Pool for Zero-Allocation Operations
-pub const StaticMemoryPool = struct {
-    // Pre-allocated connection pool - simplified without linked lists for now
-    connection_pool: [MemBudget.max_conns]ConnectionSlot,
-    connection_next_free: std.atomic.Value(u32),
-    // Pre-allocated stream pools (per connection) - simplified
-    stream_pools: [MemBudget.max_conns][MemBudget.max_streams_per_conn]StreamSlot,
-    stream_next_free: [MemBudget.max_conns]std.atomic.Value(u32),
-    // Pre-allocated data buffers
-    data_buffer_pool: [MemBudget.max_conns * MemBudget.max_streams_per_conn][MemBudget.max_data_buffer]u8,
-    header_buffer_pool: [MemBudget.max_conns * MemBudget.max_streams_per_conn][MemBudget.max_header_size]u8,
-    // Worker thread pools (will be managed by WorkerPool)
-    // worker_pool: [MemBudget.worker_count]WorkerThread,
-    // Global allocator arena
-    arena: std.heap.ArenaAllocator,
-    backing_allocator: std.mem.Allocator,
-    const Self = @This();
 
-    pub fn init(target: *Self, backing_allocator: std.mem.Allocator) !void {
-        target.* = .{
-            .connection_pool = undefined,
-            .connection_next_free = std.atomic.Value(u32).init(0),
-            .stream_pools = undefined,
-            .stream_next_free = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** MemBudget.max_conns,
-            .data_buffer_pool = undefined,
-            .header_buffer_pool = undefined,
-            .arena = std.heap.ArenaAllocator.init(backing_allocator),
-            .backing_allocator = backing_allocator,
+pub const RuntimePlan = struct {
+    connection_count: u32,
+    worker_count: u16,
+    fiber_count: u32,
+    wait_registration_count_per_thread: u32,
+    wait_registration_count_total: usize,
+    io_buffer_bytes: usize,
+    event_loop_allocator_bytes_max: usize,
+    worker_stack_bytes_max: usize,
+    hpack_thread_local_bytes_max: usize,
+    core_memory_bytes_max: usize,
+
+    pub fn init(
+        connection_count: u32,
+        io_buffer_size: u32,
+        worker_count: u16,
+    ) !RuntimePlan {
+        try validateCounts(connection_count, io_buffer_size, worker_count);
+
+        const io_buffer_bytes = try multiply3(
+            connection_count,
+            io_buffer_size,
+            2,
+        );
+        const wait_registration_count = std.math.mul(
+            u32,
+            connection_count,
+            MemBudget.wait_registrations_per_connection,
+        ) catch return error.MemoryBudgetOverflow;
+        const wait_registration_count_per_thread = std.math.add(
+            u32,
+            wait_registration_count,
+            MemBudget.wait_registrations_listener,
+        ) catch return error.MemoryBudgetOverflow;
+        const wait_registration_count_total = std.math.mul(
+            usize,
+            wait_registration_count_per_thread,
+            worker_count,
+        ) catch return error.MemoryBudgetOverflow;
+        const event_loop_allocator_bytes_max = try eventLoopAllocatorBytesMax(
+            worker_count,
+            connection_count,
+            wait_registration_count_per_thread,
+        );
+        const worker_stack_bytes_max = try workerStackBytesMax(worker_count);
+        const hpack_thread_local_bytes_max = std.math.mul(
+            usize,
+            worker_count,
+            Hpack.scratch_buffer_size,
+        ) catch return error.MemoryBudgetOverflow;
+
+        var plan: RuntimePlan = .{
+            .connection_count = connection_count,
+            .worker_count = worker_count,
+            .fiber_count = connection_count,
+            .wait_registration_count_per_thread = wait_registration_count_per_thread,
+            .wait_registration_count_total = wait_registration_count_total,
+            .io_buffer_bytes = io_buffer_bytes,
+            .event_loop_allocator_bytes_max = event_loop_allocator_bytes_max,
+            .worker_stack_bytes_max = worker_stack_bytes_max,
+            .hpack_thread_local_bytes_max = hpack_thread_local_bytes_max,
+            .core_memory_bytes_max = 0,
         };
-        const self = target;
-
-        // Initialize connection pool
-        for (&self.connection_pool, 0..) |*connection_slot, connection_index| {
-            // Assert connection index is within bounds
-            std.debug.assert(connection_index < MemBudget.max_conns);
-            connection_slot.* = ConnectionSlot{
-                .id = @intCast(connection_index),
-                .in_use = std.atomic.Value(bool).init(false),
-                .data = .{
-                    .settings = .{},
-                    .recv_window_size = 65535,
-                    .send_window_size = 65535,
-                    .last_stream_id = 0,
-                    .goaway_sent = false,
-                    .goaway_received = false,
-                },
-            };
-        }
-
-        // Initialize stream pools
-        for (&self.stream_pools, 0..) |*stream_pool, connection_index| {
-            // Assert connection index is within bounds
-            std.debug.assert(connection_index < MemBudget.max_conns);
-
-            for (stream_pool, 0..) |*stream_slot, stream_index| {
-                // Assert stream index is within bounds
-                std.debug.assert(stream_index < MemBudget.max_streams_per_conn);
-                stream_slot.* = StreamSlot{
-                    .id = @intCast(stream_index),
-                    .connection_id = @intCast(connection_index),
-                    .in_use = std.atomic.Value(bool).init(false),
-                    .data = .{
-                        .state = .Idle,
-                        .recv_window_size = 65535,
-                        .send_window_size = 65535,
-                        .headers_received = false,
-                        .data_received = 0,
-                    },
-                };
-            }
-        }
+        plan.core_memory_bytes_max = try plan.totalMemoryBytesForSlots(
+            MemBudget.connection_slot_bytes,
+            io_buffer_bytes,
+        );
+        return plan;
     }
 
-    pub fn create(backing_allocator: std.mem.Allocator) !*Self {
-        const pool = try backing_allocator.create(Self);
-        errdefer backing_allocator.destroy(pool);
-        try pool.init(backing_allocator);
-        return pool;
-    }
-    pub fn deinit(self: *Self) void {
-        // Worker pool cleanup is handled by WorkerPool module
-        self.arena.deinit();
-    }
+    pub fn totalMemoryBytesForSlots(
+        self: RuntimePlan,
+        connection_slot_size: usize,
+        separate_io_buffer_bytes: usize,
+    ) !usize {
+        const slot_bytes = std.math.mul(
+            usize,
+            self.connection_count,
+            connection_slot_size,
+        ) catch return error.MemoryBudgetOverflow;
 
-    pub fn destroy(self: *Self) void {
-        const backing_allocator = self.backing_allocator;
-        self.deinit();
-        backing_allocator.destroy(self);
-    }
-
-    pub fn acquireConnection(self: *Self) ?*ConnectionSlot {
-        // Assert pool is initialized
-        std.debug.assert(self.connection_pool.len == MemBudget.max_conns);
-
-        // Simple round-robin allocation with bound checking
-        var attempt_count: u32 = 0;
-        while (attempt_count < MemBudget.max_conns) : (attempt_count += 1) {
-            const current_index = self.connection_next_free.load(.acquire);
-            // Assert current index is within bounds
-            std.debug.assert(current_index < MemBudget.max_conns);
-
-            const next_index = (current_index + 1) % MemBudget.max_conns;
-
-            if (self.connection_next_free.cmpxchgWeak(current_index, next_index, .acq_rel, .acquire) == null) {
-                const connection_slot = &self.connection_pool[current_index];
-                if (connection_slot.in_use.cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
-                    return connection_slot;
-                }
-            }
-        }
-        return null; // No available connections
-    }
-    /// Release a connection slot
-    pub fn releaseConnection(self: *Self, connection_slot: *ConnectionSlot) void {
-        // Assert slot is valid
-        std.debug.assert(connection_slot.id < MemBudget.max_conns);
-        _ = self;
-        connection_slot.in_use.store(false, .release);
-    }
-    /// Acquire a stream slot for a specific connection
-    pub fn acquireStream(self: *Self, connection_id: u32) ?*StreamSlot {
-        // Assert connection ID is within bounds
-        std.debug.assert(connection_id < MemBudget.max_conns);
-        if (connection_id >= MemBudget.max_conns) return null;
-
-        // Simple round-robin allocation for streams with bounds checking
-        var attempt_count: u32 = 0;
-        while (attempt_count < MemBudget.max_streams_per_conn) : (attempt_count += 1) {
-            const current_stream_index = self.stream_next_free[connection_id].load(.acquire);
-            // Assert stream index is within bounds
-            std.debug.assert(current_stream_index < MemBudget.max_streams_per_conn);
-
-            const next_stream_index = (current_stream_index + 1) % MemBudget.max_streams_per_conn;
-
-            if (self.stream_next_free[connection_id].cmpxchgWeak(current_stream_index, next_stream_index, .acq_rel, .acquire) == null) {
-                const stream_slot = &self.stream_pools[connection_id][current_stream_index];
-                if (stream_slot.in_use.cmpxchgWeak(false, true, .acquire, .monotonic) == null) {
-                    return stream_slot;
-                }
-            }
-        }
-        return null; // No available streams for this connection
-    }
-    /// Release a stream slot
-    pub fn releaseStream(self: *Self, stream_slot: *StreamSlot) void {
-        // Assert slot is valid
-        std.debug.assert(stream_slot.id < MemBudget.max_streams_per_conn);
-        std.debug.assert(stream_slot.connection_id < MemBudget.max_conns);
-        _ = self;
-        stream_slot.in_use.store(false, .release);
-    }
-    /// Get pre-allocated data buffer for a stream
-    pub fn getDataBuffer(self: *Self, connection_id: u32, stream_id: u32) ?[]u8 {
-        // Assert IDs are within bounds
-        std.debug.assert(connection_id < MemBudget.max_conns);
-        std.debug.assert(stream_id < MemBudget.max_streams_per_conn);
-
-        const buffer_index = connection_id * MemBudget.max_streams_per_conn + stream_id;
-        if (buffer_index >= self.data_buffer_pool.len) return null;
-        return &self.data_buffer_pool[buffer_index];
-    }
-    /// Get pre-allocated header buffer for a stream
-    pub fn getHeaderBuffer(self: *Self, connection_id: u32, stream_id: u32) ?[]u8 {
-        // Assert IDs are within bounds
-        std.debug.assert(connection_id < MemBudget.max_conns);
-        std.debug.assert(stream_id < MemBudget.max_streams_per_conn);
-
-        const buffer_index = connection_id * MemBudget.max_streams_per_conn + stream_id;
-        if (buffer_index >= self.header_buffer_pool.len) return null;
-        return &self.header_buffer_pool[buffer_index];
-    }
-    /// Get arena allocator for temporary allocations
-    pub fn allocator(self: *Self) std.mem.Allocator {
-        return self.arena.allocator();
+        var total = try addBytes(slot_bytes, separate_io_buffer_bytes);
+        total = try addBytes(total, self.event_loop_allocator_bytes_max);
+        total = try addBytes(total, self.worker_stack_bytes_max);
+        total = try addBytes(total, self.hpack_thread_local_bytes_max);
+        total = try addBytes(total, MemBudget.server_overhead_bytes);
+        if (total > MemBudget.system_limit_bytes) return error.MemoryBudgetExceedsSystemLimit;
+        return total;
     }
 };
-/// Connection Slot in the static pool
-pub const ConnectionSlot = struct {
-    id: u32,
-    in_use: std.atomic.Value(bool),
-    data: ConnectionData,
-    pub const ConnectionData = struct {
-        // Connection-specific data will be defined when integrating with Connection
-        settings: ConnectionSettings,
-        recv_window_size: i32,
-        send_window_size: i32,
-        last_stream_id: u32,
-        goaway_sent: bool,
-        goaway_received: bool,
+
+pub const AllocatorSnapshot = struct {
+    allocations_live: usize,
+    bytes_live: usize,
+    bytes_reserved: usize,
+    state: StaticAllocator.State,
+};
+
+var static_allocator_global: StaticAllocator = undefined;
+var static_allocator_initialized: bool = false;
+
+pub fn initStaticAllocator(backing_allocator: std.mem.Allocator) !void {
+    if (static_allocator_initialized) return error.StaticAllocatorAlreadyInitialized;
+
+    static_allocator_global = StaticAllocator.init(backing_allocator);
+    static_allocator_initialized = true;
+    MemBudget.printMaximum();
+}
+
+pub fn isStaticAllocatorInitialized() bool {
+    return static_allocator_initialized;
+}
+
+pub fn backingAllocatorMatches(candidate: std.mem.Allocator) bool {
+    if (!static_allocator_initialized) return false;
+    const static_allocator = staticAllocatorPtr();
+    // Singleton allocators (`smp_allocator`, `page_allocator`) declare
+    // `.ptr = undefined`, and ReleaseFast may materialize a different value at
+    // each use, so the context pointer is not a usable identity here.
+    return static_allocator.parent_allocator.vtable == candidate.vtable;
+}
+
+pub fn staticAllocatorPtr() *StaticAllocator {
+    if (!static_allocator_initialized) @panic("http2.init() must run before allocation");
+    return &static_allocator_global;
+}
+
+pub fn freezeStaticAllocator() void {
+    staticAllocatorPtr().transition_from_init_to_static();
+}
+
+pub fn beginStaticAllocatorDeinit() void {
+    const static_allocator = staticAllocatorPtr();
+    switch (static_allocator.state) {
+        .init => static_allocator.transition_from_init_to_deinit(),
+        .static => static_allocator.transition_from_static_to_deinit(),
+        .deinit => {},
+    }
+}
+
+pub fn deinitStaticAllocator() void {
+    if (!static_allocator_initialized) return;
+
+    beginStaticAllocatorDeinit();
+    static_allocator_global.deinit();
+    static_allocator_initialized = false;
+}
+
+pub fn allocatorSnapshot() AllocatorSnapshot {
+    const static_allocator = staticAllocatorPtr();
+    return .{
+        .allocations_live = static_allocator.allocations_live,
+        .bytes_live = static_allocator.bytes_live,
+        .bytes_reserved = static_allocator.bytes_reserved,
+        .state = static_allocator.state,
     };
-};
-/// Stream Slot in the static pool
-pub const StreamSlot = struct {
-    id: u32,
-    connection_id: u32,
-    in_use: std.atomic.Value(bool),
-    data: StreamData,
-    pub const StreamData = struct {
-        // Stream-specific data will be defined when integrating with Stream
-        state: StreamState,
-        recv_window_size: i32,
-        send_window_size: i32,
-        headers_received: bool,
-        data_received: u32,
+}
+
+fn validateCounts(connection_count: u32, io_buffer_size: u32, worker_count: u16) !void {
+    if (connection_count == 0) return error.InvalidConnectionCount;
+    if (connection_count > MemBudget.max_connections) return error.ConnectionCountExceedsBudget;
+    if (io_buffer_size < 1024) return error.InvalidIoBufferSize;
+    if (io_buffer_size > MemBudget.max_io_buffer_size_bytes) {
+        return error.IoBufferSizeExceedsBudget;
+    }
+    if (worker_count == 0) return error.InvalidWorkerCount;
+    if (worker_count > MemBudget.worker_count_max) return error.WorkerCountExceedsBudget;
+}
+
+fn eventLoopAllocatorBytesMax(
+    worker_count: u16,
+    fiber_count: u32,
+    wait_registration_count_per_thread: u32,
+) !usize {
+    if (comptime has_event_loop_backend) {
+        return EventLoop.allocatorBytesMax(.{
+            .n_threads = worker_count,
+            .max_concurrent_tasks = fiber_count,
+            .max_wait_registrations_per_thread = wait_registration_count_per_thread,
+        }) catch |err| switch (err) {
+            error.InvalidCapacity => error.InvalidWorkerCount,
+            error.Overflow => error.MemoryBudgetOverflow,
+        };
+    }
+
+    const fiber_bytes = std.math.mul(
+        usize,
+        fiber_count,
+        MemBudget.event_loop_fiber_bytes_max,
+    ) catch return error.MemoryBudgetOverflow;
+    const registration_bytes = std.math.mul(
+        usize,
+        wait_registration_count_per_thread,
+        MemBudget.wait_registration_bytes_max,
+    ) catch return error.MemoryBudgetOverflow;
+    const map_bytes = try addBytes(
+        MemBudget.wait_map_fixed_bytes_max,
+        registration_bytes,
+    );
+    const all_map_bytes = std.math.mul(
+        usize,
+        worker_count,
+        map_bytes,
+    ) catch return error.MemoryBudgetOverflow;
+    const allocator_bytes = try addBytes(fiber_bytes, all_map_bytes);
+    return addBytes(allocator_bytes, MemBudget.event_loop_control_memory_bytes_max);
+}
+
+fn workerStackBytesMax(worker_count: u16) !usize {
+    if (worker_count == 0) return error.InvalidWorkerCount;
+    const spawned_worker_count = worker_count - 1;
+    const bytes_per_worker = if (has_event_loop_backend)
+        EventLoop.worker_stack_reservation_bytes_max
+    else
+        MemBudget.worker_stack_reservation_bytes_max;
+    return std.math.mul(usize, spawned_worker_count, bytes_per_worker) catch {
+        return error.MemoryBudgetOverflow;
     };
-};
-/// Worker Thread for handling HTTP/2 processing
-pub const WorkerThread = struct {
-    id: u32,
-    work_queue: std.atomic.Queue(WorkItem),
-    running: std.atomic.Value(bool),
-    thread: std.Thread,
-    pub fn start(self: *WorkerThread) !void {
-        self.running.store(true, .release);
-        self.thread = try std.Thread.spawn(.{}, workerMain, .{self});
-    }
-    pub fn stop(self: *WorkerThread) void {
-        self.running.store(false, .release);
-        // Wake up the worker if it's sleeping
-        self.work_queue.prepend(WorkItem{ .type = .shutdown });
-        self.thread.join();
-    }
-    fn workerMain(self: *WorkerThread) void {
-        while (self.running.load(.acquire)) {
-            if (self.work_queue.popFirst()) |work| {
-                switch (work.type) {
-                    .shutdown => break,
-                    .process_frame => {
-                        // Process HTTP/2 frame
-                        processFrame(work.data.frame);
-                    },
-                    .process_connection => {
-                        // Handle connection events
-                        processConnection(work.data.connection);
-                    },
-                }
-            } else {
-                // No work available, yield CPU
-                std.Thread.yield() catch {};
-            }
-        }
-    }
-};
-/// Work item for the worker queue
-pub const WorkItem = struct {
-    type: WorkType,
-    data: WorkData = undefined,
-    pub const WorkType = enum {
-        shutdown,
-        process_frame,
-        process_connection,
+}
+
+fn addBytes(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.MemoryBudgetOverflow;
+}
+
+fn multiply3(a: u32, b: u32, c: u32) !usize {
+    const product_ab = std.math.mul(usize, a, b) catch {
+        return error.MemoryBudgetOverflow;
     };
-    pub const WorkData = union {
-        frame: *FrameData,
-        connection: *ConnectionSlot,
+    return std.math.mul(usize, product_ab, c) catch {
+        return error.MemoryBudgetOverflow;
     };
-};
-/// Placeholder types (will be replaced with actual types during integration)
-const ConnectionSettings = struct {
-    header_table_size: u32 = 4096,
-    enable_push: bool = true,
-    max_concurrent_streams: u32 = 1000,
-    initial_window_size: u32 = 65535,
-    max_frame_size: u32 = 16384,
-    max_header_list_size: u32 = 8192,
-};
-const StreamState = enum {
-    Idle,
-    ReservedLocal,
-    ReservedRemote,
-    Open,
-    HalfClosedLocal,
-    HalfClosedRemote,
-    Closed,
-};
-const FrameData = struct {
-    // Placeholder for frame data
-};
-// Placeholder functions (will be implemented during integration)
-fn processFrame(frame: *FrameData) void {
-    _ = frame;
-    // Frame execution stays in the connection path until the static worker pool
-    // is integrated with protocol state transitions.
 }
-fn processConnection(connection: *ConnectionSlot) void {
-    _ = connection;
-    // Connection ownership remains with the server event loop until the worker
-    // handoff semantics are fully defined.
+
+test "runtime plan bounds HTTP/2 resources" {
+    const plan = try RuntimePlan.init(8, 16 * KiB, 2);
+
+    try std.testing.expectEqual(@as(u32, 8), plan.connection_count);
+    try std.testing.expectEqual(@as(u32, 8), plan.fiber_count);
+    try std.testing.expectEqual(@as(u32, 17), plan.wait_registration_count_per_thread);
+    try std.testing.expectEqual(@as(usize, 34), plan.wait_registration_count_total);
+    try std.testing.expectEqual(@as(usize, 256 * KiB), plan.io_buffer_bytes);
+    try std.testing.expect(plan.event_loop_allocator_bytes_max > 0);
+    try std.testing.expectEqual(
+        @as(usize, 2 * Hpack.scratch_buffer_size),
+        plan.hpack_thread_local_bytes_max,
+    );
+    try std.testing.expect(plan.core_memory_bytes_max <= MemBudget.total_required_bytes);
 }
-/// Global static memory pool instance
-var global_memory_pool: ?*StaticMemoryPool = null;
-/// Initialize the global memory pool
-pub fn initGlobalMemoryPool(backing_allocator: std.mem.Allocator) !void {
-    if (global_memory_pool != null) {
-        return error.AlreadyInitialized;
-    }
-    global_memory_pool = try StaticMemoryPool.create(backing_allocator);
-    // Worker pool is managed separately by worker_pool.zig
-    MemBudget.printBudget();
+
+test "maximum runtime plan is covered by the published ceiling" {
+    const plan = try RuntimePlan.init(
+        MemBudget.max_connections,
+        MemBudget.max_io_buffer_size_bytes,
+        MemBudget.worker_count_max,
+    );
+
+    try std.testing.expectEqual(
+        MemBudget.event_loop_allocator_memory_bytes_max,
+        plan.event_loop_allocator_bytes_max,
+    );
+    try std.testing.expectEqual(MemBudget.total_required_bytes, plan.core_memory_bytes_max);
 }
-/// Get the global memory pool
-pub fn getGlobalMemoryPool() *StaticMemoryPool {
-    return global_memory_pool.?;
+
+test "runtime plan rejects resources outside the static ceiling" {
+    try std.testing.expectError(
+        error.InvalidConnectionCount,
+        RuntimePlan.init(0, 16 * KiB, 2),
+    );
+    try std.testing.expectError(
+        error.ConnectionCountExceedsBudget,
+        RuntimePlan.init(MemBudget.max_connections + 1, 16 * KiB, 2),
+    );
+    try std.testing.expectError(
+        error.IoBufferSizeExceedsBudget,
+        RuntimePlan.init(1, MemBudget.max_io_buffer_size_bytes + 1, 2),
+    );
+    try std.testing.expectError(
+        error.WorkerCountExceedsBudget,
+        RuntimePlan.init(1, 16 * KiB, MemBudget.worker_count_max + 1),
+    );
 }
-/// Deinitialize the global memory pool
-pub fn deinitGlobalMemoryPool() void {
-    if (global_memory_pool) |pool| {
-        pool.destroy();
-        global_memory_pool = null;
-    }
-}
-/// Compile-time verification that all budget constraints are met
-pub fn verifyMemoryBudget() void {
-    comptime {
-        // Verify total memory usage
-        if (MemBudget.total_required > 8 * GiB) {
-            @compileError("Total memory budget exceeds 8GB limit");
-        }
-        // Verify connection limits are reasonable
-        if (MemBudget.max_conns * MemBudget.max_streams_per_conn > 1_000_000) {
-            @compileError("Total stream capacity exceeds reasonable limits");
-        }
-        // Verify worker thread configuration
-        if (MemBudget.worker_count > std.Thread.getCpuCount() catch 32) {
-            @compileError("Worker count exceeds available CPU cores");
-        }
-    }
-}
-test "Memory budget calculations" {
-    // Verify compile-time calculations are reasonable
-    try std.testing.expect(MemBudget.total_required > 0);
-    try std.testing.expect(MemBudget.total_required < 8 * GiB);
-    try std.testing.expect(MemBudget.worker_count > 0);
-    try std.testing.expect(MemBudget.worker_count <= 128);
-}
-test "Static memory pool initialization" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const pool = try StaticMemoryPool.create(arena.allocator());
-    defer pool.destroy();
-    // Test connection acquisition
-    const conn1 = pool.acquireConnection();
-    try std.testing.expect(conn1 != null);
-    const conn2 = pool.acquireConnection();
-    try std.testing.expect(conn2 != null);
-    try std.testing.expect(conn1.?.id != conn2.?.id);
-    // Test stream acquisition
-    const stream1 = pool.acquireStream(0);
-    try std.testing.expect(stream1 != null);
-    try std.testing.expect(stream1.?.connection_id == 0);
-    // Test buffer access
-    const data_buffer = pool.getDataBuffer(0, 0);
-    try std.testing.expect(data_buffer != null);
-    try std.testing.expect(data_buffer.?.len == MemBudget.max_data_buffer);
-    // Clean up
-    if (conn1) |c| pool.releaseConnection(c);
-    if (conn2) |c| pool.releaseConnection(c);
-    if (stream1) |s| pool.releaseStream(s);
+
+test "static allocator lifecycle records startup bytes" {
+    try initStaticAllocator(std.testing.allocator);
+    try std.testing.expect(backingAllocatorMatches(std.testing.allocator));
+    try std.testing.expect(!backingAllocatorMatches(std.heap.page_allocator));
+    const allocator_instance = staticAllocatorPtr().allocator();
+    const allocation = try allocator_instance.alloc(u8, 64);
+
+    freezeStaticAllocator();
+    const snapshot = allocatorSnapshot();
+    try std.testing.expectEqual(@as(usize, 64), snapshot.bytes_reserved);
+    try std.testing.expectEqual(StaticAllocator.State.static, snapshot.state);
+
+    beginStaticAllocatorDeinit();
+    allocator_instance.free(allocation);
+    deinitStaticAllocator();
 }

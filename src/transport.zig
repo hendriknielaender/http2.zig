@@ -14,12 +14,8 @@ pub const ServeConnectionOptions = struct {
     /// Request dispatcher for application routing or request handling.
     dispatcher: handler.RequestDispatcher,
 
-    /// Optional caller-owned stream storage.
-    ///
-    /// Adapters with a connection pool can provide this to avoid per-connection
-    /// stream-storage allocation. If omitted, the connection allocates its own
-    /// storage and frame arena.
-    stream_storage: ?*Connection.StreamStorage = null,
+    /// Caller-owned stream storage from a startup-sized connection pool.
+    stream_storage: *Connection.StreamStorage,
 
     /// Optional output populated before return, including error returns after
     /// the HTTP/2 connection has been initialized.
@@ -32,24 +28,18 @@ pub const ServeConnectionOptions = struct {
 /// alive until this function returns. TLS adapters are expected to complete the
 /// TLS handshake and enforce ALPN `h2` before calling this function.
 pub fn serveConnection(
-    allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     options: ServeConnectionOptions,
 ) !u32 {
     var connection: Connection = undefined;
 
-    if (options.stream_storage) |stream_storage| {
-        try Connection.initServerInPlace(
-            &connection,
-            stream_storage,
-            allocator,
-            reader,
-            writer,
-        );
-    } else {
-        connection = try Connection.init(allocator, reader, writer, true);
-    }
+    try Connection.initServerInPlace(
+        &connection,
+        options.stream_storage,
+        reader,
+        writer,
+    );
 
     defer connection.deinit();
     connection.bindRequestDispatcher(options.dispatcher);

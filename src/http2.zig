@@ -11,15 +11,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Local fork of `std.Io.Kqueue` (see `src/io/Kqueue.zig`). Re-exported so
-// out-of-tree modules (e.g. `examples/tls_server.zig`) consume the same
-// patched backend as the in-tree HTTP/2 server.
-pub const has_kqueue_backend = switch (builtin.os.tag) {
-    .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+// Statically allocating event loop (see `src/io/EventLoop.zig`), derived from
+// `std.Io.Kqueue` and reworked to preallocate fibers, worker stacks, and wait
+// registrations before the freeze boundary. The native `std.Io` backends
+// allocate a fiber per task at runtime, which a sealed allocator rejects.
+// Re-exported so out-of-tree modules (e.g. `examples/tls_server.zig`) consume
+// the same backend as the in-tree HTTP/2 server.
+//
+// Readiness polling is per platform: kqueue on the BSDs, epoll on Linux.
+pub const has_event_loop_backend = switch (builtin.os.tag) {
+    .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .linux => true,
     else => false,
 };
 
-pub const Kqueue = if (has_kqueue_backend) @import("io/Kqueue.zig") else opaque {};
+pub const EventLoop = if (has_event_loop_backend) @import("io/EventLoop.zig") else opaque {};
 
 // Core HTTP/2 Protocol Components
 pub const Connection = @import("connection.zig").Connection;
@@ -34,6 +39,7 @@ pub const Priority = @import("http_priority.zig").Priority;
 // Memory Management
 pub const memory_budget = @import("memory_budget.zig");
 pub const budget_assertions = @import("budget_assertions.zig");
+pub const MemBudget = @import("memory_budget.zig").MemBudget;
 
 // Error Types
 pub const error_types = @import("error.zig");
@@ -44,10 +50,18 @@ pub const transport = @import("transport.zig");
 pub const ServeConnectionOptions = transport.ServeConnectionOptions;
 pub const serveConnection = transport.serveConnection;
 
+// Request-target path normalization.
+pub const path = @import("path.zig");
+
+// Per-connection stream slot storage with O(1) lookup.
+pub const stream_storage = @import("stream_storage.zig");
+
 // Handler API
 pub const handler = @import("handler.zig");
 pub const Context = handler.Context;
 pub const Response = handler.Response;
+pub const StreamReadResult = handler.StreamReadResult;
+pub const StreamResponseConfig = handler.StreamResponseConfig;
 pub const RequestDispatcher = handler.RequestDispatcher;
 pub const Status = handler.Status;
 pub const Mime = handler.Mime;
@@ -58,88 +72,7 @@ pub const max_frame_size_default = 16384;
 pub const max_header_list_size_default = 8192;
 pub const initial_window_size_default = 65535;
 
-// Import the high-performance server.
-const TransportServer = @import("server.zig").Server;
-
-/// High-performance HTTP/2 server.
-/// Uses the configured Zig `std.Io` backend.
-pub const Server = struct {
-    inner: TransportServer,
-    allocator: std.mem.Allocator,
-
-    const Self = @This();
-
-    pub const Config = struct {
-        /// Address to bind to
-        address: std.Io.net.IpAddress,
-        /// Request dispatcher for application routing or request handling.
-        dispatcher: RequestDispatcher,
-        /// Maximum concurrent connections
-        max_connections: u32 = 1000,
-        /// Buffer size per connection
-        buffer_size: u32 = 32 * 1024,
-    };
-
-    /// Initialize a new HTTP/2 server
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
-        return Self{
-            .inner = try TransportServer.init(allocator, .{
-                .address = config.address,
-                .dispatcher = config.dispatcher,
-                .max_connections = config.max_connections,
-                .buffer_size = config.buffer_size,
-            }),
-            .allocator = allocator,
-        };
-    }
-
-    /// Clean up server resources
-    pub fn deinit(self: *Self) void {
-        self.inner.deinit();
-    }
-
-    /// Run the server event loop
-    pub fn run(self: *Self) !void {
-        try self.inner.run();
-    }
-
-    /// Stop the server
-    pub fn stop(self: *Self) void {
-        self.inner.stop();
-    }
-
-    /// Get server statistics
-    pub fn getStats(self: *Self) ServerStats {
-        return self.inner.getStats();
-    }
-};
-
-/// Experimental async HTTP/2 server.
-pub const AsyncServer = struct {
-    inner: TransportServer,
-
-    const Self = @This();
-
-    pub const Config = TransportServer.Config;
-
-    pub fn init(allocator: std.mem.Allocator, config: Config) !Self {
-        return Self{
-            .inner = try TransportServer.init(allocator, config),
-        };
-    }
-
-    pub fn deinit(self: *Self) void {
-        self.inner.deinit();
-    }
-
-    pub fn run(self: *Self) !void {
-        try self.inner.run();
-    }
-
-    pub fn getStats(self: *Self) ServerStats {
-        return self.inner.getStats();
-    }
-};
+pub const Server = @import("server.zig").Server;
 
 /// Server statistics
 pub const ServerStats = struct {
@@ -151,14 +84,44 @@ pub const ServerStats = struct {
     requests_processed: u64 = 0,
 };
 
-/// Initialize the HTTP/2 system
+/// Begin the HTTP/2 startup phase.
+///
+/// Every server, client connection pool, and transport adapter must allocate
+/// its bounded storage through `staticAllocator()` before `freeze()`.
 pub fn init(allocator: std.mem.Allocator) !void {
-    try memory_budget.initGlobalMemoryPool(allocator);
+    try memory_budget.initStaticAllocator(allocator);
 }
 
-/// Deinitialize the HTTP/2 system
+/// Return the startup-only allocator.
+pub fn staticAllocator() std.mem.Allocator {
+    return memory_budget.staticAllocatorPtr().allocator();
+}
+
+/// Seal startup memory. Runtime allocation, resize, remap, and free operations
+/// become unconditional safety failures in every optimization mode.
+pub fn freeze() void {
+    memory_budget.freezeStaticAllocator();
+}
+
+/// Seal startup memory if the application did not call `freeze()` explicitly.
+/// Server run loops call this immediately before accepting traffic.
+pub fn freezeIfNeeded() void {
+    const snapshot = memory_budget.allocatorSnapshot();
+    switch (snapshot.state) {
+        .init => freeze(),
+        .static => {},
+        .deinit => @panic("HTTP/2 runtime started during teardown"),
+    }
+}
+
+/// Enter teardown before any startup-owned pool is freed.
+pub fn beginDeinit() void {
+    memory_budget.beginStaticAllocatorDeinit();
+}
+
+/// Finish teardown after all startup-owned pools have been freed.
 pub fn deinit() void {
-    memory_budget.deinitGlobalMemoryPool();
+    memory_budget.deinitStaticAllocator();
 }
 
 // Compile-time validation and assertions for design integrity
@@ -178,6 +141,8 @@ comptime {
 }
 
 test "HTTP/2 server creation" {
+    // The bundled server requires the static event-loop backend.
+    if (!has_event_loop_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -194,6 +159,7 @@ test "HTTP/2 server creation" {
     const config = Server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", 3000),
         .dispatcher = RequestDispatcher.fromHandler(test_handler),
+        .max_connections = 2,
     };
 
     var server = try Server.init(allocator, config);

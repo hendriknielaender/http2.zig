@@ -3,7 +3,6 @@ const assert = std.debug.assert;
 const Frame = @import("frame.zig").Frame;
 const FrameHeader = @import("frame.zig").FrameHeader;
 const FrameType = @import("frame.zig").FrameType;
-const FrameTypes = @import("frame.zig");
 const FrameFlags = @import("frame.zig").FrameFlags;
 const Connection = @import("connection.zig").Connection;
 const Hpack = @import("hpack.zig").Hpack;
@@ -11,6 +10,7 @@ const Priority = @import("http_priority.zig").Priority;
 const handler = @import("handler.zig");
 const memory_budget = @import("memory_budget.zig");
 const TestIo = @import("testing/fixed_io.zig").FixedIo;
+const ResponseWriter = @import("response.zig").ResponseWriter;
 
 const log = std.log.scoped(.stream);
 
@@ -26,7 +26,7 @@ pub const StreamState = enum(u3) {
 };
 
 // Compile-time stream event enumeration for state machine
-pub const StreamEvent = enum(u4) {
+const StreamEvent = enum(u4) {
     RecvHeaders = 0,
     RecvData = 1,
     RecvEndStream = 2,
@@ -98,45 +98,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
         const WindowBufferSize: u32 = 1 << WindowBits;
         const WindowDefault: u32 = WindowBufferSize - 1;
         const MaxStreamCount: u32 = MaxStreams;
-        const HeaderBufferSize = memory_budget.MemBudget.max_header_size;
+        const HeaderBufferSize = memory_budget.MemBudget.max_header_size_bytes;
         const HeaderCountMax = 64;
-
-        // Per-stream scratch the dispatcher can format small response bodies
-        // into without touching the heap. 256 bytes covers numeric, status, or
-        // short text replies (the hot benchmark path); larger payloads must
-        // continue to use the request allocator. Sizing is a compile-time
-        // tradeoff between covering the common case and per-connection memory.
-        const ResponseBodyStorageSize: usize = 256;
-
-        // Static memory allocation for streams
-        const StreamPool = struct {
-            streams: [MaxStreamCount]?*Self.StreamInstance = [_]?*Self.StreamInstance{null} ** MaxStreamCount,
-            next_free: u32 = 0,
-
-            fn allocate(self: *StreamPool, allocator: std.mem.Allocator) !*Self.StreamInstance {
-                if (self.next_free >= MaxStreamCount) return error.StreamPoolExhausted;
-
-                const stream = try allocator.create(Self.StreamInstance);
-                self.streams[self.next_free] = stream;
-                const index = self.next_free;
-                self.next_free += 1;
-                return self.streams[index].?;
-            }
-
-            fn deallocate(self: *StreamPool, stream: *Self.StreamInstance, allocator: std.mem.Allocator) void {
-                for (self.streams[0..self.next_free], 0..) |s, i| {
-                    if (s == stream) {
-                        allocator.destroy(stream);
-                        self.streams[i] = null;
-                        // Compact the pool to maintain efficiency
-                        if (i == self.next_free - 1) {
-                            self.next_free -= 1;
-                        }
-                        return;
-                    }
-                }
-            }
-        };
 
         // Stream instance with static buffer allocation
         pub const StreamInstance = struct {
@@ -167,19 +130,14 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             request_method: ?handler.Method,
             request_path: ?[]const u8,
             total_data_received: usize,
-            request_body_storage: [memory_budget.MemBudget.max_data_buffer]u8,
+            request_body_storage: [memory_budget.MemBudget.max_data_buffer_bytes]u8,
             request_body_len: usize,
-            // Scratch the request handler formats small response bodies into,
-            // owned by the stream so the body slice on `response` stays valid
-            // until the stream slot is released. See `ResponseBodyStorageSize`.
-            response_body_storage: [ResponseBodyStorageSize]u8,
+            // Scratch for a buffered body or in-place streaming source state.
+            // The two uses are mutually exclusive for a response.
+            response_body_storage: handler.StreamStateStorage,
             request_headers_complete: bool,
             request_complete: bool,
-            response: ?handler.Response,
-            response_prepared: bool,
-            response_header_block_len: usize,
-            response_headers_sent: bool,
-            response_body_sent: usize,
+            response_writer: ResponseWriter,
             cleaned_up: bool,
 
             // RFC 9218 extensible priority state.
@@ -194,49 +152,49 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             weight: u16,
 
             // Compile-time optimized initialization
+            /// Prepares a slot for a new stream.
+            ///
+            /// Fields are written individually rather than through a whole
+            /// struct literal. The literal form stores every field including
+            /// the four scratch buffers, and the backend folds the
+            /// `undefined` ones into an adjacent zero-fill — measured at 8 KiB
+            /// of `bzero` per stream, which is pure waste on the hot path.
+            /// The buffers below carry no meaning until their paired length
+            /// says otherwise, so they are deliberately left as-is.
             pub fn init(self: *Self.StreamInstance, conn: *Connection, id: u32) void {
-                self.* = Self.StreamInstance{
-                    .id = id,
-                    .state = .Idle,
-                    .conn = conn,
-                    .recv_window_size = @intCast(WindowDefault),
-                    .send_window_size = @intCast(WindowDefault),
-                    .initial_window_size = WindowDefault,
+                self.id = id;
+                self.state = .Idle;
+                self.conn = conn;
+                self.recv_window_size = @intCast(WindowDefault);
+                self.send_window_size = @intCast(WindowDefault);
+                self.initial_window_size = WindowDefault;
 
-                    .header_block_fragments_buf = undefined,
-                    .headers_bytes_storage = undefined,
+                // header_block_fragments_buf, headers_bytes_storage,
+                // headers_storage, and request_body_storage stay untouched;
+                // the lengths below define what is readable.
+                self.header_block_fragments_len = 0;
+                self.headers_bytes_len = 0;
+                self.request_body_len = 0;
 
-                    .header_block_fragments_len = 0,
-                    .headers_bytes_len = 0,
-
-                    .expecting_continuation = false,
-                    .headers_storage = undefined,
-                    .headers = .empty,
-                    .content_length = null,
-                    .request_method_bytes = null,
-                    .request_method = null,
-                    .request_path = null,
-                    .total_data_received = 0,
-                    .request_body_storage = undefined,
-                    .request_body_len = 0,
-                    .response_body_storage = undefined,
-                    .request_headers_complete = false,
-                    .request_complete = false,
-                    .response = null,
-                    .response_prepared = false,
-                    .response_header_block_len = 0,
-                    .response_headers_sent = false,
-                    .response_body_sent = 0,
-                    .cleaned_up = false,
-                    .priority = .{},
-                    .priority_update_received = false,
-                    .schedule_epoch_last = 0,
-                    .schedule_count = 0,
-                    .stream_dependency = 0,
-                    .exclusive = false,
-                    .weight = 16,
-                };
+                self.expecting_continuation = false;
                 self.headers = std.ArrayList(Hpack.HeaderField).initBuffer(&self.headers_storage);
+                self.content_length = null;
+                self.request_method_bytes = null;
+                self.request_method = null;
+                self.request_path = null;
+                self.total_data_received = 0;
+                self.response_body_storage.initInPlace(id);
+                self.request_headers_complete = false;
+                self.request_complete = false;
+                self.response_writer = ResponseWriter.init(&self.header_block_fragments_buf);
+                self.cleaned_up = false;
+                self.priority = .{};
+                self.priority_update_received = false;
+                self.schedule_epoch_last = 0;
+                self.schedule_count = 0;
+                self.stream_dependency = 0;
+                self.exclusive = false;
+                self.weight = 16;
             }
 
             // Optimized cleanup with static memory management
@@ -254,15 +212,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 self.header_block_fragments_len = 0;
                 self.headers_bytes_len = 0;
                 self.request_body_len = 0;
-                self.response_header_block_len = 0;
-                self.response_prepared = false;
-                self.response_headers_sent = false;
-                self.response_body_sent = 0;
 
-                if (self.response) |*response| {
-                    response.deinit();
-                }
-                self.response = null;
+                self.response_writer.deinit();
                 self.headers.clearRetainingCapacity();
                 self.request_method_bytes = null;
                 self.request_method = null;
@@ -387,37 +338,39 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 // Check for overflow - this can happen when window exceeds 2^31-1
                 if (overflowed != 0 or new_window > 2147483647) {
                     log.err("Stream {} flow control window overflow: FLOW_CONTROL_ERROR\n", .{self.id});
-                    try self.sendRstStream(0x3);
-                    return error.FlowControlError;
-                }
-                // Check for underflow (should not happen with positive increment, but be safe)
-                if (new_window < 0) {
-                    log.err("Stream {} flow control window underflow: {} below 0: FLOW_CONTROL_ERROR\n", .{ self.id, new_window });
-                    try self.sendRstStream(0x3);
                     return error.FlowControlError;
                 }
 
+                // SETTINGS_INITIAL_WINDOW_SIZE may make a stream window
+                // negative. A WINDOW_UPDATE can legally leave it negative.
                 self.send_window_size = new_window;
             }
 
-            // High-performance data sending with static buffers
-            pub fn sendData(self: *Self.StreamInstance, data: []const u8, end_stream: bool) !void {
-                // Exhaustive state validation
+            /// Low-level single-frame primitive for protocol/client machinery.
+            /// It does not enforce HEADERS sequencing or response ownership.
+            /// Server handlers must use `ResponseBuilder.stream()` instead.
+            pub fn sendDataFrameUnsafe(
+                self: *Self.StreamInstance,
+                data: []const u8,
+                end_stream: bool,
+            ) !void {
                 switch (self.state) {
                     .Open, .HalfClosedRemote => {},
                     else => return error.InvalidStreamState,
                 }
 
-                if (self.send_window_size <= 0) {
-                    return error.FlowControlError;
+                if (data.len > self.conn.settings.peer_max_frame_size) {
+                    return error.FrameSizeError;
                 }
-
-                const send_window_size: usize = @intCast(self.send_window_size);
-                if (data.len > send_window_size) {
-                    return error.FlowControlError;
+                if (data.len > 0) {
+                    if (self.send_window_size <= 0) return error.FlowControlError;
+                    if (self.conn.send_window_size <= 0) return error.FlowControlError;
+                    const stream_window: usize = @intCast(self.send_window_size);
+                    const connection_window: usize = @intCast(self.conn.send_window_size);
+                    if (data.len > stream_window or data.len > connection_window) {
+                        return error.FlowControlError;
+                    }
                 }
-
-                self.send_window_size -= @intCast(data.len);
 
                 const frame_flags = if (end_stream) FrameFlags.init(FrameFlags.END_STREAM) else FrameFlags.init(0);
 
@@ -433,6 +386,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 };
 
                 try frame.write(self.conn.writer);
+                self.send_window_size -= @intCast(data.len);
+                self.conn.send_window_size -= @intCast(data.len);
 
                 if (end_stream) {
                     self.state = transitionState(self.state, .SendEndStream);
@@ -666,7 +621,6 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 switch (self.state) {
                     .Idle => {
                         log.err("WINDOW_UPDATE received on idle stream {}: PROTOCOL_ERROR\n", .{self.id});
-                        try self.sendRstStream(0x1);
                         return error.ProtocolError;
                     },
                     .Closed => {
@@ -678,25 +632,22 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
                 if (frame.payload.len != 4) {
                     log.err("WINDOW_UPDATE frame with invalid payload length {} (expected 4): FRAME_SIZE_ERROR\n", .{frame.payload.len});
-                    try self.conn.send_goaway(0, 0x6, "WINDOW_UPDATE frame with invalid payload length: FRAME_SIZE_ERROR");
                     return error.FrameSizeError;
                 }
 
-                const increment = std.mem.readInt(u32, frame.payload[0..4], .big);
+                const increment =
+                    std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF;
 
                 if (increment == 0) {
                     log.err("WINDOW_UPDATE received with increment 0 on stream {}: PROTOCOL_ERROR\n", .{self.id});
                     try self.sendRstStream(0x1);
-                    return error.ProtocolError;
+                    return;
                 }
 
-                if (increment > 0x7FFFFFFF) {
-                    log.err("WINDOW_UPDATE increment {} exceeds maximum on stream {}: FLOW_CONTROL_ERROR\n", .{ increment, self.id });
+                self.updateSendWindow(@intCast(increment)) catch |err| {
+                    if (err != error.FlowControlError) return err;
                     try self.sendRstStream(0x3);
-                    return error.FlowControlError;
-                }
-
-                try self.updateSendWindow(@intCast(increment));
+                };
             }
 
             fn handleRstStream(self: *Self.StreamInstance, frame: Frame) !void {
@@ -994,7 +945,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     }
                 }
 
-                if (!isAllLowercase(header.name)) {
+                if (!handler.isAllLowercaseHeaderName(header.name)) {
                     try self.fail_protocol_error("Header field name contains uppercase letters");
                 }
             }
@@ -1078,28 +1029,6 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 self.priority.incremental = true;
             }
         };
-
-        // Public API for the generic Stream type
-        pool: StreamPool = StreamPool{},
-
-        pub fn createStream(self: *Self, allocator: std.mem.Allocator, conn: *Connection, id: u32) !*Self.StreamInstance {
-            const stream = try self.pool.allocate(allocator);
-            stream.init(conn, id);
-            return stream;
-        }
-
-        pub fn destroyStream(self: *Self, stream: *Self.StreamInstance, allocator: std.mem.Allocator) void {
-            stream.deinit();
-            self.pool.deallocate(stream, allocator);
-        }
-
-        // Static factory method for compatibility with connection code
-        pub fn init(allocator: std.mem.Allocator, conn: anytype, id: u32) !*Self.StreamInstance {
-            var pool = StreamPool{};
-            const stream = try pool.allocate(allocator);
-            stream.init(conn, id);
-            return stream;
-        }
     };
 }
 
@@ -1121,16 +1050,54 @@ fn isConnectionSpecificHeader(header_name: []const u8) bool {
     return false;
 }
 
-fn isAllLowercase(s: []const u8) bool {
-    for (s) |c| {
-        if (c >= 'A' and c <= 'Z') {
-            return false;
+pub const DefaultStream = Stream(
+    16,
+    @intCast(memory_budget.MemBudget.max_streams_per_connection),
+);
+
+comptime {
+    const Instance = DefaultStream.StreamInstance;
+    const Budget = memory_budget.MemBudget;
+    const fields = @typeInfo(Instance).@"struct".fields;
+    var found_header_fragments: bool = false;
+    var found_headers_storage: bool = false;
+    var found_request_body: bool = false;
+    var found_response_body: bool = false;
+    var found_headers_array: bool = false;
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, "header_block_fragments_buf")) {
+            found_header_fragments = true;
+            if (@sizeOf(field.type) != Budget.stream_header_fragments_bytes) {
+                @compileError("stream_header_fragments_bytes budget mismatch");
+            }
+        } else if (std.mem.eql(u8, field.name, "headers_bytes_storage")) {
+            found_headers_storage = true;
+            if (@sizeOf(field.type) != Budget.stream_headers_storage_bytes) {
+                @compileError("stream_headers_storage_bytes budget mismatch");
+            }
+        } else if (std.mem.eql(u8, field.name, "request_body_storage")) {
+            found_request_body = true;
+            if (@sizeOf(field.type) != Budget.stream_request_body_bytes) {
+                @compileError("stream_request_body_bytes budget mismatch");
+            }
+        } else if (std.mem.eql(u8, field.name, "response_body_storage")) {
+            found_response_body = true;
+            if (@sizeOf(field.type) != Budget.stream_response_body_bytes) {
+                @compileError("stream_response_body_bytes budget mismatch");
+            }
+        } else if (std.mem.eql(u8, field.name, "headers_storage")) {
+            found_headers_array = true;
+            if (@sizeOf(field.type) != Budget.stream_headers_array_bytes) {
+                @compileError("stream_headers_array_bytes budget mismatch");
+            }
         }
     }
-    return true;
+    if (!found_header_fragments) @compileError("Missing field: header_block_fragments_buf");
+    if (!found_headers_storage) @compileError("Missing field: headers_bytes_storage");
+    if (!found_request_body) @compileError("Missing field: request_body_storage");
+    if (!found_response_body) @compileError("Missing field: response_body_storage");
+    if (!found_headers_array) @compileError("Missing field: headers_storage");
 }
-
-pub const DefaultStream = Stream(16, 1000); // 64KB window, 1000 max streams
 
 test "compile-time stream configuration" {
     // Test different configurations compile successfully
@@ -1156,7 +1123,7 @@ test "CONNECT defaults request priority to incremental" {
     var buffer: [1024]u8 = undefined;
     var test_io = TestIo.init(&.{}, &buffer);
 
-    var connection = try Connection.init(
+    var connection = try Connection.initOwnedForTesting(
         arena.allocator(),
         &test_io.reader,
         &test_io.writer,
@@ -1181,7 +1148,7 @@ test "CONNECT priority header overrides default incremental behavior" {
     var buffer: [1024]u8 = undefined;
     var test_io = TestIo.init(&.{}, &buffer);
 
-    var connection = try Connection.init(
+    var connection = try Connection.initOwnedForTesting(
         arena.allocator(),
         &test_io.reader,
         &test_io.writer,

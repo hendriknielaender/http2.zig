@@ -1,7 +1,7 @@
 //! Deterministic HTTP/2 cluster simulator.
 //!
 //! This is the bridge between the protocol-aware single-connection simulator
-//! and a TigerBeetle-style cluster harness: peers own real `Connection` state,
+//! and cluster harness: peers own real `Connection` state,
 //! frames move through a bounded packet simulator, ticks are fixed, and the
 //! checker is protocol-aware enough to catch stream/accounting violations.
 
@@ -19,6 +19,7 @@ const hpack_mod = @import("hpack.zig");
 const memory_budget = @import("memory_budget.zig");
 const packet_sim = @import("testing/packet_simulator.zig");
 const prng_mod = @import("testing/prng.zig");
+const sim_common = @import("sim_common.zig");
 
 const Connection = connection_mod.Connection;
 const Frame = frame_mod.Frame;
@@ -85,20 +86,7 @@ pub const Metrics = struct {
     }
 };
 
-const SimWriter = struct {
-    interface: std.Io.Writer,
-    storage: [writer_capacity]u8 = undefined,
-
-    fn init() SimWriter {
-        var self: SimWriter = undefined;
-        self.interface = .fixed(&self.storage);
-        return self;
-    }
-
-    fn written(self: *const SimWriter) []const u8 {
-        return self.interface.buffered();
-    }
-};
+const SimWriter = sim_common.SimWriter(writer_capacity);
 
 pub const Http2Peer = struct {
     role: Role,
@@ -111,7 +99,6 @@ pub const Http2Peer = struct {
 
     fn init(
         self: *Http2Peer,
-        allocator: std.mem.Allocator,
         role: Role,
     ) !void {
         self.role = role;
@@ -126,7 +113,6 @@ pub const Http2Peer = struct {
         try Connection.initServerEventDrivenInPlace(
             &self.connection,
             &self.stream_storage,
-            allocator,
             &self.reader,
             &self.writer.interface,
         );
@@ -167,9 +153,9 @@ const ClientOracle = struct {
     stream_count: u32 = 0,
     completed_responses: u64 = 0,
 
-    fn init(allocator: std.mem.Allocator) ClientOracle {
+    fn init() ClientOracle {
         return .{
-            .decoder_table = Hpack.DynamicTable.init(allocator, 4096),
+            .decoder_table = Hpack.DynamicTable.init(4096),
             .streams = undefined,
             .stream_count = 0,
             .completed_responses = 0,
@@ -188,14 +174,13 @@ const ClientOracle = struct {
 
     fn onFrame(
         self: *ClientOracle,
-        allocator: std.mem.Allocator,
         packet: *const Packet,
     ) !void {
         switch (packet.frame_type) {
             .HEADERS => {
                 var stream = self.findStream(packet.source, packet.target, packet.stream_id);
                 assert(!stream.headers_seen);
-                try self.decodeHeaders(allocator, packet.payload_slice());
+                try self.decodeHeaders(packet.payload_slice());
                 stream.headers_seen = true;
                 if ((packet.flags & FrameFlags.END_STREAM) != 0) {
                     stream.remote_end_seen = true;
@@ -223,14 +208,15 @@ const ClientOracle = struct {
 
     fn decodeHeaders(
         self: *ClientOracle,
-        allocator: std.mem.Allocator,
         payload: []const u8,
     ) !void {
         var cursor: usize = 0;
         var status_seen = false;
         while (cursor < payload.len) {
-            var decoded = try Hpack.decodeHeaderField(payload[cursor..], &self.decoder_table, allocator);
-            defer decoded.deinit();
+            const decoded = try Hpack.decodeHeaderFieldView(
+                payload[cursor..],
+                &self.decoder_table,
+            );
             cursor += decoded.bytes_consumed;
             if (std.mem.eql(u8, decoded.header.name, ":status")) {
                 status_seen = true;
@@ -347,8 +333,8 @@ const ClusterChecker = struct {
         var completed: u64 = 0;
         for (peers, 0..) |*peer, peer_index| {
             if (!peer.has_connection) continue;
-            assert(peer.connection.stream_slots_in_use_count <= memory_budget.MemBudget.max_streams_per_conn);
-            assert(peer.connection.pending_stream_count <= memory_budget.MemBudget.max_streams_per_conn);
+            assert(peer.connection.stream_storage.in_use_count <= memory_budget.MemBudget.max_streams_per_connection);
+            assert(peer.connection.pending_stream_count <= memory_budget.MemBudget.max_streams_per_connection);
             assert(peer.connection.recv_window_size <= std.math.maxInt(i32));
             assert(peer.connection.send_window_size <= std.math.maxInt(i32));
             assert(peer.connection.hpack_decoder_table.current_size <= peer.connection.hpack_decoder_table.max_size);
@@ -357,17 +343,17 @@ const ClusterChecker = struct {
             assert(peer.connection.hpack_encoder_table.max_size <= peer.connection.hpack_encoder_table.max_allowed_size);
             completed += peer.connection.completed_responses_pending;
 
-            for (peer.connection.stream_slots_in_use, 0..) |in_use, slot_index| {
+            for (peer.connection.stream_storage.in_use, 0..) |in_use, slot_index| {
                 if (!in_use) continue;
-                const stream = &peer.connection.stream_slots[slot_index];
+                const stream = &peer.connection.stream_storage.slots[slot_index];
                 assert(stream.id > 0);
                 assert(stream.request_body_len <= stream.request_body_storage.len);
                 assert(stream.send_window_size <= std.math.maxInt(i32));
                 assert(stream.recv_window_size <= std.math.maxInt(i32));
-                if (stream.response) |response| {
-                    assert(stream.response_body_sent <= response.body.len);
+                if (stream.response_writer.response) |response| {
+                    assert(stream.response_writer.response_body_sent <= response.body.len);
                 } else {
-                    assert(stream.response_body_sent == 0);
+                    assert(stream.response_writer.response_body_sent == 0);
                 }
                 if (self.wasResetForPeer(stream.id, @intCast(peer_index))) {
                     assert(stream.state == .Closed);
@@ -450,21 +436,21 @@ pub const Http2Cluster = struct {
         var peer_index: u8 = 0;
         while (peer_index < options.nodeCount()) : (peer_index += 1) {
             const role: Role = if (peer_index < options.client_count) .client else .server;
-            try peers[peer_index].init(allocator, role);
+            try peers[peer_index].init(role);
         }
         errdefer for (peers) |*peer| peer.deinit();
 
         const client_encoder_tables = try allocator.alloc(Hpack.DynamicTable, options.client_count);
         errdefer allocator.free(client_encoder_tables);
         for (client_encoder_tables) |*table| {
-            table.* = Hpack.DynamicTable.init(allocator, 4096);
+            table.* = Hpack.DynamicTable.init(4096);
         }
         errdefer for (client_encoder_tables) |*table| table.deinit();
 
         const client_oracles = try allocator.alloc(ClientOracle, options.client_count);
         errdefer allocator.free(client_oracles);
         for (client_oracles) |*oracle| {
-            oracle.* = ClientOracle.init(allocator);
+            oracle.* = ClientOracle.init();
         }
         errdefer for (client_oracles) |*oracle| oracle.deinit();
 
@@ -534,7 +520,6 @@ pub const Http2Cluster = struct {
 
             var payload_storage: [max_payload_size]u8 = undefined;
             const payload = try encodeRequestHeaders(
-                self.allocator,
                 &self.client_encoder_tables[client],
                 stream_id,
                 &payload_storage,
@@ -561,7 +546,7 @@ pub const Http2Cluster = struct {
                 self.metrics.frames_delivered += 1;
 
                 if (self.peers[peer_index].role == .client) {
-                    try self.client_oracles[peer_index].onFrame(self.allocator, &packet);
+                    try self.client_oracles[peer_index].onFrame(&packet);
                 } else {
                     const result = self.peers[peer_index].connection.handleFrameEventDriven(frameFromPacket(&packet));
                     result catch |err| {
@@ -639,60 +624,29 @@ pub const Http2Cluster = struct {
     }
 };
 
-fn frameFromPacket(packet: *const Packet) Frame {
-    return .{
-        .header = .{
-            .length = packet.payload_len,
-            .frame_type = coreFrameType(packet.frame_type),
-            .flags = FrameFlags.init(packet.flags),
-            .reserved = false,
-            .stream_id = packet.stream_id,
-        },
-        .payload = packet.payload_slice(),
-    };
-}
-
-fn packetFrameType(frame_type: FrameType) packet_sim.FrameType {
-    return @enumFromInt(@intFromEnum(frame_type));
-}
-
-fn coreFrameType(frame_type: packet_sim.FrameType) FrameType {
-    return @enumFromInt(@intFromEnum(frame_type));
-}
-
-fn digestMix(value: u64, input: u64) u64 {
-    return (value ^ input) *% 0x100000001b3;
-}
-
-fn isExpectedError(err: anyerror) bool {
-    return switch (err) {
-        error.ProtocolError,
-        error.StreamClosed,
-        error.FrameSizeError,
-        error.FlowControlError,
-        error.InvalidStreamState,
-        error.IdleStreamError,
-        error.CompressionError,
-        error.MaxConcurrentStreamsExceeded,
-        => true,
-        else => false,
-    };
-}
+const frameFromPacket = sim_common.frameFromPacket;
+const packetFrameType = sim_common.packetFrameType;
+const coreFrameType = sim_common.coreFrameType;
+const digestMix = sim_common.digestMix;
+const isExpectedError = sim_common.isExpectedError;
 
 fn encodeRequestHeaders(
-    allocator: std.mem.Allocator,
     table: *Hpack.DynamicTable,
     stream_id: u32,
     storage: []u8,
 ) ![]const u8 {
     var encoded = std.ArrayList(u8).initBuffer(storage);
-    try Hpack.encodeHeaderField(.{ .name = ":method", .value = "GET" }, table, &encoded, allocator);
-    try Hpack.encodeHeaderField(.{ .name = ":scheme", .value = "https" }, table, &encoded, allocator);
-    try Hpack.encodeHeaderField(.{ .name = ":authority", .value = "cluster.sim" }, table, &encoded, allocator);
+    try Hpack.encodeHeaderField(.{ .name = ":method", .value = "GET" }, table, &encoded);
+    try Hpack.encodeHeaderField(.{ .name = ":scheme", .value = "https" }, table, &encoded);
+    try Hpack.encodeHeaderField(
+        .{ .name = ":authority", .value = "cluster.sim" },
+        table,
+        &encoded,
+    );
 
     var path_storage: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/cluster/{d}", .{stream_id});
-    try Hpack.encodeHeaderField(.{ .name = ":path", .value = path }, table, &encoded, allocator);
+    try Hpack.encodeHeaderField(.{ .name = ":path", .value = path }, table, &encoded);
     return encoded.items;
 }
 

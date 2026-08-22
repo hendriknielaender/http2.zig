@@ -47,27 +47,37 @@ fn baseline2Handler(ctx: *const http2.Context) !http2.Response {
     return ctx.response.text(.ok, written);
 }
 
+/// Listen port, from `PORT` when set.
+fn resolvePort() u16 {
+    const port_env = if (std.c.getenv("PORT")) |value| std.mem.span(value) else null;
+    const env_val = port_env orelse return 8443;
+    return std.fmt.parseInt(u16, env_val, 10) catch 8443;
+}
+
+/// Sizes the event loop to the machine, as the pre-static-allocation build
+/// did, bounded by the static worker ceiling.
+fn resolveWorkerCount() u16 {
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    return @intCast(@min(@max(cpu_count, 1), http2.MemBudget.worker_count_max));
+}
+
 /// High-performance HTTP/2 over TLS benchmark server.
 pub fn main() !void {
     const allocator = std.heap.smp_allocator;
 
-    // Initialize http2 system
+    // Open the startup allocation phase.
     try http2.init(allocator);
     defer http2.deinit();
 
-    // Get port from environment.
-    const port_env = if (std.c.getenv("PORT")) |value| std.mem.span(value) else null;
+    const port = resolvePort();
+    const worker_count = resolveWorkerCount();
 
-    const port: u16 = if (port_env) |env_val|
-        std.fmt.parseInt(u16, env_val, 10) catch 8443
-    else
-        8443;
-
-    // Configure server for benchmarking with high concurrency
+    // Bound every HTTP/2 resource before the runtime phase.
     const config = tls_server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", port),
         .dispatcher = http2.RequestDispatcher.fromHandlerWithoutHeaders(benchmarkHandler),
-        .max_connections = http2.memory_budget.MemBudget.max_conns,
+        .max_connections = http2.memory_budget.MemBudget.max_connections,
+        .worker_count = worker_count,
     };
 
     var server = try tls_server.Server.init(allocator, config);
@@ -76,27 +86,36 @@ pub fn main() !void {
     log.info("HTTP/2 over TLS benchmark server ready on port {}", .{port});
     log.info("BoringSSL TLS is provided by http2-boring", .{});
 
-    // Create a context for the monitor thread
+    // The monitor thread is a startup resource and must exist before freeze.
     const MonitorContext = struct {
         server: *tls_server.Server,
+        initialized: std.atomic.Value(bool),
         ready: std.atomic.Value(bool),
         running: std.atomic.Value(bool),
     };
 
     var monitor_ctx = MonitorContext{
         .server = &server,
+        .initialized = std.atomic.Value(bool).init(false),
         .ready = std.atomic.Value(bool).init(false),
         .running = std.atomic.Value(bool).init(true),
     };
 
-    // Start performance monitoring with synchronization
+    // Start performance monitoring with synchronization.
     const monitor_thread = try std.Thread.spawn(.{}, monitorPerformance, .{&monitor_ctx});
     defer {
         monitor_ctx.running.store(false, .release);
         monitor_thread.join();
     }
 
-    // Signal that server is ready before running
+    while (!monitor_ctx.initialized.load(.acquire)) {
+        std.Thread.yield() catch {};
+    }
+
+    // All Zig-owned server pools, backend workers, and support threads now exist.
+    http2.freeze();
+
+    // Signal that the monitor may inspect the live server.
     monitor_ctx.ready.store(true, .release);
     server.run() catch |err| {
         log.err("Benchmark server failed: {}", .{err});
@@ -107,12 +126,14 @@ pub fn main() !void {
 fn monitorPerformance(ctx: *const anyopaque) void {
     const MonitorContext = struct {
         server: *tls_server.Server,
+        initialized: std.atomic.Value(bool),
         ready: std.atomic.Value(bool),
         running: std.atomic.Value(bool),
     };
 
     const monitor_ctx = @as(*MonitorContext, @ptrCast(@alignCast(@constCast(ctx))));
     const io = std.Io.Threaded.global_single_threaded.io();
+    monitor_ctx.initialized.store(true, .release);
 
     // Wait for server to be ready
     while (!monitor_ctx.ready.load(.acquire)) {
@@ -142,13 +163,17 @@ fn monitorPerformance(ctx: *const anyopaque) void {
             if (conn_rps > peak_conn_rps) peak_conn_rps = conn_rps;
             if (req_rps > peak_rps) peak_rps = req_rps;
 
-            log.info("[HTTP/2] {} active | {} req/s ({} conn/s) | {} total reqs | Peak: {} req/s", .{
-                stats.active_connections,
-                req_rps,
-                conn_rps,
-                stats.requests_processed,
-                peak_rps,
-            });
+            log.info(
+                "[HTTP/2] {} active | {} req/s ({} conn/s) | " ++
+                    "{} total reqs | Peak: {} req/s",
+                .{
+                    stats.active_connections,
+                    req_rps,
+                    conn_rps,
+                    stats.requests_processed,
+                    peak_rps,
+                },
+            );
 
             last_total = stats.total_connections;
             last_requests = stats.requests_processed;
