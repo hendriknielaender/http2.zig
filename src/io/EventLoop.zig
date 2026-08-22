@@ -780,10 +780,18 @@ fn queueContainsFiber(head: *Fiber, target: *Fiber) bool {
 
 fn findReadyFiber(loop: *EventLoop, thread: *Thread) ?*Fiber {
     if (@atomicRmw(?*Fiber, &thread.ready_queue, .Xchg, Fiber.finished, .acquire)) |ready_fiber| {
-        assert(thread == &loop.threads.allocated[0] or
-            !queueContainsFiber(ready_fiber, loop.mainFiber()));
-        @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.queue_next, .release);
+        // The sentinel locks the list against pushers until the remainder is
+        // published; see `waitForReadyQueue`.
+        const remainder = ready_fiber.queue_next;
         ready_fiber.queue_next = null;
+        if (@cmpxchgStrong(
+            ?*Fiber,
+            &thread.ready_queue,
+            Fiber.finished,
+            remainder,
+            .release,
+            .monotonic,
+        ) != null) @panic("ready queue pushed across an active pop");
         return ready_fiber;
     }
     const active_threads = @atomicLoad(u32, &loop.threads.active, .acquire);
@@ -808,8 +816,18 @@ fn findReadyFiber(loop: *EventLoop, thread: *Thread) ?*Fiber {
             .acquire,
             .monotonic,
         )) |_| continue;
-        @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.queue_next, .release);
+        const remainder = ready_fiber.queue_next;
         ready_fiber.queue_next = null;
+        // Our own slot still holds this pop's sentinel; publish the stolen
+        // remainder through it, exactly like the local-pop path above.
+        if (@cmpxchgStrong(
+            ?*Fiber,
+            &thread.ready_queue,
+            Fiber.finished,
+            remainder,
+            .release,
+            .monotonic,
+        ) != null) @panic("ready queue pushed across an active steal");
         return ready_fiber;
     }
     // couldn't find anything to do, so we are now open for business
@@ -884,14 +902,34 @@ fn schedule(loop: *EventLoop, thread: *Thread, unpinned_queue: Fiber.Queue) void
         return;
     }
     // nobody wanted it, so just queue it on ourselves
-    while (@cmpxchgWeak(
-        ?*Fiber,
-        &thread.ready_queue,
-        ready_queue.tail.queue_next,
-        ready_queue.head,
-        .acq_rel,
-        .acquire,
-    )) |old_head| ready_queue.tail.queue_next = old_head;
+    var expected: ?*Fiber = null;
+    while (true) {
+        waitForReadyQueue(thread);
+        if (@cmpxchgWeak(
+            ?*Fiber,
+            &thread.ready_queue,
+            expected,
+            ready_queue.head,
+            .acq_rel,
+            .acquire,
+        )) |old_head| {
+            if (old_head != Fiber.finished) {
+                ready_queue.tail.queue_next = old_head;
+                expected = old_head;
+            }
+            continue;
+        }
+        break;
+    }
+}
+
+/// Blocks pushers while a pop holds the `finished` sentinel in the slot, so a
+/// push can never interleave between the pop's list detach and its remainder
+/// publication.
+fn waitForReadyQueue(thread: *Thread) void {
+    while (@atomicLoad(?*Fiber, &thread.ready_queue, .acquire) == Fiber.finished) {
+        std.atomic.spinLoopHint();
+    }
 }
 
 fn pinMainFiber(loop: *EventLoop, ready_queue: *Fiber.Queue) bool {
@@ -1180,6 +1218,7 @@ fn wakeFd(loop: *EventLoop, fd: posix.fd_t) void {
 fn scheduleReadyQueueOnThread(thread: *Thread, ready_queue: Fiber.Queue) void {
     assert(ready_queue.tail.queue_next == null);
 
+    waitForReadyQueue(thread);
     var expected: ?*Fiber = null;
     while (true) {
         if (@cmpxchgWeak(
@@ -1191,6 +1230,7 @@ fn scheduleReadyQueueOnThread(thread: *Thread, ready_queue: Fiber.Queue) void {
             .monotonic,
         )) |old_head| {
             if (old_head == Fiber.finished) {
+                waitForReadyQueue(thread);
                 expected = null;
             } else {
                 ready_queue.tail.queue_next = old_head;
