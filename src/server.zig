@@ -7,9 +7,9 @@ const handler = @import("handler.zig");
 const transport = @import("transport.zig");
 const http2 = @import("http2.zig");
 const memory_budget = @import("memory_budget.zig");
-// Local fork of `std.Io.Kqueue` patched to compile against the current
-// `std.Io.VTable` shape. See `src/io/Kqueue.zig` for the rationale.
-const Kqueue = http2.Kqueue;
+// Local fork of `std.Io.EventLoop` patched to compile against the current
+// `std.Io.VTable` shape. See `src/io/EventLoop.zig` for the rationale.
+const EventLoop = http2.EventLoop;
 
 const Connection = connection_module.Connection;
 const ServerStats = @import("http2.zig").ServerStats;
@@ -23,15 +23,15 @@ const RunState = enum(u8) {
     stopping,
 };
 
-const Backend = if (http2.has_kqueue_backend) struct {
+const Backend = if (http2.has_event_loop_backend) struct {
     allocator: std.mem.Allocator,
-    evented: *Kqueue,
+    evented: *EventLoop,
 
     fn init(
         allocator: std.mem.Allocator,
         runtime_plan: memory_budget.RuntimePlan,
     ) !Backend {
-        const evented = try allocator.create(Kqueue);
+        const evented = try allocator.create(EventLoop);
         errdefer allocator.destroy(evented);
 
         try evented.init(allocator, .{
@@ -166,7 +166,7 @@ pub const Server = struct {
         if (!memory_budget.backingAllocatorMatches(allocator)) {
             return error.BackingAllocatorMismatch;
         }
-        if (!http2.has_kqueue_backend) return error.StaticBackendUnavailable;
+        if (!http2.has_event_loop_backend) return error.StaticBackendUnavailable;
         const runtime_plan = try memory_budget.RuntimePlan.init(
             config.max_connections,
             config.buffer_size,
@@ -505,27 +505,27 @@ comptime {
     if (@sizeOf(Server.ConnectionSlot) > memory_budget.MemBudget.connection_slot_bytes) {
         @compileError("ConnectionSlot exceeds its static memory budget");
     }
-    if (http2.has_kqueue_backend and
-        Kqueue.fiber_allocation_size > memory_budget.MemBudget.event_loop_fiber_bytes_max)
+    if (http2.has_event_loop_backend and
+        EventLoop.fiber_allocation_size > memory_budget.MemBudget.event_loop_fiber_bytes_max)
     {
-        @compileError("Kqueue fiber exceeds its static memory budget");
+        @compileError("EventLoop fiber exceeds its static memory budget");
     }
-    if (http2.has_kqueue_backend and
-        Kqueue.worker_stack_reservation_bytes_max >
+    if (http2.has_event_loop_backend and
+        EventLoop.worker_stack_reservation_bytes_max >
             memory_budget.MemBudget.worker_stack_reservation_bytes_max)
     {
-        @compileError("Kqueue worker stack exceeds its static memory budget");
+        @compileError("EventLoop worker stack exceeds its static memory budget");
     }
-    if (http2.has_kqueue_backend and
-        Kqueue.wait_registration_bytes_max >
+    if (http2.has_event_loop_backend and
+        EventLoop.wait_registration_bytes_max >
             memory_budget.MemBudget.wait_registration_bytes_max)
     {
-        @compileError("Kqueue wait registration exceeds its static memory budget");
+        @compileError("EventLoop wait registration exceeds its static memory budget");
     }
-    if (http2.has_kqueue_backend and
-        Kqueue.wait_map_fixed_bytes_max > memory_budget.MemBudget.wait_map_fixed_bytes_max)
+    if (http2.has_event_loop_backend and
+        EventLoop.wait_map_fixed_bytes_max > memory_budget.MemBudget.wait_map_fixed_bytes_max)
     {
-        @compileError("Kqueue wait map exceeds its static memory budget");
+        @compileError("EventLoop wait map exceeds its static memory budget");
     }
 }
 
@@ -589,7 +589,7 @@ fn logListening(self: *const Server) void {
 }
 
 fn backendLabel() []const u8 {
-    return "Kqueue";
+    return "EventLoop";
 }
 
 fn setTcpNoDelay(fd: std.posix.fd_t) void {
@@ -691,8 +691,8 @@ fn testRequestHandler(ctx: *const handler.Context) !handler.Response {
 }
 
 test "server initialization keeps stats at zero" {
-    // The bundled server requires the static Kqueue backend.
-    if (!http2.has_kqueue_backend) return error.SkipZigTest;
+    // The bundled server requires the static EventLoop backend.
+    if (!http2.has_event_loop_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -714,8 +714,8 @@ test "server initialization keeps stats at zero" {
 }
 
 test "connection slots reject excess work and reuse released capacity" {
-    // The bundled server requires the static Kqueue backend.
-    if (!http2.has_kqueue_backend) return error.SkipZigTest;
+    // The bundled server requires the static EventLoop backend.
+    if (!http2.has_event_loop_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -744,8 +744,8 @@ test "connection slots reject excess work and reuse released capacity" {
 }
 
 test "server listener can stop and restart without stale cancellation" {
-    // The bundled server requires the static Kqueue backend.
-    if (!http2.has_kqueue_backend) return error.SkipZigTest;
+    // The bundled server requires the static EventLoop backend.
+    if (!http2.has_event_loop_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -765,8 +765,8 @@ test "server listener can stop and restart without stale cancellation" {
 }
 
 test "stop cancels idle async connections" {
-    // The bundled server requires the static Kqueue backend.
-    if (!http2.has_kqueue_backend) return error.SkipZigTest;
+    // The bundled server requires the static EventLoop backend.
+    if (!http2.has_event_loop_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

@@ -10,11 +10,13 @@ const builtin = @import("builtin");
 const StaticAllocator = @import("static_allocator.zig");
 const Hpack = @import("hpack.zig").Hpack;
 
-const has_kqueue_backend = switch (builtin.os.tag) {
-    .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+// Kept in sync with `http2.has_event_loop_backend`; importing it here would
+// be circular, since `http2.zig` imports this module.
+const has_event_loop_backend = switch (builtin.os.tag) {
+    .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .linux => true,
     else => false,
 };
-const Kqueue = if (has_kqueue_backend) @import("io/Kqueue.zig") else opaque {};
+const EventLoop = if (has_event_loop_backend) @import("io/EventLoop.zig") else opaque {};
 
 pub const KiB: usize = 1024;
 pub const MiB: usize = 1024 * KiB;
@@ -37,7 +39,10 @@ pub const MemBudget = struct {
     pub const event_loop_fibers_per_connection: u32 = 1;
     pub const wait_registration_bytes_max: usize = 128;
     pub const wait_map_fixed_bytes_max: usize = 256;
-    pub const worker_stack_reservation_bytes_max: usize = 320 * KiB;
+    // Worker idle stack plus one guard page; see `event_loop_fiber_bytes_max`
+    // for why the page size drives the worst case, and `idle_stack_size` in
+    // `io/EventLoop.zig` for why the stack itself is one MiB.
+    pub const worker_stack_reservation_bytes_max: usize = 1152 * KiB;
     pub const event_loop_control_memory_bytes_max: usize = 2 * MiB;
 
     pub const stream_header_fragments_bytes = max_header_size_bytes;
@@ -75,7 +80,10 @@ pub const MemBudget = struct {
 
     pub const io_buffer_memory_bytes =
         max_connections * max_io_buffer_size_bytes * 2;
-    pub const event_loop_fiber_bytes_max: usize = 528 * KiB;
+    // One fiber allocation, rounded up to a page. The page size is the
+    // platform variable here: 4 KiB on x86_64, 16 KiB on aarch64 macOS, and
+    // 64 KiB on aarch64 Linux, which is the worst case this must cover.
+    pub const event_loop_fiber_bytes_max: usize = 576 * KiB;
     pub const event_loop_fiber_count =
         max_connections * event_loop_fibers_per_connection;
     pub const wait_registration_count_per_thread_max =
@@ -294,8 +302,8 @@ fn eventLoopAllocatorBytesMax(
     fiber_count: u32,
     wait_registration_count_per_thread: u32,
 ) !usize {
-    if (comptime has_kqueue_backend) {
-        return Kqueue.allocatorBytesMax(.{
+    if (comptime has_event_loop_backend) {
+        return EventLoop.allocatorBytesMax(.{
             .n_threads = worker_count,
             .max_concurrent_tasks = fiber_count,
             .max_wait_registrations_per_thread = wait_registration_count_per_thread,
@@ -331,8 +339,8 @@ fn eventLoopAllocatorBytesMax(
 fn workerStackBytesMax(worker_count: u16) !usize {
     if (worker_count == 0) return error.InvalidWorkerCount;
     const spawned_worker_count = worker_count - 1;
-    const bytes_per_worker = if (has_kqueue_backend)
-        Kqueue.worker_stack_reservation_bytes_max
+    const bytes_per_worker = if (has_event_loop_backend)
+        EventLoop.worker_stack_reservation_bytes_max
     else
         MemBudget.worker_stack_reservation_bytes_max;
     return std.math.mul(usize, spawned_worker_count, bytes_per_worker) catch {

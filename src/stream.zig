@@ -152,46 +152,49 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             weight: u16,
 
             // Compile-time optimized initialization
+            /// Prepares a slot for a new stream.
+            ///
+            /// Fields are written individually rather than through a whole
+            /// struct literal. The literal form stores every field including
+            /// the four scratch buffers, and the backend folds the
+            /// `undefined` ones into an adjacent zero-fill — measured at 8 KiB
+            /// of `bzero` per stream, which is pure waste on the hot path.
+            /// The buffers below carry no meaning until their paired length
+            /// says otherwise, so they are deliberately left as-is.
             pub fn init(self: *Self.StreamInstance, conn: *Connection, id: u32) void {
-                self.* = Self.StreamInstance{
-                    .id = id,
-                    .state = .Idle,
-                    .conn = conn,
-                    .recv_window_size = @intCast(WindowDefault),
-                    .send_window_size = @intCast(WindowDefault),
-                    .initial_window_size = WindowDefault,
+                self.id = id;
+                self.state = .Idle;
+                self.conn = conn;
+                self.recv_window_size = @intCast(WindowDefault);
+                self.send_window_size = @intCast(WindowDefault);
+                self.initial_window_size = WindowDefault;
 
-                    .header_block_fragments_buf = undefined,
-                    .headers_bytes_storage = undefined,
+                // header_block_fragments_buf, headers_bytes_storage,
+                // headers_storage, and request_body_storage stay untouched;
+                // the lengths below define what is readable.
+                self.header_block_fragments_len = 0;
+                self.headers_bytes_len = 0;
+                self.request_body_len = 0;
 
-                    .header_block_fragments_len = 0,
-                    .headers_bytes_len = 0,
-
-                    .expecting_continuation = false,
-                    .headers_storage = undefined,
-                    .headers = .empty,
-                    .content_length = null,
-                    .request_method_bytes = null,
-                    .request_method = null,
-                    .request_path = null,
-                    .total_data_received = 0,
-                    .request_body_storage = undefined,
-                    .request_body_len = 0,
-                    .response_body_storage = handler.StreamStateStorage.init(id),
-                    .request_headers_complete = false,
-                    .request_complete = false,
-                    .response_writer = undefined,
-                    .cleaned_up = false,
-                    .priority = .{},
-                    .priority_update_received = false,
-                    .schedule_epoch_last = 0,
-                    .schedule_count = 0,
-                    .stream_dependency = 0,
-                    .exclusive = false,
-                    .weight = 16,
-                };
+                self.expecting_continuation = false;
                 self.headers = std.ArrayList(Hpack.HeaderField).initBuffer(&self.headers_storage);
+                self.content_length = null;
+                self.request_method_bytes = null;
+                self.request_method = null;
+                self.request_path = null;
+                self.total_data_received = 0;
+                self.response_body_storage.initInPlace(id);
+                self.request_headers_complete = false;
+                self.request_complete = false;
                 self.response_writer = ResponseWriter.init(&self.header_block_fragments_buf);
+                self.cleaned_up = false;
+                self.priority = .{};
+                self.priority_update_received = false;
+                self.schedule_epoch_last = 0;
+                self.schedule_count = 0;
+                self.stream_dependency = 0;
+                self.exclusive = false;
+                self.weight = 16;
             }
 
             // Optimized cleanup with static memory management

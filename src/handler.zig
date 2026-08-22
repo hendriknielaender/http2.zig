@@ -260,6 +260,17 @@ pub const StreamStateStorage = struct {
         };
     }
 
+    /// Initializes in place, leaving `bytes` untouched.
+    ///
+    /// Assigning the result of `init` would copy the whole struct, and a
+    /// whole-struct store lets the backend fold the scratch bytes into an
+    /// adjacent zero-fill. `bytes` carries no meaning until a source claims
+    /// it, so writing it is wasted work on the per-stream path.
+    pub fn initInPlace(self: *StreamStateStorage, generation_seed: u32) void {
+        self.generation = generation_seed;
+        self.active = false;
+    }
+
     fn claim(self: *StreamStateStorage) !u32 {
         if (self.active) return error.StreamStateStorageInUse;
         self.generation +%= 1;

@@ -47,6 +47,20 @@ fn baseline2Handler(ctx: *const http2.Context) !http2.Response {
     return ctx.response.text(.ok, written);
 }
 
+/// Listen port, from `PORT` when set.
+fn resolvePort() u16 {
+    const port_env = if (std.c.getenv("PORT")) |value| std.mem.span(value) else null;
+    const env_val = port_env orelse return 8443;
+    return std.fmt.parseInt(u16, env_val, 10) catch 8443;
+}
+
+/// Sizes the event loop to the machine, as the pre-static-allocation build
+/// did, bounded by the static worker ceiling.
+fn resolveWorkerCount() u16 {
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    return @intCast(@min(@max(cpu_count, 1), http2.MemBudget.worker_count_max));
+}
+
 /// High-performance HTTP/2 over TLS benchmark server.
 pub fn main() !void {
     const allocator = std.heap.smp_allocator;
@@ -55,20 +69,15 @@ pub fn main() !void {
     try http2.init(allocator);
     defer http2.deinit();
 
-    // Get port from environment.
-    const port_env = if (std.c.getenv("PORT")) |value| std.mem.span(value) else null;
-
-    const port: u16 = if (port_env) |env_val|
-        std.fmt.parseInt(u16, env_val, 10) catch 8443
-    else
-        8443;
+    const port = resolvePort();
+    const worker_count = resolveWorkerCount();
 
     // Bound every HTTP/2 resource before the runtime phase.
     const config = tls_server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", port),
         .dispatcher = http2.RequestDispatcher.fromHandlerWithoutHeaders(benchmarkHandler),
         .max_connections = http2.memory_budget.MemBudget.max_connections,
-        .worker_count = http2.MemBudget.worker_count,
+        .worker_count = worker_count,
     };
 
     var server = try tls_server.Server.init(allocator, config);

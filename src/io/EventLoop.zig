@@ -1,4 +1,4 @@
-const Kqueue = @This();
+const EventLoop = @This();
 const builtin = @import("builtin");
 
 const std = @import("std");
@@ -15,6 +15,21 @@ const closeFd = std.Io.Threaded.closeFd;
 const posix = std.posix;
 const posixSocketModeProtocol = Io.Threaded.posixSocketModeProtocol;
 
+/// Readiness poller for the host platform. Everything below this line is
+/// platform-neutral: the poller owns each thread's kernel descriptor and
+/// normalizes its events, so adding a platform means adding a poller rather
+/// than forking the scheduler.
+pub const Poll = switch (builtin.os.tag) {
+    .macos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("poll/kqueue.zig"),
+    .linux => @import("poll/epoll.zig"),
+    else => @compileError("unimplemented platform: " ++ @tagName(builtin.os.tag)),
+};
+
+/// Out-of-band message delivered to a thread's idle loop.
+const Signal = Poll.Signal;
+/// Backend-reported readiness detail, carried to the woken fiber verbatim.
+const Completion = Poll.Completion;
+
 /// Must be a thread-safe allocator.
 gpa: Allocator,
 main_fiber_buffer: [@sizeOf(Fiber) + Fiber.max_result_size]u8 align(@alignOf(Fiber)),
@@ -23,40 +38,47 @@ fiber_pool: FiberPool,
 workers_spawned: u32,
 main_owner: std.atomic.Value(std.Thread.Id),
 
-/// Empirically saw >128KB being used by the self-hosted backend to panic.
-const idle_stack_size = 256 * 1024;
+/// Idle-loop stack for each event-loop thread.
+///
+/// Two floors apply. The self-hosted backend was empirically seen using more
+/// than 128 KiB when panicking, and glibc carves a thread's static TLS block
+/// out of this same allocation and rejects `pthread_create` with `EINVAL`
+/// unless the stack clears `guardsize + static TLS + MINIMAL_REST_STACK`. Zig
+/// binaries carry roughly 264 KiB of static TLS, which puts that floor just
+/// above 256 KiB, so a stack sized to the first bound alone fails to spawn any
+/// worker on glibc. One MiB clears both with room to spare; the pages are
+/// reserved lazily, so the unused tail costs address space rather than memory.
+const idle_stack_size = 1024 * 1024;
 
 const max_idle_search = 4;
 const max_steal_ready_search = 4;
 const max_iovecs_len = 8;
-
-const changes_buffer_len = 64;
 
 const Thread = struct {
     thread: std.Thread,
     idle_context: Io.fiber.Context,
     current_context: *Io.fiber.Context,
     ready_queue: ?*Fiber,
-    kq_fd: posix.fd_t,
+    poll: Poll.Instance,
     mutex: std.atomic.Mutex,
     idle_search_index: u32,
     steal_ready_search_index: u32,
     /// For ensuring multiple fibers waiting on the same file descriptor and
-    /// filter use the same kevent.
+    /// filter share one registration.
     wait_queues: WaitQueues,
     wait_queue_limit: usize,
 
     const WaitQueueKey = struct {
         ident: usize,
-        filter: i16,
+        filter: Poll.Filter,
     };
 
     /// A wait_queues entry persists for the lifetime of the (fd, filter)
-    /// kqueue registration. With EV_CLEAR (edge-triggered) we register the
+    /// poller registration. Registrations are edge-triggered: we register the
     /// FD once and leave it registered across many events — when no fibers
     /// are waiting, both fields are null but the entry stays in the map as
-    /// a marker that "kqueue still knows about this FD". The entry is only
-    /// removed on `wakeFd` (called from `netClose`).
+    /// a marker that "the poller still knows about this FD". The entry is
+    /// only removed on `wakeFd` (called from `netClose`).
     const WaitQueue = struct {
         head: ?*Fiber,
         tail: ?*Fiber,
@@ -86,12 +108,16 @@ const Thread = struct {
         errdefer wait_queues.deinit(gpa);
         try wait_queues.ensureTotalCapacity(gpa, wait_queue_capacity);
 
+        var poll: Poll.Instance = undefined;
+        try poll.init();
+        errdefer poll.deinit();
+
         thread.* = .{
             .thread = undefined,
             .idle_context = undefined,
             .current_context = &thread.idle_context,
             .ready_queue = null,
-            .kq_fd = try createFileDescriptor(),
+            .poll = poll,
             .mutex = .unlocked,
             .idle_search_index = 0,
             .steal_ready_search_index = 0,
@@ -101,13 +127,13 @@ const Thread = struct {
     }
 
     fn deinit(thread: *Thread, gpa: Allocator) void {
-        closeFd(thread.kq_fd);
+        thread.poll.deinit();
         // With persistent edge-triggered registrations, entries may remain
         // as empty markers after all FDs were closed via `wakeFd`. What we
         // must not see is any *active* waiter still parked on this thread.
         for (thread.wait_queues.values()) |wait_queue| {
             if (wait_queue.head != null) {
-                @panic("Kqueue deinitialized with an active wait registration");
+                @panic("EventLoop deinitialized with an active wait registration");
             }
         }
         thread.wait_queues.deinit(gpa);
@@ -142,8 +168,8 @@ const Fiber = struct {
         std.heap.page_size_max,
     );
 
-    fn allocate(k: *Kqueue) error{ConcurrencyUnavailable}!*Fiber {
-        return k.fiber_pool.acquire() orelse error.ConcurrencyUnavailable;
+    fn allocate(loop: *EventLoop) error{ConcurrencyUnavailable}!*Fiber {
+        return loop.fiber_pool.acquire() orelse error.ConcurrencyUnavailable;
     }
 
     fn allocatedSlice(f: *Fiber) []align(@alignOf(Fiber)) u8 {
@@ -191,7 +217,7 @@ const Fiber = struct {
     const Queue = struct { head: *Fiber, tail: *Fiber };
 };
 
-/// Startup memory reserved for each concurrent Kqueue task.
+/// Startup memory reserved for each concurrent EventLoop task.
 pub const fiber_allocation_size = Fiber.allocation_size;
 /// Conservative per-registration map storage, including index/control bytes.
 pub const wait_registration_bytes_max: usize = 128;
@@ -200,7 +226,7 @@ pub const wait_map_fixed_bytes_max: usize = 256;
 pub const worker_stack_size = idle_stack_size;
 pub const worker_stack_reservation_bytes_max = worker_stack_size + std.heap.page_size_max;
 pub const thread_state_size = @sizeOf(Thread);
-pub const backend_struct_size = @sizeOf(Kqueue);
+pub const backend_struct_size = @sizeOf(EventLoop);
 
 const FiberPool = struct {
     storage: []align(@alignOf(Fiber)) u8,
@@ -238,7 +264,7 @@ const FiberPool = struct {
 
     fn deinit(pool: *FiberPool, gpa: Allocator) void {
         if (pool.free_count != pool.capacity) {
-            @panic("Kqueue deinitialized with live fibers");
+            @panic("EventLoop deinitialized with live fibers");
         }
         gpa.free(pool.storage);
         pool.* = undefined;
@@ -269,34 +295,34 @@ const FiberPool = struct {
 };
 
 test "fiber allocation reports saturation and reuses storage" {
-    var k: Kqueue = undefined;
-    k.fiber_pool = try FiberPool.init(std.testing.allocator, 2);
-    const first = try Fiber.allocate(&k);
-    const second = try Fiber.allocate(&k);
+    var loop: EventLoop = undefined;
+    loop.fiber_pool = try FiberPool.init(std.testing.allocator, 2);
+    const first = try Fiber.allocate(&loop);
+    const second = try Fiber.allocate(&loop);
     const saturated = blk: {
-        _ = Fiber.allocate(&k) catch |err| {
+        _ = Fiber.allocate(&loop) catch |err| {
             break :blk err == error.ConcurrencyUnavailable;
         };
         break :blk false;
     };
 
-    k.fiber_pool.release(first);
-    const recycled = try Fiber.allocate(&k);
+    loop.fiber_pool.release(first);
+    const recycled = try Fiber.allocate(&loop);
     const reused = recycled == first;
-    k.fiber_pool.release(second);
-    k.fiber_pool.release(recycled);
-    const storage_len = k.fiber_pool.storage.len;
-    k.fiber_pool.deinit(std.testing.allocator);
+    loop.fiber_pool.release(second);
+    loop.fiber_pool.release(recycled);
+    const storage_len = loop.fiber_pool.storage.len;
+    loop.fiber_pool.deinit(std.testing.allocator);
 
     try std.testing.expect(saturated);
     try std.testing.expect(reused);
     try std.testing.expectEqual(2 * fiber_allocation_size, storage_len);
 }
 
-fn recycle(k: *Kqueue, fiber: *Fiber) void {
+fn recycle(loop: *EventLoop, fiber: *Fiber) void {
     std.log.debug("recycling {*}", .{fiber});
     assert(fiber.queue_next == null);
-    k.fiber_pool.release(fiber);
+    loop.fiber_pool.release(fiber);
 }
 
 pub const InitOptions = struct {
@@ -307,12 +333,12 @@ pub const InitOptions = struct {
 
 pub const InitError = error{InvalidCapacity} ||
     Allocator.Error ||
-    CreateFileDescriptorError ||
+    Poll.CreateError ||
     std.Thread.SpawnError;
 
 pub const AllocationSizeError = error{ InvalidCapacity, Overflow };
 
-/// Bounds bytes requested from `gpa` by `create(Kqueue)` plus `init`.
+/// Bounds bytes requested from `gpa` by `create(EventLoop)` plus `init`.
 /// OS-owned stacks are separate: reserve `worker_stack_reservation_bytes_max` per worker.
 pub fn allocatorBytesMax(options: InitOptions) AllocationSizeError!usize {
     const n_threads = try resolveThreadCount(options);
@@ -350,7 +376,7 @@ fn alignBytes(value: usize, alignment: usize) error{Overflow}!usize {
     return with_padding & ~(alignment - 1);
 }
 
-pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
+pub fn init(loop: *EventLoop, gpa: Allocator, options: InitOptions) !void {
     const n_threads = try resolveThreadCount(options);
     const threads_size = std.math.mul(
         usize,
@@ -373,7 +399,7 @@ pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
     var fiber_pool = try FiberPool.init(gpa, options.max_concurrent_tasks);
     errdefer fiber_pool.deinit(gpa);
 
-    k.* = .{
+    loop.* = .{
         .gpa = gpa,
         .main_fiber_buffer = undefined,
         .threads = .{
@@ -385,15 +411,15 @@ pub fn init(k: *Kqueue, gpa: Allocator, options: InitOptions) !void {
         .main_owner = .init(0),
     };
 
-    initializeThreads(k, options.max_wait_registrations_per_thread) catch |err| {
-        cleanupInitializedThreads(k);
-        k.* = undefined;
+    initializeThreads(loop, options.max_wait_registrations_per_thread) catch |err| {
+        cleanupInitializedThreads(loop);
+        loop.* = undefined;
         return err;
     };
-    initializeMainFiber(k, allocated_slice, idle_stack_end_offset);
-    spawnWorkerThreads(k) catch |err| {
-        cleanupInitializedThreads(k);
-        k.* = undefined;
+    initializeMainFiber(loop, allocated_slice, idle_stack_end_offset);
+    spawnWorkerThreads(loop) catch |err| {
+        cleanupInitializedThreads(loop);
+        loop.* = undefined;
         return err;
     };
 }
@@ -435,17 +461,17 @@ test "init options require explicit nonzero capacities" {
 }
 
 test "init preallocates the single-thread backend" {
-    var k: Kqueue = undefined;
-    try k.init(std.testing.allocator, .{
+    var loop: EventLoop = undefined;
+    try loop.init(std.testing.allocator, .{
         .n_threads = 1,
         .max_concurrent_tasks = 2,
         .max_wait_registrations_per_thread = 3,
     });
 
-    const active_threads = k.threads.active;
-    const available_tasks = k.fiber_pool.free_count;
-    const wait_capacity = k.threads.allocated[0].wait_queues.capacity();
-    k.deinit();
+    const active_threads = loop.threads.active;
+    const available_tasks = loop.fiber_pool.free_count;
+    const wait_capacity = loop.threads.allocated[0].wait_queues.capacity();
+    loop.deinit();
 
     try std.testing.expectEqual(1, active_threads);
     try std.testing.expectEqual(2, available_tasks);
@@ -453,16 +479,16 @@ test "init preallocates the single-thread backend" {
 }
 
 test "init eagerly starts configured workers" {
-    var k: Kqueue = undefined;
-    try k.init(std.heap.c_allocator, .{
+    var loop: EventLoop = undefined;
+    try loop.init(std.heap.c_allocator, .{
         .n_threads = 2,
         .max_concurrent_tasks = 2,
         .max_wait_registrations_per_thread = 3,
     });
 
-    const active_threads = k.threads.active;
-    const workers_spawned = k.workers_spawned;
-    k.deinit();
+    const active_threads = loop.threads.active;
+    const workers_spawned = loop.workers_spawned;
+    loop.deinit();
 
     try std.testing.expectEqual(2, active_threads);
     try std.testing.expectEqual(1, workers_spawned);
@@ -475,16 +501,18 @@ test "exit notification cannot be replaced by an ordinary wake" {
 
     signalThreadExit(&thread);
     wakeThread(&thread);
-    var events: [2]posix.Kevent = undefined;
-    const timeout: posix.timespec = .{ .sec = 0, .nsec = 0 };
-    const event_count = try kevent(thread.kq_fd, &.{}, &events, &timeout);
+    var events: [Poll.wait_buffer_len]Poll.Event = undefined;
+    const event_count = try thread.poll.wait(&events, 0);
 
     var saw_exit = false;
     var saw_wakeup = false;
     for (events[0..event_count]) |event| {
-        const user_data: Completion.UserData = @enumFromInt(event.udata);
-        saw_exit = saw_exit or user_data == .exit;
-        saw_wakeup = saw_wakeup or user_data == .wakeup;
+        const message = switch (event) {
+            .signal => |signal| signal,
+            .ready => continue,
+        };
+        saw_exit = saw_exit or message == .exit;
+        saw_wakeup = saw_wakeup or message == .wakeup;
     }
     try std.testing.expectEqual(2, event_count);
     try std.testing.expect(saw_exit);
@@ -504,19 +532,19 @@ test "allocator byte bound covers eager backend storage" {
         .max_wait_registrations_per_thread = 17,
     };
 
-    const k = try allocator.create(Kqueue);
-    try k.init(allocator, options);
+    const loop = try allocator.create(EventLoop);
+    try loop.init(allocator, options);
     const actual_bytes = gpa.total_requested_bytes;
     const bounded_bytes = try allocatorBytesMax(options);
-    k.deinit();
-    allocator.destroy(k);
+    loop.deinit();
+    allocator.destroy(loop);
 
     try std.testing.expect(actual_bytes <= bounded_bytes);
     try std.testing.expectEqual(0, gpa.total_requested_bytes);
 }
 
 const AttachTestContext = struct {
-    k: *Kqueue,
+    loop: *EventLoop,
     attached: std.atomic.Value(bool) = .init(false),
     finished: std.atomic.Value(bool) = .init(false),
     release: std.atomic.Value(bool) = .init(false),
@@ -524,12 +552,12 @@ const AttachTestContext = struct {
 
     fn run(context: *AttachTestContext) void {
         defer context.finished.store(true, .release);
-        context.k.attachCurrentThread() catch |err| {
+        context.loop.attachCurrentThread() catch |err| {
             context.failure = err;
             return;
         };
-        defer context.k.detachCurrentThread();
-        context.k.checkCancel() catch |err| {
+        defer context.loop.detachCurrentThread();
+        context.loop.checkCancel() catch |err| {
             context.failure = err;
             return;
         };
@@ -539,14 +567,14 @@ const AttachTestContext = struct {
 };
 
 test "main fiber ownership transfers without allocation" {
-    var k: Kqueue = undefined;
-    try k.init(std.testing.allocator, .{
+    var loop: EventLoop = undefined;
+    try loop.init(std.testing.allocator, .{
         .n_threads = 1,
         .max_concurrent_tasks = 1,
         .max_wait_registrations_per_thread = 1,
     });
 
-    var context = AttachTestContext{ .k = &k };
+    var context = AttachTestContext{ .loop = &loop };
     const thread = try std.Thread.spawn(.{}, AttachTestContext.run, .{&context});
     while (!context.attached.load(.acquire) and
         !context.finished.load(.acquire))
@@ -557,30 +585,30 @@ test "main fiber ownership transfers without allocation" {
         thread.join();
         return context.failure orelse error.TestUnexpectedResult;
     }
-    try std.testing.expectError(error.ThreadAlreadyAttached, k.attachCurrentThread());
+    try std.testing.expectError(error.ThreadAlreadyAttached, loop.attachCurrentThread());
     context.release.store(true, .release);
     thread.join();
 
     try std.testing.expectEqual(@as(?anyerror, null), context.failure);
-    try k.attachCurrentThread();
-    try std.testing.expectError(error.ThreadAlreadyAttached, k.attachCurrentThread());
-    k.detachCurrentThread();
-    k.deinit();
+    try loop.attachCurrentThread();
+    try std.testing.expectError(error.ThreadAlreadyAttached, loop.attachCurrentThread());
+    loop.detachCurrentThread();
+    loop.deinit();
 }
 
-fn initializeThreads(k: *Kqueue, wait_queue_capacity: usize) !void {
-    for (k.threads.allocated) |*thread| {
-        try thread.init(k.gpa, wait_queue_capacity);
-        k.threads.active += 1;
+fn initializeThreads(loop: *EventLoop, wait_queue_capacity: usize) !void {
+    for (loop.threads.allocated) |*thread| {
+        try thread.init(loop.gpa, wait_queue_capacity);
+        loop.threads.active += 1;
     }
 }
 
 fn initializeMainFiber(
-    k: *Kqueue,
+    loop: *EventLoop,
     allocated_slice: []align(@alignOf(Thread)) u8,
     idle_stack_end_offset: usize,
 ) void {
-    const main_fiber = k.mainFiber();
+    const main_fiber = loop.mainFiber();
     main_fiber.* = .{
         .required_align = {},
         .context = undefined,
@@ -590,11 +618,11 @@ fn initializeMainFiber(
         .cancel_thread = null,
         .awaiting_completions = .empty,
     };
-    const main_thread = &k.threads.allocated[0];
+    const main_thread = &loop.threads.allocated[0];
     const idle_stack_end: [*]align(16) usize = @ptrCast(@alignCast(
         allocated_slice[idle_stack_end_offset..].ptr,
     ));
-    (idle_stack_end - 1)[0..1].* = .{@intFromPtr(k)};
+    (idle_stack_end - 1)[0..1].* = .{@intFromPtr(loop)};
     main_thread.idle_context = switch (builtin.cpu.arch) {
         .aarch64 => .{
             .sp = @intFromPtr(idle_stack_end),
@@ -615,134 +643,117 @@ fn initializeMainFiber(
     std.log.debug("created main {*}", .{main_fiber});
 }
 
-fn spawnWorkerThreads(k: *Kqueue) std.Thread.SpawnError!void {
-    for (k.threads.allocated[1..], 1..) |*thread, index| {
+fn spawnWorkerThreads(loop: *EventLoop) std.Thread.SpawnError!void {
+    for (loop.threads.allocated[1..], 1..) |*thread, index| {
         thread.thread = try std.Thread.spawn(.{
             .stack_size = idle_stack_size,
-            .allocator = k.gpa,
-        }, threadEntry, .{ k, @as(u32, @intCast(index)) });
-        k.workers_spawned += 1;
+            .allocator = loop.gpa,
+        }, threadEntry, .{ loop, @as(u32, @intCast(index)) });
+        loop.workers_spawned += 1;
     }
 }
 
-fn cleanupInitializedThreads(k: *Kqueue) void {
-    const initialized = k.threads.active;
+fn cleanupInitializedThreads(loop: *EventLoop) void {
+    const initialized = loop.threads.active;
     if (initialized == 0) return;
 
-    const spawned_end = k.workers_spawned + 1;
-    for (k.threads.allocated[1..spawned_end]) |*thread| signalThreadExit(thread);
-    for (k.threads.allocated[1..spawned_end]) |*thread| thread.thread.join();
+    const spawned_end = loop.workers_spawned + 1;
+    for (loop.threads.allocated[1..spawned_end]) |*thread| signalThreadExit(thread);
+    for (loop.threads.allocated[1..spawned_end]) |*thread| thread.thread.join();
 
-    for (k.threads.allocated[0..initialized]) |*thread| thread.deinit(k.gpa);
-    k.threads.active = 0;
-    k.workers_spawned = 0;
+    for (loop.threads.allocated[0..initialized]) |*thread| thread.deinit(loop.gpa);
+    loop.threads.active = 0;
+    loop.workers_spawned = 0;
 }
 
 pub const AttachError = error{ThreadAlreadyAttached};
 
 /// Acquires exclusive ownership of the main fiber for the calling thread.
 /// Attachment is not reentrant; detach before any later attachment.
-pub fn attachCurrentThread(k: *Kqueue) AttachError!void {
+pub fn attachCurrentThread(loop: *EventLoop) AttachError!void {
     const current_id = std.Thread.getCurrentId();
     assert(current_id != 0);
-    if (k.main_owner.cmpxchgStrong(0, current_id, .acq_rel, .acquire) != null)
+    if (loop.main_owner.cmpxchgStrong(0, current_id, .acq_rel, .acquire) != null)
         return error.ThreadAlreadyAttached;
 
-    const main_thread = &k.threads.allocated[0];
-    const main_fiber = k.mainFiber();
+    const main_thread = &loop.threads.allocated[0];
+    const main_fiber = loop.mainFiber();
     assert(main_thread.current_context == &main_fiber.context);
     main_thread.current_context = &main_fiber.context;
     Thread.self = main_thread;
 }
 
 /// Releases main-fiber ownership after synchronous I/O has returned.
-pub fn detachCurrentThread(k: *Kqueue) void {
+pub fn detachCurrentThread(loop: *EventLoop) void {
     const current_id = std.Thread.getCurrentId();
-    const main_thread = &k.threads.allocated[0];
-    const main_fiber = k.mainFiber();
-    assert(k.main_owner.load(.acquire) == current_id);
+    const main_thread = &loop.threads.allocated[0];
+    const main_fiber = loop.mainFiber();
+    assert(loop.main_owner.load(.acquire) == current_id);
     assert(Thread.self == main_thread);
     assert(main_thread.current_context == &main_fiber.context);
 
     Thread.self = undefined;
-    const owner = k.main_owner.cmpxchgStrong(current_id, 0, .release, .acquire);
+    const owner = loop.main_owner.cmpxchgStrong(current_id, 0, .release, .acquire);
     assert(owner == null);
 }
 
 /// Cancels and wakes the main fiber if it is parked on `fd`.
 /// Cancellation is published first so a concurrent wait publication cannot
 /// miss the interrupt.
-pub fn interruptMainWait(k: *Kqueue, fd: posix.fd_t) void {
+pub fn interruptMainWait(loop: *EventLoop, fd: posix.fd_t) void {
     assert(fd >= 0);
     const previous = @atomicRmw(
         ?*Thread,
-        &k.mainFiber().cancel_thread,
+        &loop.mainFiber().cancel_thread,
         .Xchg,
         Thread.canceling,
         .acq_rel,
     );
     if (previous != null and previous != Thread.canceling) {
-        @panic("Kqueue main fiber interrupted inside a cancel region");
+        @panic("EventLoop main fiber interrupted inside a cancel region");
     }
-    k.wakeFd(fd);
+    loop.wakeFd(fd);
 }
 
 /// Clears the stop-time cancellation after the main wait has returned.
-pub fn clearMainCancellation(k: *Kqueue) void {
+pub fn clearMainCancellation(loop: *EventLoop) void {
     const previous = @atomicRmw(
         ?*Thread,
-        &k.mainFiber().cancel_thread,
+        &loop.mainFiber().cancel_thread,
         .Xchg,
         null,
         .acq_rel,
     );
     if (previous != null and previous != Thread.canceling) {
-        @panic("Kqueue main fiber left a cancel region active");
+        @panic("EventLoop main fiber left a cancel region active");
     }
 }
 
-pub fn deinit(k: *Kqueue) void {
-    k.attachCurrentThread() catch @panic("Kqueue main fiber is already attached");
-    const active_threads = @atomicLoad(u32, &k.threads.active, .acquire);
-    for (k.threads.allocated[0..active_threads]) |*thread| {
+pub fn deinit(loop: *EventLoop) void {
+    loop.attachCurrentThread() catch @panic("EventLoop main fiber is already attached");
+    const active_threads = @atomicLoad(u32, &loop.threads.active, .acquire);
+    for (loop.threads.allocated[0..active_threads]) |*thread| {
         const ready_fiber = @atomicLoad(?*Fiber, &thread.ready_queue, .monotonic);
         if (ready_fiber != null and ready_fiber != Fiber.finished) {
-            @panic("Kqueue deinitialized with ready fibers");
+            @panic("EventLoop deinitialized with ready fibers");
         }
     }
-    k.yield(null, .exit);
-    const gpa = k.gpa;
+    loop.yield(null, .exit);
+    const gpa = loop.gpa;
     const allocated_ptr: [*]align(@alignOf(Thread)) u8 = @ptrCast(@alignCast(
-        k.threads.allocated.ptr,
+        loop.threads.allocated.ptr,
     ));
     const idle_stack_end_offset = std.mem.alignForward(
         usize,
-        k.threads.allocated.len * @sizeOf(Thread) + idle_stack_size,
+        loop.threads.allocated.len * @sizeOf(Thread) + idle_stack_size,
         std.heap.page_size_max,
     );
-    for (k.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
-    for (k.threads.allocated[0..active_threads]) |*thread| thread.deinit(gpa);
-    k.fiber_pool.deinit(gpa);
-    k.detachCurrentThread();
+    for (loop.threads.allocated[1..active_threads]) |*thread| thread.thread.join();
+    for (loop.threads.allocated[0..active_threads]) |*thread| thread.deinit(gpa);
+    loop.fiber_pool.deinit(gpa);
+    loop.detachCurrentThread();
     gpa.free(allocated_ptr[0..idle_stack_end_offset]);
-    k.* = undefined;
-}
-
-pub const CreateFileDescriptorError = error{
-    /// The per-process limit on the number of open file descriptors has been reached.
-    ProcessFdQuotaExceeded,
-    /// The system-wide limit on the total number of open files has been reached.
-    SystemFdQuotaExceeded,
-} || Io.UnexpectedError;
-
-pub fn createFileDescriptor() CreateFileDescriptorError!posix.fd_t {
-    const rc = posix.system.kqueue();
-    switch (posix.errno(rc)) {
-        .SUCCESS => return @intCast(rc),
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        else => |err| return posix.unexpectedErrno(err),
-    }
+    loop.* = undefined;
 }
 
 fn lockThread(thread: *Thread) void {
@@ -755,8 +766,8 @@ fn lockMutex(mutex: *std.atomic.Mutex) void {
     }
 }
 
-fn mainFiber(k: *Kqueue) *Fiber {
-    return @ptrCast(&k.main_fiber_buffer);
+fn mainFiber(loop: *EventLoop) *Fiber {
+    return @ptrCast(&loop.main_fiber_buffer);
 }
 
 fn queueContainsFiber(head: *Fiber, target: *Fiber) bool {
@@ -767,20 +778,20 @@ fn queueContainsFiber(head: *Fiber, target: *Fiber) bool {
     }
 }
 
-fn findReadyFiber(k: *Kqueue, thread: *Thread) ?*Fiber {
+fn findReadyFiber(loop: *EventLoop, thread: *Thread) ?*Fiber {
     if (@atomicRmw(?*Fiber, &thread.ready_queue, .Xchg, Fiber.finished, .acquire)) |ready_fiber| {
-        assert(thread == &k.threads.allocated[0] or
-            !queueContainsFiber(ready_fiber, k.mainFiber()));
+        assert(thread == &loop.threads.allocated[0] or
+            !queueContainsFiber(ready_fiber, loop.mainFiber()));
         @atomicStore(?*Fiber, &thread.ready_queue, ready_fiber.queue_next, .release);
         ready_fiber.queue_next = null;
         return ready_fiber;
     }
-    const active_threads = @atomicLoad(u32, &k.threads.active, .acquire);
+    const active_threads = @atomicLoad(u32, &loop.threads.active, .acquire);
     for (0..@min(max_steal_ready_search, active_threads)) |_| {
         defer thread.steal_ready_search_index += 1;
         if (thread.steal_ready_search_index == active_threads) thread.steal_ready_search_index = 0;
         const steal_ready_search_thread =
-            &k.threads.allocated[0..active_threads][thread.steal_ready_search_index];
+            &loop.threads.allocated[0..active_threads][thread.steal_ready_search_index];
         if (steal_ready_search_thread == thread) continue;
         const ready_fiber = @atomicLoad(
             ?*Fiber,
@@ -788,7 +799,7 @@ fn findReadyFiber(k: *Kqueue, thread: *Thread) ?*Fiber {
             .acquire,
         ) orelse continue;
         if (ready_fiber == Fiber.finished) continue;
-        if (queueContainsFiber(ready_fiber, k.mainFiber())) continue;
+        if (queueContainsFiber(ready_fiber, loop.mainFiber())) continue;
         if (@cmpxchgWeak(
             ?*Fiber,
             &steal_ready_search_thread.ready_queue,
@@ -806,10 +817,14 @@ fn findReadyFiber(k: *Kqueue, thread: *Thread) ?*Fiber {
     return null;
 }
 
-fn yield(k: *Kqueue, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage.PendingTask) void {
+fn yield(
+    loop: *EventLoop,
+    maybe_ready_fiber: ?*Fiber,
+    pending_task: SwitchMessage.PendingTask,
+) void {
     const thread: *Thread = .current();
-    const local_ready = k.readyFiberForThread(thread, maybe_ready_fiber);
-    const ready_context = if (local_ready orelse k.findReadyFiber(thread)) |ready_fiber|
+    const local_ready = loop.readyFiberForThread(thread, maybe_ready_fiber);
+    const ready_context = if (local_ready orelse loop.findReadyFiber(thread)) |ready_fiber|
         &ready_fiber.context
     else
         &thread.idle_context;
@@ -824,24 +839,24 @@ fn yield(k: *Kqueue, maybe_ready_fiber: ?*Fiber, pending_task: SwitchMessage.Pen
         message.contexts.old,
         message.contexts.new,
     });
-    contextSwitch(&message).handle(k);
+    contextSwitch(&message).handle(loop);
 }
 
-fn readyFiberForThread(k: *Kqueue, thread: *Thread, maybe_fiber: ?*Fiber) ?*Fiber {
+fn readyFiberForThread(loop: *EventLoop, thread: *Thread, maybe_fiber: ?*Fiber) ?*Fiber {
     const fiber = maybe_fiber orelse return null;
-    if (fiber != k.mainFiber() or thread == &k.threads.allocated[0]) return fiber;
+    if (fiber != loop.mainFiber() or thread == &loop.threads.allocated[0]) return fiber;
 
     assert(fiber.queue_next == null);
-    scheduleReadyQueueOnThread(&k.threads.allocated[0], .{
+    scheduleReadyQueueOnThread(&loop.threads.allocated[0], .{
         .head = fiber,
         .tail = fiber,
     });
     return null;
 }
 
-fn schedule(k: *Kqueue, thread: *Thread, unpinned_queue: Fiber.Queue) void {
+fn schedule(loop: *EventLoop, thread: *Thread, unpinned_queue: Fiber.Queue) void {
     var ready_queue = unpinned_queue;
-    if (!k.pinMainFiber(&ready_queue)) return;
+    if (!loop.pinMainFiber(&ready_queue)) return;
     {
         var fiber = ready_queue.head;
         while (true) {
@@ -850,12 +865,12 @@ fn schedule(k: *Kqueue, thread: *Thread, unpinned_queue: Fiber.Queue) void {
         }
         assert(fiber == ready_queue.tail);
     }
-    const active_threads = @atomicLoad(u32, &k.threads.active, .acquire);
+    const active_threads = @atomicLoad(u32, &loop.threads.active, .acquire);
     for (0..@min(max_idle_search, active_threads)) |_| {
         defer thread.idle_search_index += 1;
         if (thread.idle_search_index == active_threads) thread.idle_search_index = 0;
         const idle_search_thread =
-            &k.threads.allocated[0..active_threads][thread.idle_search_index];
+            &loop.threads.allocated[0..active_threads][thread.idle_search_index];
         if (idle_search_thread == thread) continue;
         if (@cmpxchgWeak(
             ?*Fiber,
@@ -879,8 +894,8 @@ fn schedule(k: *Kqueue, thread: *Thread, unpinned_queue: Fiber.Queue) void {
     )) |old_head| ready_queue.tail.queue_next = old_head;
 }
 
-fn pinMainFiber(k: *Kqueue, ready_queue: *Fiber.Queue) bool {
-    const main_fiber = k.mainFiber();
+fn pinMainFiber(loop: *EventLoop, ready_queue: *Fiber.Queue) bool {
+    const main_fiber = loop.mainFiber();
     var previous: ?*Fiber = null;
     var fiber = ready_queue.head;
     while (true) {
@@ -893,7 +908,7 @@ fn pinMainFiber(k: *Kqueue, ready_queue: *Fiber.Queue) bool {
                 ready_queue.head = next_fiber;
             }
             fiber.queue_next = null;
-            scheduleReadyQueueOnThread(&k.threads.allocated[0], .{
+            scheduleReadyQueueOnThread(&loop.threads.allocated[0], .{
                 .head = fiber,
                 .tail = fiber,
             });
@@ -905,80 +920,62 @@ fn pinMainFiber(k: *Kqueue, ready_queue: *Fiber.Queue) bool {
 }
 
 fn mainIdle(
-    k: *Kqueue,
+    loop: *EventLoop,
     message: *const SwitchMessage,
 ) callconv(.withStackAlign(.c, @max(
     @alignOf(Thread),
     @alignOf(Io.fiber.Context),
 ))) noreturn {
-    message.handle(k);
-    k.idle(&k.threads.allocated[0]);
-    k.yield(@ptrCast(&k.main_fiber_buffer), .nothing);
+    message.handle(loop);
+    loop.idle(&loop.threads.allocated[0]);
+    loop.yield(@ptrCast(&loop.main_fiber_buffer), .nothing);
     unreachable; // switched to dead fiber
 }
 
-fn threadEntry(k: *Kqueue, index: u32) void {
-    const thread: *Thread = &k.threads.allocated[index];
+fn threadEntry(loop: *EventLoop, index: u32) void {
+    const thread: *Thread = &loop.threads.allocated[index];
     Thread.self = thread;
     std.log.debug("created thread idle {*}", .{&thread.idle_context});
-    k.idle(thread);
+    loop.idle(thread);
 }
 
-const Completion = struct {
-    const UserData = enum(usize) {
-        unused,
-        wakeup,
-        cleanup,
-        exit,
-        /// *Fiber
-        _,
-    };
-    /// Corresponds to Kevent field.
-    flags: u16,
-    /// Corresponds to Kevent field.
-    fflags: u32,
-    /// Corresponds to Kevent field.
-    data: isize,
-};
-
-fn idle(k: *Kqueue, thread: *Thread) void {
-    var events_buffer: [changes_buffer_len]posix.Kevent = undefined;
+fn idle(loop: *EventLoop, thread: *Thread) void {
+    var events_buffer: [Poll.wait_buffer_len]Poll.Event = undefined;
     var maybe_ready_fiber: ?*Fiber = null;
     while (true) {
-        while (maybe_ready_fiber orelse k.findReadyFiber(thread)) |ready_fiber| {
-            k.yield(ready_fiber, .nothing);
+        while (maybe_ready_fiber orelse loop.findReadyFiber(thread)) |ready_fiber| {
+            loop.yield(ready_fiber, .nothing);
             maybe_ready_fiber = null;
         }
-        const n = kevent(thread.kq_fd, &.{}, &events_buffer, null) catch |err| {
+        const n = thread.poll.wait(&events_buffer, null) catch |err| {
             // TODO handle EINTR for cancellation purposes
             @panic(@errorName(err)); // TODO
         };
         var maybe_ready_queue: ?Fiber.Queue = null;
-        for (events_buffer[0..n]) |event| switch (@as(
-            Completion.UserData,
-            @enumFromInt(event.udata),
-        )) {
-            .unused => unreachable, // bad submission queued?
-            .wakeup => {},
-            .cleanup => @panic("failed to notify other threads that we are exiting"),
-            .exit => {
-                assert(maybe_ready_fiber == null and maybe_ready_queue == null); // pending async
-                return;
+        for (events_buffer[0..n]) |event| switch (event) {
+            .signal => |message| switch (message) {
+                .wakeup => {},
+                .cleanup => @panic("failed to notify other threads that we are exiting"),
+                .exit => {
+                    // Pending async work must have drained before exit.
+                    assert(maybe_ready_fiber == null and maybe_ready_queue == null);
+                    return;
+                },
             },
-            _ => processFdEvent(
+            .ready => |ready| processFdEvent(
                 thread,
-                event,
+                ready,
                 &maybe_ready_fiber,
                 &maybe_ready_queue,
             ),
         };
-        if (maybe_ready_queue) |ready_queue| k.schedule(thread, ready_queue);
+        if (maybe_ready_queue) |ready_queue| loop.schedule(thread, ready_queue);
     }
 }
 
 fn processFdEvent(
     thread: *Thread,
-    event: posix.Kevent,
+    event: Poll.Event.Ready,
     maybe_ready_fiber: *?*Fiber,
     maybe_ready_queue: *?Fiber.Queue,
 ) void {
@@ -987,15 +984,11 @@ fn processFdEvent(
     const event_tail = wait_queue.tail;
     assert(event_tail.queue_next == null);
 
-    event_head.resultPointer(Completion).* = .{
-        .flags = event.flags,
-        .fflags = event.fflags,
-        .data = event.data,
-    };
+    event_head.resultPointer(Completion).* = event.completion;
     queueReadyEvent(maybe_ready_fiber, maybe_ready_queue, event_head, event_tail);
 }
 
-fn drainWaitQueue(thread: *Thread, event: posix.Kevent) ?Fiber.Queue {
+fn drainWaitQueue(thread: *Thread, event: Poll.Event.Ready) ?Fiber.Queue {
     lockThread(thread);
     defer thread.mutex.unlock();
 
@@ -1039,7 +1032,7 @@ const WaitPublicationResult = enum {
 
 const WaitPublication = struct {
     fd: posix.fd_t,
-    filter: i16,
+    filter: Poll.Filter,
     result: *WaitPublicationResult,
 };
 
@@ -1049,15 +1042,15 @@ const GroupCompletion = struct {
 };
 
 fn waitForFd(
-    k: *Kqueue,
+    loop: *EventLoop,
     fd: posix.fd_t,
-    filter: i16,
+    filter: Poll.Filter,
 ) error{ Canceled, SystemResources }!void {
-    try k.checkCancel();
+    try loop.checkCancel();
 
     assert(fd >= 0);
     var result: WaitPublicationResult = .pending;
-    k.yield(null, .{ .publish_wait = .{
+    loop.yield(null, .{ .publish_wait = .{
         .fd = fd,
         .filter = filter,
         .result = &result,
@@ -1065,14 +1058,14 @@ fn waitForFd(
 
     switch (result) {
         .pending => unreachable,
-        .waiting => try k.checkCancel(),
+        .waiting => try loop.checkCancel(),
         .canceled => return error.Canceled,
         .system_resources => return error.SystemResources,
     }
 }
 
 fn publishWait(
-    k: *Kqueue,
+    loop: *EventLoop,
     thread: *Thread,
     fiber: *Fiber,
     publication: WaitPublication,
@@ -1110,12 +1103,12 @@ fn publishWait(
     thread.mutex.unlock();
 
     if (schedule_immediately) {
-        k.schedule(thread, .{ .head = fiber, .tail = fiber });
+        loop.schedule(thread, .{ .head = fiber, .tail = fiber });
     }
 }
 
 fn appendWaiter(wait_queue: *Thread.WaitQueue, fiber: *Fiber) void {
-    // An empty entry marks an existing persistent kqueue registration.
+    // An empty entry marks an existing persistent poller registration.
     if (wait_queue.tail) |tail| {
         tail.queue_next = fiber;
         wait_queue.tail = fiber;
@@ -1125,23 +1118,13 @@ fn appendWaiter(wait_queue: *Thread.WaitQueue, fiber: *Fiber) void {
     }
 }
 
-fn registerFd(thread: *Thread, ident: usize, filter: i16, fiber: *Fiber) void {
-    const changes = [_]posix.Kevent{.{
-        .ident = ident,
-        .filter = filter,
-        .flags = std.c.EV.ADD | std.c.EV.CLEAR,
-        .fflags = 0,
-        .data = 0,
-        .udata = @intFromPtr(fiber),
-    }};
-    assert(0 == (kevent(thread.kq_fd, &changes, &.{}, null) catch |err| {
-        @panic(@errorName(err));
-    }));
+fn registerFd(thread: *Thread, ident: usize, filter: Poll.Filter, fiber: *Fiber) void {
+    thread.poll.register(ident, filter, @intFromPtr(fiber));
 }
 
-fn removeWaitingFiber(k: *Kqueue, fiber: *Fiber) bool {
-    const active_threads = @atomicLoad(u32, &k.threads.active, .acquire);
-    for (k.threads.allocated[0..active_threads]) |*thread| {
+fn removeWaitingFiber(loop: *EventLoop, fiber: *Fiber) bool {
+    const active_threads = @atomicLoad(u32, &loop.threads.active, .acquire);
+    for (loop.threads.allocated[0..active_threads]) |*thread| {
         lockThread(thread);
 
         var index: usize = 0;
@@ -1149,7 +1132,7 @@ fn removeWaitingFiber(k: *Kqueue, fiber: *Fiber) bool {
             switch (waitQueueRemoveFiber(&thread.wait_queues.values()[index], fiber)) {
                 .not_found => {},
                 // Persistent edge-triggered registration: leave the entry
-                // in place even if its queue is now empty. The kqueue
+                // in place even if its queue is now empty. The poller
                 // registration outlives any individual waiter; we only
                 // tear it down on FD close (see `wakeFd`).
                 .removed, .emptied => {
@@ -1166,12 +1149,12 @@ fn removeWaitingFiber(k: *Kqueue, fiber: *Fiber) bool {
     return false;
 }
 
-fn wakeFd(k: *Kqueue, fd: posix.fd_t) void {
+fn wakeFd(loop: *EventLoop, fd: posix.fd_t) void {
     assert(fd >= 0);
 
     const ident: usize = @intCast(fd);
-    const active_threads = @atomicLoad(u32, &k.threads.active, .acquire);
-    for (k.threads.allocated[0..active_threads]) |*thread| {
+    const active_threads = @atomicLoad(u32, &loop.threads.active, .acquire);
+    for (loop.threads.allocated[0..active_threads]) |*thread| {
         lockThread(thread);
 
         var index: usize = 0;
@@ -1229,18 +1212,8 @@ fn signalThreadExit(thread: *Thread) void {
     signalThread(thread, .exit);
 }
 
-fn signalThread(thread: *Thread, user_data: Completion.UserData) void {
-    const changes = [_]posix.Kevent{.{
-        .ident = @intFromEnum(user_data),
-        .filter = std.c.EVFILT.USER,
-        .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
-        .fflags = std.c.NOTE.TRIGGER,
-        .data = 0,
-        .udata = @intFromEnum(user_data),
-    }};
-    _ = kevent(thread.kq_fd, &changes, &.{}, null) catch |err| {
-        @panic(@errorName(err));
-    };
+fn signalThread(thread: *Thread, message: Signal) void {
+    thread.poll.signal(message);
 }
 
 const WaitQueueRemove = enum {
@@ -1287,7 +1260,7 @@ const SwitchMessage = struct {
         exit,
     };
 
-    fn handle(message: *const SwitchMessage, k: *Kqueue) void {
+    fn handle(message: *const SwitchMessage, loop: *EventLoop) void {
         const thread: *Thread = .current();
         thread.current_context = message.contexts.new;
         switch (message.pending_task) {
@@ -1298,10 +1271,10 @@ const SwitchMessage = struct {
                     message.contexts.old,
                 ));
                 assert(prev_fiber.queue_next == null);
-                k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
+                loop.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
             },
             .complete_group => |completion| {
-                completeGroupFiber(k, completion);
+                completeGroupFiber(loop, completion);
             },
             .register_awaiter => |awaiter| {
                 const prev_fiber: *Fiber = @alignCast(@fieldParentPtr(
@@ -1310,18 +1283,18 @@ const SwitchMessage = struct {
                 ));
                 assert(prev_fiber.queue_next == null);
                 if (@atomicRmw(?*Fiber, awaiter, .Xchg, prev_fiber, .acq_rel) == Fiber.finished)
-                    k.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
+                    loop.schedule(thread, .{ .head = prev_fiber, .tail = prev_fiber });
             },
             .publish_wait => |publication| {
                 const prev_fiber: *Fiber = @alignCast(@fieldParentPtr(
                     "context",
                     message.contexts.old,
                 ));
-                publishWait(k, thread, prev_fiber, publication);
+                publishWait(loop, thread, prev_fiber, publication);
             },
             .exit => {
-                const active_threads = @atomicLoad(u32, &k.threads.active, .acquire);
-                for (k.threads.allocated[0..active_threads]) |*each_thread| {
+                const active_threads = @atomicLoad(u32, &loop.threads.active, .acquire);
+                for (loop.threads.allocated[0..active_threads]) |*each_thread| {
                     signalThreadExit(each_thread);
                 }
             },
@@ -1370,7 +1343,7 @@ fn fiberEntry() callconv(.naked) void {
 }
 
 const AsyncClosure = struct {
-    kqueue: *Kqueue,
+    kqueue: *EventLoop,
     fiber: *Fiber,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     result_align: Alignment,
@@ -1408,7 +1381,7 @@ const AsyncClosure = struct {
 };
 
 const GroupAsyncClosure = struct {
-    kqueue: *Kqueue,
+    kqueue: *EventLoop,
     fiber: *Fiber,
     group: *Io.Group,
     start: *const fn (context: *const anyopaque) void,
@@ -1458,7 +1431,7 @@ fn groupFiberEntry() callconv(.naked) void {
     }
 }
 
-fn completeGroupFiber(k: *Kqueue, completion: GroupCompletion) void {
+fn completeGroupFiber(loop: *EventLoop, completion: GroupCompletion) void {
     const fiber = completion.fiber;
     const group = completion.group;
     lockGroup(group);
@@ -1475,7 +1448,7 @@ fn completeGroupFiber(k: *Kqueue, completion: GroupCompletion) void {
             @atomicStore(?*anyopaque, &group.token.raw, next, .release);
         }
         fiber.group_next = null;
-        k.recycle(fiber);
+        loop.recycle(fiber);
         if (next == null) {
             @atomicStore(?*anyopaque, &group.token.raw, null, .release);
         }
@@ -1485,13 +1458,13 @@ fn completeGroupFiber(k: *Kqueue, completion: GroupCompletion) void {
         if (candidate.group_next == fiber) {
             candidate.group_next = fiber.group_next;
             fiber.group_next = null;
-            k.recycle(fiber);
+            loop.recycle(fiber);
             return;
         }
         previous = candidate.group_next;
     }
 
-    @panic("Kqueue group lost a live fiber");
+    @panic("EventLoop group lost a live fiber");
 }
 
 const GroupState = extern struct {
@@ -1517,7 +1490,7 @@ fn unlockGroup(group: *Io.Group) void {
     groupState(group).mutex.unlock();
 }
 
-// This Kqueue backend is a local fork of `std.Io.Kqueue` from zig 0.16.0,
+// This EventLoop backend is a local fork of `std.Io.EventLoop` from zig 0.16.0,
 // patched so the HTTP/2 server can run on an evented (kqueue) reactor
 // instead of one OS thread per accepted connection.
 //
@@ -1539,9 +1512,9 @@ fn unlockGroup(group: *Io.Group) void {
 // Until then, port missing primitives from
 // https://github.com/mitchellh/libxev/blob/main/src/backend/kqueue.zig
 // while preserving the `std.Io.VTable` interface.
-pub fn io(k: *Kqueue) Io {
+pub fn io(loop: *EventLoop) Io {
     return .{
-        .userdata = k,
+        .userdata = loop,
         .vtable = &vtable,
     };
 }
@@ -1605,13 +1578,13 @@ fn concurrent(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque, result: *anyopaque) void,
 ) Io.ConcurrentError!*Io.AnyFuture {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     assert(result_alignment.compare(.lte, Fiber.max_result_align)); // TODO
     assert(context_alignment.compare(.lte, Fiber.max_context_align)); // TODO
     assert(result_len <= Fiber.max_result_size); // TODO
     assert(context.len <= Fiber.max_context_size); // TODO
 
-    const fiber = try Fiber.allocate(k);
+    const fiber = try Fiber.allocate(loop);
     std.log.debug("allocated {*}", .{fiber});
 
     const closure: *AsyncClosure = .fromFiber(fiber);
@@ -1637,7 +1610,7 @@ fn concurrent(
         .awaiting_completions = .empty,
     };
     closure.* = .{
-        .kqueue = k,
+        .kqueue = loop,
         .fiber = fiber,
         .start = start,
         .result_align = result_alignment,
@@ -1645,7 +1618,7 @@ fn concurrent(
     };
     @memcpy(closure.contextPointer(), context);
 
-    k.schedule(.current(), .{ .head = fiber, .tail = fiber });
+    loop.schedule(.current(), .{ .head = fiber, .tail = fiber });
     return @ptrCast(fiber);
 }
 
@@ -1655,12 +1628,12 @@ fn await(
     result: []u8,
     result_alignment: std.mem.Alignment,
 ) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     const future_fiber: *Fiber = @ptrCast(@alignCast(any_future));
     if (@atomicLoad(?*Fiber, &future_fiber.awaiter, .acquire) != Fiber.finished)
-        k.yield(null, .{ .register_awaiter = &future_fiber.awaiter });
+        loop.yield(null, .{ .register_awaiter = &future_fiber.awaiter });
     @memcpy(result, future_fiber.resultBytes(result_alignment));
-    k.recycle(future_fiber);
+    loop.recycle(future_fiber);
 }
 
 fn cancel(
@@ -1669,7 +1642,7 @@ fn cancel(
     result: []u8,
     result_alignment: std.mem.Alignment,
 ) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     const future_fiber: *Fiber = @ptrCast(@alignCast(any_future));
     _ = @cmpxchgStrong(
         ?*Thread,
@@ -1680,14 +1653,14 @@ fn cancel(
         .acquire,
     );
     if (@atomicLoad(?*Fiber, &future_fiber.awaiter, .acquire) != Fiber.finished)
-        k.yield(null, .{ .register_awaiter = &future_fiber.awaiter });
+        loop.yield(null, .{ .register_awaiter = &future_fiber.awaiter });
     @memcpy(result, future_fiber.resultBytes(result_alignment));
-    k.recycle(future_fiber);
+    loop.recycle(future_fiber);
 }
 
 fn cancelRequested(userdata: ?*anyopaque) bool {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     const thread: *Thread = .current();
     if (thread.current_context == &thread.idle_context) return false;
     const fiber = thread.currentFiber();
@@ -1713,11 +1686,11 @@ fn groupConcurrent(
     context_alignment: Alignment,
     start: *const fn (context: *const anyopaque) void,
 ) Io.ConcurrentError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     assert(context_alignment.compare(.lte, Fiber.max_context_align));
     assert(context.len <= Fiber.max_context_size);
 
-    const fiber = try Fiber.allocate(k);
+    const fiber = try Fiber.allocate(loop);
 
     const closure: *GroupAsyncClosure = .fromFiber(fiber);
     fiber.* = .{
@@ -1742,7 +1715,7 @@ fn groupConcurrent(
         .awaiting_completions = .empty,
     };
     closure.* = .{
-        .kqueue = k,
+        .kqueue = loop,
         .fiber = fiber,
         .group = type_erased,
         .start = start,
@@ -1758,7 +1731,7 @@ fn groupConcurrent(
     @atomicStore(?*anyopaque, &type_erased.token.raw, fiber, .release);
     unlockGroup(type_erased);
 
-    k.schedule(.current(), .{ .head = fiber, .tail = fiber });
+    loop.schedule(.current(), .{ .head = fiber, .tail = fiber });
 }
 
 fn groupAwait(
@@ -1766,14 +1739,14 @@ fn groupAwait(
     type_erased: *Io.Group,
     initial_token: *anyopaque,
 ) Io.Cancelable!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     while (true) {
         while (@atomicLoad(?*anyopaque, &type_erased.token.raw, .acquire) != null) {
-            k.checkCancel() catch {
+            loop.checkCancel() catch {
                 groupCancel(userdata, type_erased, initial_token);
                 return error.Canceled;
             };
-            yield(k, null, .reschedule);
+            yield(loop, null, .reschedule);
         }
 
         lockGroup(type_erased);
@@ -1788,7 +1761,7 @@ fn groupAwait(
 }
 
 fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     _ = token;
 
     var ready_queue: ?Fiber.Queue = null;
@@ -1809,7 +1782,7 @@ fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void 
             .acq_rel,
             .acquire,
         );
-        if (k.removeWaitingFiber(f)) {
+        if (loop.removeWaitingFiber(f)) {
             if (ready_queue) |*queue| {
                 queue.tail.queue_next = f;
                 queue.tail = f;
@@ -1826,20 +1799,20 @@ fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void 
         const ready_fiber = queue.head;
         if (ready_fiber.queue_next) |next_ready_fiber| {
             ready_fiber.queue_next = null;
-            k.schedule(thread, .{
+            loop.schedule(thread, .{
                 .head = next_ready_fiber,
                 .tail = queue.tail,
             });
         }
-        k.yield(ready_fiber, .reschedule);
+        loop.yield(ready_fiber, .reschedule);
     }
-    finishGroupCancellation(k, group);
+    finishGroupCancellation(loop, group);
 }
 
-fn finishGroupCancellation(k: *Kqueue, group: *Io.Group) void {
+fn finishGroupCancellation(loop: *EventLoop, group: *Io.Group) void {
     while (true) {
         while (@atomicLoad(?*anyopaque, &group.token.raw, .acquire) != null) {
-            k.yield(null, .reschedule);
+            loop.yield(null, .reschedule);
         }
 
         lockGroup(group);
@@ -1860,17 +1833,17 @@ test "group list remains consistent during concurrent completion" {
     const tasks_per_round = 64;
     const rounds = 32;
 
-    var k: Kqueue = undefined;
-    try k.init(std.heap.c_allocator, .{
+    var loop: EventLoop = undefined;
+    try loop.init(std.heap.c_allocator, .{
         .n_threads = 4,
         .max_concurrent_tasks = tasks_per_round,
         .max_wait_registrations_per_thread = 1,
     });
-    defer k.deinit();
-    try k.attachCurrentThread();
-    defer k.detachCurrentThread();
+    defer loop.deinit();
+    try loop.attachCurrentThread();
+    defer loop.detachCurrentThread();
 
-    const evented_io = k.io();
+    const evented_io = loop.io();
     var completed: std.atomic.Value(usize) = .init(0);
     for (0..rounds) |round| {
         var group: Io.Group = .init;
@@ -1887,11 +1860,11 @@ test "group list remains consistent during concurrent completion" {
 }
 
 fn groupCancellationTask(
-    k: *Kqueue,
+    loop: *EventLoop,
     canceled: *std.atomic.Value(usize),
 ) Io.Cancelable!void {
     while (true) {
-        k.checkCancel() catch {
+        loop.checkCancel() catch {
             _ = canceled.fetchAdd(1, .seq_cst);
             return error.Canceled;
         };
@@ -1902,21 +1875,21 @@ fn groupCancellationTask(
 test "group cancellation remains consistent with concurrent completion" {
     const task_count = 32;
 
-    var k: Kqueue = undefined;
-    try k.init(std.heap.c_allocator, .{
+    var loop: EventLoop = undefined;
+    try loop.init(std.heap.c_allocator, .{
         .n_threads = 4,
         .max_concurrent_tasks = task_count,
         .max_wait_registrations_per_thread = 1,
     });
-    defer k.deinit();
-    try k.attachCurrentThread();
-    defer k.detachCurrentThread();
+    defer loop.deinit();
+    try loop.attachCurrentThread();
+    defer loop.detachCurrentThread();
 
-    const evented_io = k.io();
+    const evented_io = loop.io();
     var canceled: std.atomic.Value(usize) = .init(0);
     var group: Io.Group = .init;
     for (0..task_count) |_| {
-        try group.concurrent(evented_io, groupCancellationTask, .{ &k, &canceled });
+        try group.concurrent(evented_io, groupCancellationTask, .{ &loop, &canceled });
     }
     group.cancel(evented_io);
 
@@ -1925,7 +1898,7 @@ test "group cancellation remains consistent with concurrent completion" {
 }
 
 const SpawnDuringCancellationContext = struct {
-    k: *Kqueue,
+    loop: *EventLoop,
     io: Io,
     group: *Io.Group,
     started: *std.atomic.Value(bool),
@@ -1934,7 +1907,7 @@ const SpawnDuringCancellationContext = struct {
 };
 
 fn childAddedDuringCancellation(context: *SpawnDuringCancellationContext) Io.Cancelable!void {
-    context.k.checkCancel() catch {
+    context.loop.checkCancel() catch {
         context.child_canceled.store(true, .release);
         return error.Canceled;
     };
@@ -1944,7 +1917,7 @@ fn childAddedDuringCancellation(context: *SpawnDuringCancellationContext) Io.Can
 fn spawnAfterCancellationRequest(context: *SpawnDuringCancellationContext) Io.Cancelable!void {
     context.started.store(true, .release);
     while (true) {
-        context.k.checkCancel() catch break;
+        context.loop.checkCancel() catch break;
         std.Thread.yield() catch {};
     }
     context.group.concurrent(
@@ -1959,23 +1932,23 @@ fn spawnAfterCancellationRequest(context: *SpawnDuringCancellationContext) Io.Ca
 }
 
 test "concurrent group member inherits cancellation" {
-    var k: Kqueue = undefined;
-    try k.init(std.heap.c_allocator, .{
+    var loop: EventLoop = undefined;
+    try loop.init(std.heap.c_allocator, .{
         .n_threads = 2,
         .max_concurrent_tasks = 2,
         .max_wait_registrations_per_thread = 1,
     });
-    defer k.deinit();
-    try k.attachCurrentThread();
-    defer k.detachCurrentThread();
+    defer loop.deinit();
+    try loop.attachCurrentThread();
+    defer loop.detachCurrentThread();
 
-    const evented_io = k.io();
+    const evented_io = loop.io();
     var group: Io.Group = .init;
     var started: std.atomic.Value(bool) = .init(false);
     var child_canceled: std.atomic.Value(bool) = .init(false);
     var child_missed_cancel: std.atomic.Value(bool) = .init(false);
     var context: SpawnDuringCancellationContext = .{
-        .k = &k,
+        .loop = &loop,
         .io = evented_io,
         .group = &group,
         .started = &started,
@@ -2002,8 +1975,8 @@ fn dirCreateDir(
     sub_path: []const u8,
     permissions: Dir.Permissions,
 ) Dir.CreateDirError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dir;
     _ = sub_path;
     _ = permissions;
@@ -2016,8 +1989,8 @@ fn dirCreateDirPath(
     sub_path: []const u8,
     permissions: Dir.Permissions,
 ) Dir.CreateDirPathError!Dir.CreatePathStatus {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dir;
     _ = sub_path;
     _ = permissions;
@@ -2031,8 +2004,8 @@ fn dirCreateDirPathOpen(
     permissions: Dir.Permissions,
     options: Dir.OpenOptions,
 ) Dir.CreateDirPathOpenError!Dir {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dir;
     _ = sub_path;
     _ = permissions;
@@ -2041,8 +2014,8 @@ fn dirCreateDirPathOpen(
 }
 
 fn dirStat(userdata: ?*anyopaque, dir: Dir) Dir.StatError!Dir.Stat {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dir;
     @panic("TODO");
 }
@@ -2053,8 +2026,8 @@ fn dirStatFile(
     sub_path: []const u8,
     options: Dir.StatFileOptions,
 ) Dir.StatFileError!File.Stat {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dir;
     _ = sub_path;
     _ = options;
@@ -2066,8 +2039,8 @@ fn dirAccess(
     sub_path: []const u8,
     options: Dir.AccessOptions,
 ) Dir.AccessError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dir;
     _ = sub_path;
     _ = options;
@@ -2079,8 +2052,8 @@ fn dirCreateFile(
     sub_path: []const u8,
     flags: File.CreateFlags,
 ) File.OpenError!File {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dir;
     _ = sub_path;
     _ = flags;
@@ -2092,8 +2065,8 @@ fn dirOpenFile(
     sub_path: []const u8,
     flags: File.OpenFlags,
 ) File.OpenError!File {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dir;
     _ = sub_path;
     _ = flags;
@@ -2105,29 +2078,29 @@ fn dirOpenDir(
     sub_path: []const u8,
     options: Dir.OpenOptions,
 ) Dir.OpenError!Dir {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dir;
     _ = sub_path;
     _ = options;
     @panic("TODO");
 }
 fn dirClose(userdata: ?*anyopaque, dirs: []const Dir) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = dirs;
     @panic("TODO");
 }
 fn fileStat(userdata: ?*anyopaque, file: File) File.StatError!File.Stat {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = file;
     @panic("TODO");
 }
 
 fn fileClose(userdata: ?*anyopaque, files: []const File) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = files;
     @panic("TODO");
 }
@@ -2139,8 +2112,8 @@ fn fileWriteStreaming(
     data: []const []const u8,
     splat: usize,
 ) File.Writer.Error!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = file;
     _ = header;
     _ = data;
@@ -2156,8 +2129,8 @@ fn fileWritePositional(
     splat: usize,
     offset: u64,
 ) File.WritePositionalError!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = file;
     _ = header;
     _ = data;
@@ -2171,8 +2144,8 @@ fn fileReadStreaming(
     file: File,
     data: []const []u8,
 ) File.Reader.Error!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = file;
     _ = data;
     @panic("TODO");
@@ -2184,37 +2157,37 @@ fn fileReadPositional(
     data: []const []u8,
     offset: u64,
 ) File.ReadPositionalError!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = file;
     _ = data;
     _ = offset;
     @panic("TODO");
 }
 fn fileSeekBy(userdata: ?*anyopaque, file: File, relative_offset: i64) File.SeekError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = file;
     _ = relative_offset;
     @panic("TODO");
 }
 fn fileSeekTo(userdata: ?*anyopaque, file: File, absolute_offset: u64) File.SeekError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = file;
     _ = absolute_offset;
     @panic("TODO");
 }
 
 fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.Error!Io.Timestamp {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = clock;
     @panic("TODO");
 }
 fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.SleepError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = timeout;
     @panic("TODO");
 }
@@ -2224,27 +2197,27 @@ fn netListenIp(
     address: *const net.IpAddress,
     options: net.IpAddress.ListenOptions,
 ) net.IpAddress.ListenError!net.Socket {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     const family = Io.Threaded.posixAddressFamily(address);
-    const socket_fd = try openSocketPosix(k, family, .{
+    const socket_fd = try openSocketPosix(loop, family, .{
         .mode = options.mode,
         .protocol = options.protocol,
     });
     errdefer closeFd(socket_fd);
 
     if (options.reuse_address) {
-        try setSocketOption(k, socket_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
+        try setSocketOption(loop, socket_fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, 1);
         if (@hasDecl(posix.SO, "REUSEPORT")) {
-            setSocketOption(k, socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1) catch {};
+            setSocketOption(loop, socket_fd, posix.SOL.SOCKET, posix.SO.REUSEPORT, 1) catch {};
         }
     }
 
     var storage: Io.Threaded.PosixAddress = undefined;
     var addr_len = Io.Threaded.addressToPosix(address, &storage);
-    try posixBind(k, socket_fd, &storage.any, addr_len);
+    try posixBind(loop, socket_fd, &storage.any, addr_len);
 
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         switch (posix.errno(posix.system.listen(socket_fd, options.kernel_backlog))) {
             .SUCCESS => break,
             .INTR => continue,
@@ -2258,7 +2231,7 @@ fn netListenIp(
         }
     }
 
-    try posixGetSockName(k, socket_fd, &storage.any, &addr_len);
+    try posixGetSockName(loop, socket_fd, &storage.any, &addr_len);
     return .{
         .handle = socket_fd,
         .address = Io.Threaded.addressFromPosix(&storage),
@@ -2270,14 +2243,14 @@ fn netAccept(
     server: net.Socket.Handle,
     options: net.Server.AcceptOptions,
 ) net.Server.AcceptError!net.Socket {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     _ = options;
 
     var storage: Io.Threaded.PosixAddress = undefined;
     var addr_len: posix.socklen_t = @sizeOf(@TypeOf(storage));
 
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         const rc = posix.system.accept(server, &storage.any, &addr_len);
         switch (posix.errno(rc)) {
             .SUCCESS => {
@@ -2286,7 +2259,7 @@ fn netAccept(
 
                 if (Io.Threaded.socket_flags_unsupported) {
                     while (true) {
-                        try k.checkCancel();
+                        try loop.checkCancel();
                         switch (posix.errno(posix.system.fcntl(
                             new_fd,
                             posix.F.SETFD,
@@ -2299,7 +2272,7 @@ fn netAccept(
                         }
                     }
                 }
-                try setNonBlocking(k, new_fd);
+                try setNonBlocking(loop, new_fd);
 
                 return .{
                     .handle = new_fd,
@@ -2309,7 +2282,7 @@ fn netAccept(
             .INTR => continue,
             .CANCELED => return error.Canceled,
             .AGAIN => {
-                try k.waitForFd(server, std.c.EVFILT.READ);
+                try loop.waitForFd(server, .read);
                 addr_len = @sizeOf(@TypeOf(storage));
                 continue;
             },
@@ -2335,17 +2308,17 @@ fn netBindIp(
     address: *const net.IpAddress,
     options: net.IpAddress.BindOptions,
 ) net.IpAddress.BindError!net.Socket {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     const family = Io.Threaded.posixAddressFamily(address);
-    const socket_fd = try openSocketPosix(k, family, options);
+    const socket_fd = try openSocketPosix(loop, family, options);
     errdefer closeFd(socket_fd);
     var storage: Io.Threaded.PosixAddress = undefined;
     var addr_len = Io.Threaded.addressToPosix(address, &storage);
-    try posixBind(k, socket_fd, &storage.any, addr_len);
+    try posixBind(loop, socket_fd, &storage.any, addr_len);
     if (options.allow_broadcast) {
-        try setSocketOption(k, socket_fd, posix.SOL.SOCKET, posix.SO.BROADCAST, 1);
+        try setSocketOption(loop, socket_fd, posix.SOL.SOCKET, posix.SO.BROADCAST, 1);
     }
-    try posixGetSockName(k, socket_fd, &storage.any, &addr_len);
+    try posixGetSockName(loop, socket_fd, &storage.any, &addr_len);
     return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&storage) };
 }
 fn netConnectIp(
@@ -2354,28 +2327,28 @@ fn netConnectIp(
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
     if (options.timeout != .none) @panic("TODO");
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     const family = Io.Threaded.posixAddressFamily(address);
-    const socket_fd = try openSocketPosix(k, family, .{
+    const socket_fd = try openSocketPosix(loop, family, .{
         .mode = options.mode,
         .protocol = options.protocol,
     });
     errdefer closeFd(socket_fd);
     var storage: Io.Threaded.PosixAddress = undefined;
     var addr_len = Io.Threaded.addressToPosix(address, &storage);
-    try posixConnect(k, socket_fd, &storage.any, addr_len);
-    try posixGetSockName(k, socket_fd, &storage.any, &addr_len);
+    try posixConnect(loop, socket_fd, &storage.any, addr_len);
+    try posixGetSockName(loop, socket_fd, &storage.any, &addr_len);
     return .{ .handle = socket_fd, .address = Io.Threaded.addressFromPosix(&storage) };
 }
 
 fn posixConnect(
-    k: *Kqueue,
+    loop: *EventLoop,
     socket_fd: posix.socket_t,
     addr: *const posix.sockaddr,
     addr_len: posix.socklen_t,
 ) !void {
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         switch (posix.errno(posix.system.connect(socket_fd, addr, addr_len))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -2411,8 +2384,8 @@ fn netListenUnix(
     unix_address: *const net.UnixAddress,
     options: net.UnixAddress.ListenOptions,
 ) net.UnixAddress.ListenError!net.Socket.Handle {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = unix_address;
     _ = options;
     @panic("TODO");
@@ -2421,8 +2394,8 @@ fn netConnectUnix(
     userdata: ?*anyopaque,
     unix_address: *const net.UnixAddress,
 ) net.UnixAddress.ConnectError!net.Socket.Handle {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = unix_address;
     @panic("TODO");
 }
@@ -2433,7 +2406,7 @@ fn netSend(
     outgoing_messages: []net.OutgoingMessage,
     flags: net.SendFlags,
 ) struct { ?net.Socket.SendError, usize } {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
 
     const posix_flags: u32 =
         @as(u32, if (@hasDecl(posix.MSG, "CONFIRM") and flags.confirm)
@@ -2453,14 +2426,14 @@ fn netSend(
         posix.MSG.NOSIGNAL;
 
     for (outgoing_messages, 0..) |*msg, i| {
-        netSendOne(k, handle, msg, posix_flags) catch |err| return .{ err, i };
+        netSendOne(loop, handle, msg, posix_flags) catch |err| return .{ err, i };
     }
 
     return .{ null, outgoing_messages.len };
 }
 
 fn netSendOne(
-    k: *Kqueue,
+    loop: *EventLoop,
     handle: net.Socket.Handle,
     message: *net.OutgoingMessage,
     flags: u32,
@@ -2481,7 +2454,7 @@ fn netSendOne(
         .flags = 0,
     };
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         const rc = posix.system.sendmsg(handle, &msg, flags);
         switch (posix.errno(rc)) {
             .SUCCESS => {
@@ -2490,7 +2463,7 @@ fn netSendOne(
             },
             .INTR => continue,
             .CANCELED => return error.Canceled,
-            .AGAIN => @panic("TODO register kevent"),
+            .AGAIN => @panic("TODO register poller interest"),
 
             .ACCES => return error.AccessDenied,
             .ALREADY => return error.FastOpenAlreadyInProgress,
@@ -2524,8 +2497,8 @@ fn netReceive(
     flags: net.ReceiveFlags,
     timeout: Io.Timeout,
 ) struct { ?net.Socket.ReceiveTimeoutError, usize } {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = handle;
     _ = message_buffer;
     _ = data_buffer;
@@ -2539,7 +2512,7 @@ fn netRead(
     fd: net.Socket.Handle,
     data: [][]u8,
 ) net.Stream.Reader.Error!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
 
     var iovecs_buffer: [max_iovecs_len]posix.iovec = undefined;
     var i: usize = 0;
@@ -2554,14 +2527,14 @@ fn netRead(
     assert(dest[0].len > 0);
 
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         const rc = posix.system.readv(fd, dest.ptr, @intCast(dest.len));
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
             .CANCELED => return error.Canceled,
             .AGAIN => {
-                try k.waitForFd(fd, std.c.EVFILT.READ);
+                try loop.waitForFd(fd, .read);
                 continue;
             },
 
@@ -2587,7 +2560,7 @@ fn netWrite(
     data: []const []const u8,
     splat: usize,
 ) net.Stream.Writer.Error!usize {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
 
     var iovecs_buffer: [max_iovecs_len + 2]posix.iovec_const = undefined;
     var i: usize = 0;
@@ -2616,14 +2589,14 @@ fn netWrite(
     if (src.len == 0) return @as(usize, 0);
 
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         const rc = posix.system.writev(dest, src.ptr, @intCast(src.len));
         switch (posix.errno(rc)) {
             .SUCCESS => return @intCast(rc),
             .INTR => continue,
             .CANCELED => return error.Canceled,
             .AGAIN => {
-                try k.waitForFd(dest, std.c.EVFILT.WRITE);
+                try loop.waitForFd(dest, .write);
                 continue;
             },
 
@@ -2646,9 +2619,9 @@ fn netWrite(
 }
 
 fn netClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
     for (handles) |handle| {
-        k.wakeFd(handle);
+        loop.wakeFd(handle);
         closeFd(handle);
     }
 }
@@ -2658,8 +2631,8 @@ fn netShutdown(
     handle: net.Socket.Handle,
     how: net.ShutdownHow,
 ) net.ShutdownError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
 
     const posix_how: i32 = switch (how) {
         .recv => posix.SHUT.RD,
@@ -2689,8 +2662,8 @@ fn netInterfaceNameResolve(
     userdata: ?*anyopaque,
     name: *const net.Interface.Name,
 ) net.Interface.Name.ResolveError!net.Interface {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = name;
     @panic("TODO");
 }
@@ -2699,8 +2672,8 @@ fn netInterfaceName(
     userdata: ?*anyopaque,
     interface: net.Interface,
 ) net.Interface.NameError!net.Interface.Name {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = interface;
     @panic("TODO");
 }
@@ -2711,8 +2684,8 @@ fn netLookup(
     resolved: *Io.Queue(net.HostName.LookupResult),
     options: net.HostName.LookupOptions,
 ) net.HostName.LookupError!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    _ = k;
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    _ = loop;
     _ = host_name;
     _ = resolved;
     _ = options;
@@ -2720,7 +2693,7 @@ fn netLookup(
 }
 
 fn openSocketPosix(
-    k: *Kqueue,
+    loop: *EventLoop,
     family: posix.sa_family_t,
     options: IpAddress.BindOptions,
 ) error{
@@ -2741,7 +2714,7 @@ fn openSocketPosix(
         options.protocol,
     );
     const socket_fd = while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         const flags: u32 = mode | if (Io.Threaded.socket_flags_unsupported)
             0
         else
@@ -2752,9 +2725,9 @@ fn openSocketPosix(
                 const fd: posix.fd_t = @intCast(socket_rc);
                 errdefer closeFd(fd);
                 if (Io.Threaded.socket_flags_unsupported) {
-                    try setCloseOnExec(k, fd);
+                    try setCloseOnExec(loop, fd);
                 }
-                try setNonBlocking(k, fd);
+                try setNonBlocking(loop, fd);
                 break fd;
             },
             .INTR => continue,
@@ -2775,15 +2748,15 @@ fn openSocketPosix(
 
     if (options.ip6_only) {
         if (posix.IPV6 == void) return error.OptionUnsupported;
-        try setSocketOption(k, socket_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, 0);
+        try setSocketOption(loop, socket_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, 0);
     }
 
     return socket_fd;
 }
 
-fn setCloseOnExec(k: *Kqueue, fd: posix.fd_t) !void {
+fn setCloseOnExec(loop: *EventLoop, fd: posix.fd_t) !void {
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         switch (posix.errno(posix.system.fcntl(
             fd,
             posix.F.SETFD,
@@ -2798,13 +2771,13 @@ fn setCloseOnExec(k: *Kqueue, fd: posix.fd_t) !void {
 }
 
 fn posixBind(
-    k: *Kqueue,
+    loop: *EventLoop,
     socket_fd: posix.socket_t,
     addr: *const posix.sockaddr,
     addr_len: posix.socklen_t,
 ) !void {
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         switch (posix.errno(posix.system.bind(socket_fd, addr, addr_len))) {
             .SUCCESS => break,
             .INTR => continue,
@@ -2824,13 +2797,13 @@ fn posixBind(
 }
 
 fn posixGetSockName(
-    k: *Kqueue,
+    loop: *EventLoop,
     socket_fd: posix.fd_t,
     addr: *posix.sockaddr,
     addr_len: *posix.socklen_t,
 ) !void {
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         switch (posix.errno(posix.system.getsockname(socket_fd, addr, addr_len))) {
             .SUCCESS => break,
             .INTR => continue,
@@ -2846,10 +2819,10 @@ fn posixGetSockName(
     }
 }
 
-fn setSocketOption(k: *Kqueue, fd: posix.fd_t, level: i32, opt_name: u32, option: u32) !void {
+fn setSocketOption(loop: *EventLoop, fd: posix.fd_t, level: i32, opt_name: u32, option: u32) !void {
     const o: []const u8 = @ptrCast(&option);
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         switch (posix.errno(posix.system.setsockopt(fd, level, opt_name, o.ptr, @intCast(o.len)))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -2864,9 +2837,9 @@ fn setSocketOption(k: *Kqueue, fd: posix.fd_t, level: i32, opt_name: u32, option
     }
 }
 
-fn setNonBlocking(k: *Kqueue, fd: posix.fd_t) !void {
+fn setNonBlocking(loop: *EventLoop, fd: posix.fd_t) !void {
     var flags: usize = while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         const rc = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
         switch (posix.errno(rc)) {
             .SUCCESS => break @intCast(rc),
@@ -2878,7 +2851,7 @@ fn setNonBlocking(k: *Kqueue, fd: posix.fd_t) !void {
     flags |= @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK"));
 
     while (true) {
-        try k.checkCancel();
+        try loop.checkCancel();
         switch (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, flags))) {
             .SUCCESS => return,
             .INTR => continue,
@@ -2888,55 +2861,11 @@ fn setNonBlocking(k: *Kqueue, fd: posix.fd_t) !void {
     }
 }
 
-fn checkCancel(k: *Kqueue) error{Canceled}!void {
-    if (cancelRequested(k)) return error.Canceled;
+fn checkCancel(loop: *EventLoop) error{Canceled}!void {
+    if (cancelRequested(loop)) return error.Canceled;
 }
 
 fn ioCheckCancel(userdata: ?*anyopaque) Io.Cancelable!void {
-    const k: *Kqueue = @ptrCast(@alignCast(userdata));
-    try k.checkCancel();
-}
-
-pub const KEventError = error{
-    /// The process does not have permission to register a filter.
-    AccessDenied,
-    /// The event could not be found to be modified or deleted.
-    EventNotFound,
-    /// No memory was available to register the event.
-    SystemResources,
-    /// The specified process to attach to does not exist.
-    ProcessNotFound,
-    /// changelist or eventlist had too many items on it.
-    /// TODO remove this possibility
-    Overflow,
-};
-
-pub fn kevent(
-    kq: i32,
-    changelist: []const posix.Kevent,
-    eventlist: []posix.Kevent,
-    timeout: ?*const posix.timespec,
-) KEventError!usize {
-    while (true) {
-        const rc = posix.system.kevent(
-            kq,
-            changelist.ptr,
-            std.math.cast(c_int, changelist.len) orelse return error.Overflow,
-            eventlist.ptr,
-            std.math.cast(c_int, eventlist.len) orelse return error.Overflow,
-            timeout,
-        );
-        switch (posix.errno(rc)) {
-            .SUCCESS => return @intCast(rc),
-            .ACCES => return error.AccessDenied,
-            .FAULT => unreachable, // TODO use error.Unexpected for these
-            .BADF => unreachable, // Always a race condition.
-            .INTR => continue, // TODO handle cancelation
-            .INVAL => unreachable,
-            .NOENT => return error.EventNotFound,
-            .NOMEM => return error.SystemResources,
-            .SRCH => return error.ProcessNotFound,
-            else => unreachable,
-        }
-    }
+    const loop: *EventLoop = @ptrCast(@alignCast(userdata));
+    try loop.checkCancel();
 }

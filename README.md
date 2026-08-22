@@ -9,7 +9,7 @@
 
 **A high-performance HTTP/2 protocol implementation in Zig**
 
-Cross-platform protocol core • Static Kqueue runtime
+Cross-platform protocol core • Static event-loop runtime
 
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
 [![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-orange.svg)](https://ziglang.org)
@@ -22,7 +22,7 @@ Cross-platform protocol core • Static Kqueue runtime
 ## Features
 
 - 🌍 **Cross-platform protocol core** with caller-owned readers, writers, and stream storage
-- 💾 **Static Zig memory on Kqueue** - bounded pools replace hot-path heap growth
+- 💾 **Static Zig memory on Linux and the BSDs** - bounded pools replace hot-path heap growth
 - 🔒 **Bounded concurrency** - fixed connection, stream, and event-loop task capacities
 - 🧩 **Bring your own router** - plug in any dispatcher or router you want
 - ✅ **HTTP/2 RFC 7540** compliant
@@ -288,7 +288,7 @@ registrations, and worker threads.
 
 `RuntimePlan` uses checked arithmetic for the configured connection, thread, fiber, I/O-buffer,
 and per-thread wait-registration counts. The published core ceiling covers the maximum accepted
-configuration, including all Kqueue allocator storage and OS worker-stack reservations—not just
+configuration, including all event-loop allocator storage and OS worker-stack reservations—not just
 the default two threads. Per-thread HPACK scratch is also charged to the plan. The TLS example
 separately checks its larger, adapter-specific connection slot layout against the same system
 ceiling.
@@ -317,11 +317,24 @@ streams and oversized frames or header blocks through bounded protocol errors. C
 startup.
 
 The static guarantee covers memory obtained through http2.zig's phase-gated Zig allocator. The
-in-tree Kqueue backend preallocates worker threads, fibers, and wait-registration maps before the
-freeze boundary. The bundled server fails with `StaticBackendUnavailable` on platforms without
-Kqueue; it does not silently fall back to `std.Io.Threaded` and its dynamic task pool. The protocol
-and in-place client APIs remain transport-neutral. Another server backend must provide an
-equivalent startup-allocation contract before it can make the same whole-runtime claim.
+in-tree event loop (`src/io/EventLoop.zig`) preallocates worker threads, fibers, and
+wait-registration maps before the freeze boundary. It is derived from `std.Io.Kqueue`, because the
+native `std.Io` backends allocate a fiber per task at runtime—`std.Io.Kqueue` and `std.Io.Uring`
+both fall back to the general-purpose allocator when their free list is empty, and spawn worker
+threads lazily—which a sealed allocator rejects.
+
+Readiness polling is the only platform-specific part, and lives behind a small seam in
+`src/io/poll/`: kqueue on macOS and the BSDs, epoll on Linux. The two pollers present the same
+normalized event stream, so the scheduler above them is platform-neutral. Epoll carries one
+interest mask per descriptor rather than one registration per direction, so its poller arms both
+directions at once and fans a readiness event out to the waiting readers, writers, or both; it
+also has no user-triggered filter, so out-of-band signals are a bitmask published before an
+eventfd write, which keeps distinct signals from coalescing.
+
+The bundled server fails with `StaticBackendUnavailable` on platforms with neither poller; it does
+not silently fall back to `std.Io.Threaded` and its dynamic task pool. The protocol and in-place
+client APIs remain transport-neutral. Another server backend must provide an equivalent
+startup-allocation contract before it can make the same whole-runtime claim.
 
 TLS has a separate allocator boundary: the `http2-boring` example embeds each adapter connection
 and its fixed Zig I/O buffers in a startup-owned connection slot, and creates the I/O backend before

@@ -11,15 +11,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Local fork of `std.Io.Kqueue` (see `src/io/Kqueue.zig`). Re-exported so
-// out-of-tree modules (e.g. `examples/tls_server.zig`) consume the same
-// patched backend as the in-tree HTTP/2 server.
-pub const has_kqueue_backend = switch (builtin.os.tag) {
-    .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+// Statically allocating event loop (see `src/io/EventLoop.zig`), derived from
+// `std.Io.Kqueue` and reworked to preallocate fibers, worker stacks, and wait
+// registrations before the freeze boundary. The native `std.Io` backends
+// allocate a fiber per task at runtime, which a sealed allocator rejects.
+// Re-exported so out-of-tree modules (e.g. `examples/tls_server.zig`) consume
+// the same backend as the in-tree HTTP/2 server.
+//
+// Readiness polling is per platform: kqueue on the BSDs, epoll on Linux.
+pub const has_event_loop_backend = switch (builtin.os.tag) {
+    .macos, .freebsd, .netbsd, .openbsd, .dragonfly, .linux => true,
     else => false,
 };
 
-pub const Kqueue = if (has_kqueue_backend) @import("io/Kqueue.zig") else opaque {};
+pub const EventLoop = if (has_event_loop_backend) @import("io/EventLoop.zig") else opaque {};
 
 // Core HTTP/2 Protocol Components
 pub const Connection = @import("connection.zig").Connection;
@@ -136,8 +141,8 @@ comptime {
 }
 
 test "HTTP/2 server creation" {
-    // The bundled server requires the static Kqueue backend.
-    if (!has_kqueue_backend) return error.SkipZigTest;
+    // The bundled server requires the static event-loop backend.
+    if (!has_event_loop_backend) return error.SkipZigTest;
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();

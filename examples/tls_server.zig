@@ -50,15 +50,15 @@ pub const Server = struct {
 
     const Self = @This();
 
-    const Backend = if (http2.has_kqueue_backend) struct {
+    const Backend = if (http2.has_event_loop_backend) struct {
         allocator: std.mem.Allocator,
-        evented: *http2.Kqueue,
+        evented: *http2.EventLoop,
 
         fn init(
             allocator: std.mem.Allocator,
             runtime_plan: http2.memory_budget.RuntimePlan,
         ) !Backend {
-            const evented = try allocator.create(http2.Kqueue);
+            const evented = try allocator.create(http2.EventLoop);
             errdefer allocator.destroy(evented);
 
             try evented.init(allocator, .{
@@ -167,7 +167,7 @@ pub const Server = struct {
         if (!http2.memory_budget.backingAllocatorMatches(allocator)) {
             return error.BackingAllocatorMismatch;
         }
-        if (!http2.has_kqueue_backend) return error.StaticBackendUnavailable;
+        if (!http2.has_event_loop_backend) return error.StaticBackendUnavailable;
         const runtime_plan = try http2.memory_budget.RuntimePlan.init(
             config.max_connections,
             adapter_io_buffer_size,
