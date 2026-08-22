@@ -71,7 +71,8 @@ pub const Settings = struct {
     enable_push: bool = true,
     max_concurrent_streams: u32 = max_streams_per_connection,
     initial_window_size: u32 = 65535,
-    max_frame_size: u32 = 16384,
+    /// Maximum frame payload size advertised by the peer for outbound frames.
+    peer_max_frame_size: u32 = 16384,
     max_header_list_size: u32 = 8192,
     no_rfc7540_priorities: bool = true,
 
@@ -87,7 +88,6 @@ pub const ConnectionPendingPriorityUpdate = struct {
 };
 
 pub const DispatchContext = struct {
-    allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
     stream_storage: *StreamStorage,
@@ -383,6 +383,8 @@ fn handleStreamLevelFrameProcess(
 
     if (stream.state == .Closed) {
         const stream_index = ctx.stream_storage.findIndex(stream.id) orelse unreachable;
+        pendingStreamRemove(ctx, stream_index);
+        stream.deinit();
         ctx.stream_storage.releaseSlot(stream_index);
         return;
     }
@@ -446,41 +448,23 @@ fn handleGoawayFrame(ctx: *DispatchContext, frame: Frame) !void {
 }
 
 fn handleWindowUpdate(ctx: *DispatchContext, frame: Frame) !void {
+    assert(frame.header.stream_id == 0);
     if (frame.payload.len != 4) {
         try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x6, "WINDOW_UPDATE with invalid payload: FRAME_SIZE_ERROR");
         return;
     }
-    const increment = std.mem.readInt(u32, frame.payload[0..4], .big);
+    const increment = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF;
     if (increment == 0) {
         try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x1, "WINDOW_UPDATE increment 0: PROTOCOL_ERROR");
         return;
     }
-    if (increment > 0x7FFFFFFF) {
-        try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x3, "WINDOW_UPDATE increment too large: FLOW_CONTROL_ERROR");
-        return;
-    }
-
-    if (frame.header.stream_id == 0) {
-        updateSendWindow(ctx, ctx.send_window_size, increment) catch |err| {
-            if (err == error.FlowControlError) {
-                try finishAfterGoaway(ctx);
-                return;
-            }
-            return err;
-        };
-    } else {
-        const stream = ctx.stream_storage.find(frame.header.stream_id) orelse {
-            if (frame.header.stream_id > ctx.last_stream_id.*) {
-                try sendGoawayAndClose(ctx, 0, 0x1, "WINDOW_UPDATE on idle: PROTOCOL_ERROR");
-                return error.ProtocolError;
-            }
+    updateSendWindow(ctx, ctx.send_window_size, increment) catch |err| {
+        if (err == error.FlowControlError) {
+            try finishAfterGoaway(ctx);
             return;
-        };
-        stream.updateSendWindow(@intCast(increment)) catch |err| {
-            if (err == error.FlowControlError) return;
-            return err;
-        };
-    }
+        }
+        return err;
+    };
 }
 
 pub fn handlePriorityUpdateFrame(ctx: *DispatchContext, frame: Frame) !void {
@@ -701,6 +685,25 @@ fn pendingStreamPush(ctx: *DispatchContext, stream_index: u8) !void {
     ctx.pending_stream_count.* += 1;
 }
 
+fn pendingStreamRemove(ctx: *DispatchContext, stream_index: u8) void {
+    assert(stream_index < max_streams_per_connection);
+    if (!ctx.pending_stream_queued[stream_index]) return;
+
+    var pending_index: u8 = 0;
+    while (pending_index < ctx.pending_stream_count.*) : (pending_index += 1) {
+        if (ctx.pending_stream_slots[pending_index] != stream_index) continue;
+
+        var shift_index = pending_index + 1;
+        while (shift_index < ctx.pending_stream_count.*) : (shift_index += 1) {
+            ctx.pending_stream_slots[shift_index - 1] = ctx.pending_stream_slots[shift_index];
+        }
+        ctx.pending_stream_count.* -= 1;
+        ctx.pending_stream_queued[stream_index] = false;
+        return;
+    }
+    unreachable;
+}
+
 // -----------------------------------------------------------------------
 //  Pending priority updates
 // -----------------------------------------------------------------------
@@ -853,7 +856,7 @@ fn applySetting(ctx: *DispatchContext, id: u16, value: u32) !void {
                 }
                 return;
             }
-            ctx.settings.max_frame_size = value;
+            ctx.settings.peer_max_frame_size = value;
         },
         6 => ctx.settings.max_header_list_size = value,
         else => {},

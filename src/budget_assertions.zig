@@ -47,7 +47,10 @@ fn validateTotalMemory() void {
         if (MemBudget.total_required_bytes > system_memory_limit) {
             @compileError(std.fmt.comptimePrint(
                 "Memory budget exceeds system limit: {d}MB required" ++ " > {d}MB available",
-                .{ MemBudget.total_required_bytes / memory_budget.MiB, system_memory_limit / memory_budget.MiB },
+                .{
+                    MemBudget.total_required_bytes / memory_budget.MiB,
+                    system_memory_limit / memory_budget.MiB,
+                },
             ));
         }
 
@@ -80,7 +83,10 @@ fn validatePerConnectionSizing() void {
         if (MemBudget.connection_slot_bytes > max_memory_per_connection) {
             @compileError(std.fmt.comptimePrint(
                 "Memory per connection too high: {d}MB > {d}MB limit",
-                .{ MemBudget.connection_slot_bytes / memory_budget.MiB, max_memory_per_connection / memory_budget.MiB },
+                .{
+                    MemBudget.connection_slot_bytes / memory_budget.MiB,
+                    max_memory_per_connection / memory_budget.MiB,
+                },
             ));
         }
 
@@ -115,9 +121,9 @@ fn validateProtocolConstants() void {
             ));
         }
 
-        const max_window_size = 2147483647;
-        if (MemBudget.bytes_per_connection > max_window_size) {
-            @compileError("Connection window size exceeds HTTP/2 limit");
+        const max_window_size = 2_147_483_647;
+        if (MemBudget.max_data_buffer_bytes > max_window_size) {
+            @compileError("Stream data buffer exceeds the HTTP/2 flow-control limit");
         }
     }
 }

@@ -99,7 +99,6 @@ pub const Http2Peer = struct {
 
     fn init(
         self: *Http2Peer,
-        allocator: std.mem.Allocator,
         role: Role,
     ) !void {
         self.role = role;
@@ -114,7 +113,6 @@ pub const Http2Peer = struct {
         try Connection.initServerEventDrivenInPlace(
             &self.connection,
             &self.stream_storage,
-            allocator,
             &self.reader,
             &self.writer.interface,
         );
@@ -155,9 +153,9 @@ const ClientOracle = struct {
     stream_count: u32 = 0,
     completed_responses: u64 = 0,
 
-    fn init(allocator: std.mem.Allocator) ClientOracle {
+    fn init() ClientOracle {
         return .{
-            .decoder_table = Hpack.DynamicTable.init(allocator, 4096),
+            .decoder_table = Hpack.DynamicTable.init(4096),
             .streams = undefined,
             .stream_count = 0,
             .completed_responses = 0,
@@ -176,14 +174,13 @@ const ClientOracle = struct {
 
     fn onFrame(
         self: *ClientOracle,
-        allocator: std.mem.Allocator,
         packet: *const Packet,
     ) !void {
         switch (packet.frame_type) {
             .HEADERS => {
                 var stream = self.findStream(packet.source, packet.target, packet.stream_id);
                 assert(!stream.headers_seen);
-                try self.decodeHeaders(allocator, packet.payload_slice());
+                try self.decodeHeaders(packet.payload_slice());
                 stream.headers_seen = true;
                 if ((packet.flags & FrameFlags.END_STREAM) != 0) {
                     stream.remote_end_seen = true;
@@ -211,14 +208,15 @@ const ClientOracle = struct {
 
     fn decodeHeaders(
         self: *ClientOracle,
-        allocator: std.mem.Allocator,
         payload: []const u8,
     ) !void {
         var cursor: usize = 0;
         var status_seen = false;
         while (cursor < payload.len) {
-            var decoded = try Hpack.decodeHeaderField(payload[cursor..], &self.decoder_table, allocator);
-            defer decoded.deinit();
+            const decoded = try Hpack.decodeHeaderFieldView(
+                payload[cursor..],
+                &self.decoder_table,
+            );
             cursor += decoded.bytes_consumed;
             if (std.mem.eql(u8, decoded.header.name, ":status")) {
                 status_seen = true;
@@ -438,21 +436,21 @@ pub const Http2Cluster = struct {
         var peer_index: u8 = 0;
         while (peer_index < options.nodeCount()) : (peer_index += 1) {
             const role: Role = if (peer_index < options.client_count) .client else .server;
-            try peers[peer_index].init(allocator, role);
+            try peers[peer_index].init(role);
         }
         errdefer for (peers) |*peer| peer.deinit();
 
         const client_encoder_tables = try allocator.alloc(Hpack.DynamicTable, options.client_count);
         errdefer allocator.free(client_encoder_tables);
         for (client_encoder_tables) |*table| {
-            table.* = Hpack.DynamicTable.init(allocator, 4096);
+            table.* = Hpack.DynamicTable.init(4096);
         }
         errdefer for (client_encoder_tables) |*table| table.deinit();
 
         const client_oracles = try allocator.alloc(ClientOracle, options.client_count);
         errdefer allocator.free(client_oracles);
         for (client_oracles) |*oracle| {
-            oracle.* = ClientOracle.init(allocator);
+            oracle.* = ClientOracle.init();
         }
         errdefer for (client_oracles) |*oracle| oracle.deinit();
 
@@ -522,7 +520,6 @@ pub const Http2Cluster = struct {
 
             var payload_storage: [max_payload_size]u8 = undefined;
             const payload = try encodeRequestHeaders(
-                self.allocator,
                 &self.client_encoder_tables[client],
                 stream_id,
                 &payload_storage,
@@ -549,7 +546,7 @@ pub const Http2Cluster = struct {
                 self.metrics.frames_delivered += 1;
 
                 if (self.peers[peer_index].role == .client) {
-                    try self.client_oracles[peer_index].onFrame(self.allocator, &packet);
+                    try self.client_oracles[peer_index].onFrame(&packet);
                 } else {
                     const result = self.peers[peer_index].connection.handleFrameEventDriven(frameFromPacket(&packet));
                     result catch |err| {
@@ -634,19 +631,22 @@ const digestMix = sim_common.digestMix;
 const isExpectedError = sim_common.isExpectedError;
 
 fn encodeRequestHeaders(
-    allocator: std.mem.Allocator,
     table: *Hpack.DynamicTable,
     stream_id: u32,
     storage: []u8,
 ) ![]const u8 {
     var encoded = std.ArrayList(u8).initBuffer(storage);
-    try Hpack.encodeHeaderField(.{ .name = ":method", .value = "GET" }, table, &encoded, allocator);
-    try Hpack.encodeHeaderField(.{ .name = ":scheme", .value = "https" }, table, &encoded, allocator);
-    try Hpack.encodeHeaderField(.{ .name = ":authority", .value = "cluster.sim" }, table, &encoded, allocator);
+    try Hpack.encodeHeaderField(.{ .name = ":method", .value = "GET" }, table, &encoded);
+    try Hpack.encodeHeaderField(.{ .name = ":scheme", .value = "https" }, table, &encoded);
+    try Hpack.encodeHeaderField(
+        .{ .name = ":authority", .value = "cluster.sim" },
+        table,
+        &encoded,
+    );
 
     var path_storage: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/cluster/{d}", .{stream_id});
-    try Hpack.encodeHeaderField(.{ .name = ":path", .value = path }, table, &encoded, allocator);
+    try Hpack.encodeHeaderField(.{ .name = ":path", .value = path }, table, &encoded);
     return encoded.items;
 }
 

@@ -301,7 +301,8 @@ const Http2StateChecker = struct {
     highest_stream_id: u32 = 0,
     last_goaway_stream_id: u32 = 0,
     goaway_seen: bool = false,
-    reset_streams: [max_reset_streams_tracked]u32 = [_]u32{0} ** max_reset_streams_tracked,
+    reset_streams: [max_reset_streams_tracked]u32 =
+        [_]u32{0} ** max_reset_streams_tracked,
     reset_stream_count: u32 = 0,
 
     fn onRequest(self: *Http2StateChecker, stream_id: u32) void {
@@ -451,7 +452,7 @@ const Simulator = struct {
             .packet_replay_probability = config.packet_replay_probability,
             .path_capacity = config.path_capacity,
         });
-        self.client_encoder_table = Hpack.DynamicTable.init(allocator, config.hpack_table_size);
+        self.client_encoder_table = Hpack.DynamicTable.init(config.hpack_table_size);
         self.model = .{};
         self.checker = .{};
         self.metrics = .{
@@ -466,7 +467,6 @@ const Simulator = struct {
         try Connection.initServerEventDrivenInPlace(
             &self.connection,
             &self.stream_storage,
-            allocator,
             &self.reader,
             &self.writer.interface,
         );
@@ -474,7 +474,7 @@ const Simulator = struct {
         self.connection.hpack_encoder_table.setMaxAllowedSize(config.hpack_table_size);
         self.connection.settings.header_table_size = @intCast(config.hpack_table_size);
         self.connection.settings.initial_window_size = config.initial_window_size;
-        self.connection.settings.max_frame_size = config.max_frame_size;
+        self.connection.settings.peer_max_frame_size = config.max_frame_size;
         self.connection.recv_window_size = @intCast(config.initial_window_size);
         self.connection.send_window_size = @intCast(config.initial_window_size);
         self.handler_state = .{ .response_body_size = config.response_body_size };
@@ -590,7 +590,6 @@ const Simulator = struct {
         self.checker.onRequest(stream_id);
         var payload_storage: [max_payload_size]u8 = undefined;
         const payload = try encodeRequestHeaders(
-            self.allocator,
             &self.client_encoder_table,
             stream_id,
             pressure,
@@ -620,7 +619,6 @@ const Simulator = struct {
         self.checker.onRequest(stream_id);
         var payload_storage: [max_payload_size]u8 = undefined;
         const payload = try encodeRequestHeaders(
-            self.allocator,
             &self.client_encoder_table,
             stream_id,
             false,
@@ -782,20 +780,23 @@ const coreFrameType = sim_common.coreFrameType;
 const isExpectedError = sim_common.isExpectedError;
 
 fn encodeRequestHeaders(
-    allocator: std.mem.Allocator,
     table: *Hpack.DynamicTable,
     stream_id: u32,
     pressure: bool,
     storage: []u8,
 ) ![]const u8 {
     var encoded = std.ArrayList(u8).initBuffer(storage);
-    try Hpack.encodeHeaderField(.{ .name = ":method", .value = "GET" }, table, &encoded, allocator);
-    try Hpack.encodeHeaderField(.{ .name = ":scheme", .value = "https" }, table, &encoded, allocator);
-    try Hpack.encodeHeaderField(.{ .name = ":authority", .value = "sim.local" }, table, &encoded, allocator);
+    try Hpack.encodeHeaderField(.{ .name = ":method", .value = "GET" }, table, &encoded);
+    try Hpack.encodeHeaderField(.{ .name = ":scheme", .value = "https" }, table, &encoded);
+    try Hpack.encodeHeaderField(
+        .{ .name = ":authority", .value = "sim.local" },
+        table,
+        &encoded,
+    );
 
     var path_storage: [64]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_storage, "/sim/{d}", .{stream_id});
-    try Hpack.encodeHeaderField(.{ .name = ":path", .value = path }, table, &encoded, allocator);
+    try Hpack.encodeHeaderField(.{ .name = ":path", .value = path }, table, &encoded);
 
     if (pressure) {
         var value_storage: [96]u8 = undefined;
@@ -804,7 +805,11 @@ fn encodeRequestHeaders(
             "seeded-header-value-for-stream-{d}-xxxxxxxxxxxxxxxxxxxxxxxx",
             .{stream_id},
         );
-        try Hpack.encodeHeaderField(.{ .name = "x-sim-pressure", .value = value }, table, &encoded, allocator);
+        try Hpack.encodeHeaderField(
+            .{ .name = "x-sim-pressure", .value = value },
+            table,
+            &encoded,
+        );
     }
 
     return encoded.items;

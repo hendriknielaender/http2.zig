@@ -55,6 +55,8 @@ pub const stream_storage = @import("stream_storage.zig");
 pub const handler = @import("handler.zig");
 pub const Context = handler.Context;
 pub const Response = handler.Response;
+pub const StreamReadResult = handler.StreamReadResult;
+pub const StreamResponseConfig = handler.StreamResponseConfig;
 pub const RequestDispatcher = handler.RequestDispatcher;
 pub const Status = handler.Status;
 pub const Mime = handler.Mime;
@@ -77,26 +79,42 @@ pub const ServerStats = struct {
     requests_processed: u64 = 0,
 };
 
-/// Initialize the HTTP/2 system.
-/// Wraps the caller's allocator in a phase-gated StaticAllocator so that
-/// all heap work can be frozen before the event loop starts.
+/// Begin the HTTP/2 startup phase.
+///
+/// Every server, client connection pool, and transport adapter must allocate
+/// its bounded storage through `staticAllocator()` before `freeze()`.
 pub fn init(allocator: std.mem.Allocator) !void {
     try memory_budget.initStaticAllocator(allocator);
 }
 
-/// Return the phase-gated allocator.  All server init should use this so that
-/// `freeze()` can prevent accidental runtime allocations.
+/// Return the startup-only allocator.
 pub fn staticAllocator() std.mem.Allocator {
     return memory_budget.staticAllocatorPtr().allocator();
 }
 
-/// Freeze allocations.  Any alloc/resize after this will assert-fail.
+/// Seal startup memory. Runtime allocation, resize, remap, and free operations
+/// become unconditional safety failures in every optimization mode.
 pub fn freeze() void {
     memory_budget.freezeStaticAllocator();
 }
 
-/// Deinitialize the HTTP/2 system.  Unfreezes the allocator and frees all
-/// tracked memory.
+/// Seal startup memory if the application did not call `freeze()` explicitly.
+/// Server run loops call this immediately before accepting traffic.
+pub fn freezeIfNeeded() void {
+    const snapshot = memory_budget.allocatorSnapshot();
+    switch (snapshot.state) {
+        .init => freeze(),
+        .static => {},
+        .deinit => @panic("HTTP/2 runtime started during teardown"),
+    }
+}
+
+/// Enter teardown before any startup-owned pool is freed.
+pub fn beginDeinit() void {
+    memory_budget.beginStaticAllocatorDeinit();
+}
+
+/// Finish teardown after all startup-owned pools have been freed.
 pub fn deinit() void {
     memory_budget.deinitStaticAllocator();
 }
@@ -134,6 +152,7 @@ test "HTTP/2 server creation" {
     const config = Server.Config{
         .address = try std.Io.net.IpAddress.parse("127.0.0.1", 3000),
         .dispatcher = RequestDispatcher.fromHandler(test_handler),
+        .max_connections = 2,
     };
 
     var server = try Server.init(allocator, config);

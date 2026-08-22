@@ -1,63 +1,55 @@
-//! Compile-time memory budgeting that prevents runtime OOM by sizing every
-//! allocation against worst-case calculations known before the server starts.
+//! HTTP/2 resource limits and startup-only allocator authority.
 //!
-//! The budget constants serve as the single source of truth for maximum
-//! resource counts.  Every module that pre-allocates storage (connection
-//! slots, stream buffers, header fragments) binds its array lengths to these
-//! constants so that a budget change one place flows through the entire build.
-//!
-//! A phase-gated allocator (StaticAllocator) wraps the caller's allocator so
-//! that all heap work happens during init and is frozen before the event loop
-//! starts.  Any accidental runtime allocation triggers an assertion failure.
+//! The server computes its concrete pool counts from `RuntimePlan`, allocates
+//! those pools during initialization, and seals `StaticAllocator` before
+//! accepting traffic. Capacity exhaustion is handled as protocol overload;
+//! it never falls back to growing a heap allocation during runtime.
+
 const std = @import("std");
+const builtin = @import("builtin");
+const StaticAllocator = @import("static_allocator.zig");
+const Hpack = @import("hpack.zig").Hpack;
 
-pub const KiB = 1024;
-pub const MiB = 1024 * KiB;
-pub const GiB = 1024 * MiB;
+const has_kqueue_backend = switch (builtin.os.tag) {
+    .macos, .freebsd, .netbsd, .openbsd, .dragonfly => true,
+    else => false,
+};
+const Kqueue = if (has_kqueue_backend) @import("io/Kqueue.zig") else opaque {};
 
-/// Compile-time resource budget; every capacity choice lives here so that
-/// a single edit propagates to every consumer without leaving any array
-/// unbounded.
+pub const KiB: usize = 1024;
+pub const MiB: usize = 1024 * KiB;
+pub const GiB: usize = 1024 * MiB;
+
 pub const MemBudget = struct {
-    /// Maximum concurrent connections.  Must match `server.Config.max_connections`
-    /// default so that budget calculations are coherent with deployed code.
-    pub const max_connections = 1000;
+    pub const system_limit_bytes = 8 * GiB;
+    pub const max_connections: u32 = 1000;
+    pub const max_streams_per_connection: u32 = 100;
+    pub const max_frame_size_bytes: usize = 16 * KiB;
+    pub const max_header_size_bytes: usize = 8 * KiB;
+    pub const max_data_buffer_bytes: usize = 16 * KiB;
+    pub const max_io_buffer_size_bytes: u32 = 32 * KiB;
 
-    /// Maximum concurrent streams inside a single connection.
-    /// RFC 7540 §5.1.1 notes the peer MAY advertise fewer via SETTINGS;
-    /// this is the worst-case local reservation.
-    pub const max_streams_per_connection = 100;
+    pub const worker_count: u16 = 2;
+    pub const worker_count_max: u16 = 128;
 
-    /// Per-connection receive-window ceiling in bytes.
-    pub const bytes_per_connection = 64 * KiB;
-
-    /// Largest frame payload we accept (RFC 7540 §4.2 minimum is 16384).
-    pub const max_frame_size_bytes = 16 * KiB;
-
-    /// Maximum uncompressed header block size.  RFC 7540 §10.3 recommends
-    /// at least 8KB capacity; HPACK dynamic-table entries may occupy this.
-    pub const max_header_size_bytes = 8 * KiB;
-
-    /// Per-stream data buffer (minimum 16KB per RFC 7540 §6.9.2).
-    pub const max_data_buffer_bytes = 16 * KiB;
-
-    /// Worker threads spun up for request processing.
-    pub const worker_count = 2;
-
-    /// Minimum stack allocation per worker thread.
-    pub const stack_bytes_per_thread = 128 * KiB;
-
-    // -----------------------------------------------------------------------
-    //  Derived sizes – kept manually in sync with StreamInstance inline
-    //  buffers so that the budget is always the ceiling.
-    // -----------------------------------------------------------------------
+    pub const wait_registrations_per_connection: u32 = 2;
+    pub const wait_registrations_listener: u32 = 1;
+    pub const event_loop_fibers_per_connection: u32 = 1;
+    pub const wait_registration_bytes_max: usize = 128;
+    pub const wait_map_fixed_bytes_max: usize = 256;
+    pub const worker_stack_reservation_bytes_max: usize = 320 * KiB;
+    pub const event_loop_control_memory_bytes_max: usize = 2 * MiB;
 
     pub const stream_header_fragments_bytes = max_header_size_bytes;
     pub const stream_headers_storage_bytes = max_header_size_bytes;
     pub const stream_request_body_bytes = max_data_buffer_bytes;
-    pub const stream_response_body_bytes = 256;
-    pub const stream_headers_array_bytes = 64 * @sizeOf(struct { name: []const u8, value: []const u8 });
-    pub const stream_metadata_bytes = 512;
+    pub const stream_response_body_capacity_bytes: usize = 256;
+    pub const stream_response_body_bytes: usize = 272;
+    pub const stream_headers_array_bytes = 64 * @sizeOf(struct {
+        name: []const u8,
+        value: []const u8,
+    });
+    pub const stream_metadata_bytes: usize = 2 * KiB;
 
     pub const stream_instance_bytes =
         stream_header_fragments_bytes +
@@ -70,157 +62,357 @@ pub const MemBudget = struct {
     pub const stream_storage_lookup_bytes =
         256 * (@sizeOf(u32) + @sizeOf(u8)) +
         max_streams_per_connection * (@sizeOf(u32) + @sizeOf(bool));
-
     pub const stream_storage_bytes =
-        max_streams_per_connection * stream_instance_bytes + stream_storage_lookup_bytes;
+        max_streams_per_connection * stream_instance_bytes +
+        stream_storage_lookup_bytes;
 
-    pub const connection_slot_overhead_bytes = 64;
-    pub const connection_slot_bytes = stream_storage_bytes + connection_slot_overhead_bytes;
-
-    pub const server_overhead_bytes = 16 * KiB;
-
+    pub const connection_slot_overhead_bytes: usize = 64;
+    pub const connection_slot_bytes =
+        stream_storage_bytes + connection_slot_overhead_bytes;
     pub const stream_memory_per_connection =
         max_streams_per_connection * stream_instance_bytes;
-
     pub const connection_memory_bytes = max_connections * connection_slot_bytes;
-    pub const worker_memory_bytes = worker_count * stack_bytes_per_thread;
-    pub const total_required_bytes = connection_memory_bytes +
-        worker_memory_bytes + server_overhead_bytes;
+
+    pub const io_buffer_memory_bytes =
+        max_connections * max_io_buffer_size_bytes * 2;
+    pub const event_loop_fiber_bytes_max: usize = 528 * KiB;
+    pub const event_loop_fiber_count =
+        max_connections * event_loop_fibers_per_connection;
+    pub const wait_registration_count_per_thread_max =
+        max_connections * wait_registrations_per_connection +
+        wait_registrations_listener;
+    pub const event_loop_allocator_memory_bytes_max =
+        eventLoopAllocatorBytesMax(
+            worker_count_max,
+            event_loop_fiber_count,
+            wait_registration_count_per_thread_max,
+        ) catch @compileError("maximum event-loop allocator budget overflowed");
+    pub const worker_memory_bytes_max = workerStackBytesMax(worker_count_max) catch
+        @compileError("maximum worker stack budget overflowed");
+    pub const hpack_thread_local_memory_bytes_max =
+        worker_count_max * Hpack.scratch_buffer_size;
+    pub const server_overhead_bytes: usize = 16 * KiB;
+
+    pub const total_required_bytes =
+        connection_memory_bytes +
+        io_buffer_memory_bytes +
+        event_loop_allocator_memory_bytes_max +
+        worker_memory_bytes_max +
+        hpack_thread_local_memory_bytes_max +
+        server_overhead_bytes;
 
     comptime {
-        const system_limit_bytes = 8 * GiB;
         if (total_required_bytes > system_limit_bytes) {
-            @compileError("Memory budget exceeds system limit: " ++
-                std.fmt.comptimePrint("{d}MB required > {d}MB limit", .{
-                    total_required_bytes / MiB, system_limit_bytes / MiB,
-                }));
+            @compileError("maximum HTTP/2 memory budget exceeds 8 GiB");
         }
-        if (worker_count == 0 or worker_count > 128) {
-            @compileError("Invalid worker count: must be between 1-128");
-        }
+        if (worker_count == 0) @compileError("worker_count must be positive");
+        if (worker_count > worker_count_max) @compileError("worker_count exceeds ceiling");
     }
 
-    /// Print the budget to the log so operators can sanity-check sizing
-    /// before deployment.
-    pub fn printBudget() void {
-        std.log.info("Memory Budget:", .{});
-        std.log.info("  Max Connections: {d}", .{max_connections});
-        std.log.info("  Max Streams/Conn: {d}", .{max_streams_per_connection});
-        std.log.info("  Stream Instance: {d}KB", .{stream_instance_bytes / KiB});
-        std.log.info("  StreamStorage/Conn: {d}KB", .{stream_storage_bytes / KiB});
-        std.log.info("  Connection Slots: {d}MB", .{connection_memory_bytes / MiB});
-        std.log.info("  Worker Threads: {d}", .{worker_count});
-        std.log.info("  Worker Memory: {d}MB", .{worker_memory_bytes / MiB});
-        std.log.info("  Server Overhead: {d}MB", .{server_overhead_bytes / MiB});
-        std.log.info("  Total Required: {d}MB", .{total_required_bytes / MiB});
+    pub fn printMaximum() void {
+        std.log.info("HTTP/2 static memory ceiling: {d} MiB", .{
+            total_required_bytes / MiB,
+        });
+        std.log.info("  connections: {d}", .{max_connections});
+        std.log.info("  streams per connection: {d}", .{max_streams_per_connection});
+        std.log.info("  event-loop fibers: {d}", .{event_loop_fiber_count});
+        std.log.info("  event-loop threads maximum: {d}", .{worker_count_max});
     }
 };
 
-const StaticAllocator = @import("static_allocator.zig");
+pub const RuntimePlan = struct {
+    connection_count: u32,
+    worker_count: u16,
+    fiber_count: u32,
+    wait_registration_count_per_thread: u32,
+    wait_registration_count_total: usize,
+    io_buffer_bytes: usize,
+    event_loop_allocator_bytes_max: usize,
+    worker_stack_bytes_max: usize,
+    hpack_thread_local_bytes_max: usize,
+    core_memory_bytes_max: usize,
 
-/// Single phase-gated allocator wrapping the caller-supplied heap.
-/// All server-level allocations flow through this; it is frozen before
-/// the event loop starts so that any accidental runtime allocation
-/// triggers an assertion failure.
+    pub fn init(
+        connection_count: u32,
+        io_buffer_size: u32,
+        worker_count: u16,
+    ) !RuntimePlan {
+        try validateCounts(connection_count, io_buffer_size, worker_count);
+
+        const io_buffer_bytes = try multiply3(
+            connection_count,
+            io_buffer_size,
+            2,
+        );
+        const wait_registration_count = std.math.mul(
+            u32,
+            connection_count,
+            MemBudget.wait_registrations_per_connection,
+        ) catch return error.MemoryBudgetOverflow;
+        const wait_registration_count_per_thread = std.math.add(
+            u32,
+            wait_registration_count,
+            MemBudget.wait_registrations_listener,
+        ) catch return error.MemoryBudgetOverflow;
+        const wait_registration_count_total = std.math.mul(
+            usize,
+            wait_registration_count_per_thread,
+            worker_count,
+        ) catch return error.MemoryBudgetOverflow;
+        const event_loop_allocator_bytes_max = try eventLoopAllocatorBytesMax(
+            worker_count,
+            connection_count,
+            wait_registration_count_per_thread,
+        );
+        const worker_stack_bytes_max = try workerStackBytesMax(worker_count);
+        const hpack_thread_local_bytes_max = std.math.mul(
+            usize,
+            worker_count,
+            Hpack.scratch_buffer_size,
+        ) catch return error.MemoryBudgetOverflow;
+
+        var plan: RuntimePlan = .{
+            .connection_count = connection_count,
+            .worker_count = worker_count,
+            .fiber_count = connection_count,
+            .wait_registration_count_per_thread = wait_registration_count_per_thread,
+            .wait_registration_count_total = wait_registration_count_total,
+            .io_buffer_bytes = io_buffer_bytes,
+            .event_loop_allocator_bytes_max = event_loop_allocator_bytes_max,
+            .worker_stack_bytes_max = worker_stack_bytes_max,
+            .hpack_thread_local_bytes_max = hpack_thread_local_bytes_max,
+            .core_memory_bytes_max = 0,
+        };
+        plan.core_memory_bytes_max = try plan.totalMemoryBytesForSlots(
+            MemBudget.connection_slot_bytes,
+            io_buffer_bytes,
+        );
+        return plan;
+    }
+
+    pub fn totalMemoryBytesForSlots(
+        self: RuntimePlan,
+        connection_slot_size: usize,
+        separate_io_buffer_bytes: usize,
+    ) !usize {
+        const slot_bytes = std.math.mul(
+            usize,
+            self.connection_count,
+            connection_slot_size,
+        ) catch return error.MemoryBudgetOverflow;
+
+        var total = try addBytes(slot_bytes, separate_io_buffer_bytes);
+        total = try addBytes(total, self.event_loop_allocator_bytes_max);
+        total = try addBytes(total, self.worker_stack_bytes_max);
+        total = try addBytes(total, self.hpack_thread_local_bytes_max);
+        total = try addBytes(total, MemBudget.server_overhead_bytes);
+        if (total > MemBudget.system_limit_bytes) return error.MemoryBudgetExceedsSystemLimit;
+        return total;
+    }
+};
+
+pub const AllocatorSnapshot = struct {
+    allocations_live: usize,
+    bytes_live: usize,
+    bytes_reserved: usize,
+    state: StaticAllocator.State,
+};
+
 var static_allocator_global: StaticAllocator = undefined;
 var static_allocator_initialized: bool = false;
+
+pub fn initStaticAllocator(backing_allocator: std.mem.Allocator) !void {
+    if (static_allocator_initialized) return error.StaticAllocatorAlreadyInitialized;
+
+    static_allocator_global = StaticAllocator.init(backing_allocator);
+    static_allocator_initialized = true;
+    MemBudget.printMaximum();
+}
 
 pub fn isStaticAllocatorInitialized() bool {
     return static_allocator_initialized;
 }
 
-/// Wrap the caller's allocator in a phase-gated StaticAllocator and print
-/// the memory budget.  Safe to call multiple times (second call is a no-op)
-/// so that both `http2.init()` and test suites can call it.
-pub fn initStaticAllocator(backing_allocator: std.mem.Allocator) !void {
-    if (static_allocator_initialized) return;
-
-    static_allocator_global = StaticAllocator.init(backing_allocator);
-    static_allocator_initialized = true;
-    MemBudget.printBudget();
+pub fn backingAllocatorMatches(candidate: std.mem.Allocator) bool {
+    if (!static_allocator_initialized) return false;
+    const static_allocator = staticAllocatorPtr();
+    return static_allocator.parent_allocator.ptr == candidate.ptr and
+        static_allocator.parent_allocator.vtable == candidate.vtable;
 }
 
-/// Return a pointer to the phase-gated allocator.
-/// Precondition: `initStaticAllocator` must have been called.
 pub fn staticAllocatorPtr() *StaticAllocator {
-    std.debug.assert(static_allocator_initialized);
+    if (!static_allocator_initialized) @panic("http2.init() must run before allocation");
     return &static_allocator_global;
 }
 
-/// Freeze the phase-gated allocator so that any `alloc`, `resize`, or
-/// `remap` call will assert-fail.  Call after all server init is complete.
 pub fn freezeStaticAllocator() void {
-    std.debug.assert(static_allocator_initialized);
-    if (static_allocator_global.state == .init) {
-        static_allocator_global.transition_from_init_to_static();
+    staticAllocatorPtr().transition_from_init_to_static();
+}
+
+pub fn beginStaticAllocatorDeinit() void {
+    const static_allocator = staticAllocatorPtr();
+    switch (static_allocator.state) {
+        .init => static_allocator.transition_from_init_to_deinit(),
+        .static => static_allocator.transition_from_static_to_deinit(),
+        .deinit => {},
     }
 }
 
-/// Unfreeze for shutdown; allows `free` but not `alloc`.
-/// State may already be `.deinit` if resources were freed via errdefer
-/// before the explicit shutdown sequence.
-pub fn unfreezeStaticAllocator() void {
-    std.debug.assert(static_allocator_initialized);
-    if (static_allocator_global.state == .static) {
-        static_allocator_global.transition_from_static_to_deinit();
-    }
-}
-
-/// Deinitialize the phase-gated allocator and mark it as uninitialized.
 pub fn deinitStaticAllocator() void {
     if (!static_allocator_initialized) return;
 
-    unfreezeStaticAllocator();
+    beginStaticAllocatorDeinit();
     static_allocator_global.deinit();
     static_allocator_initialized = false;
 }
 
-// -----------------------------------------------------------------------
-//  Tests
-// -----------------------------------------------------------------------
-
-test "MemBudget constants are consistent" {
-    try std.testing.expect(MemBudget.total_required_bytes > 0);
-    try std.testing.expect(MemBudget.total_required_bytes < 8 * GiB);
-    try std.testing.expect(MemBudget.worker_count > 0);
-    try std.testing.expect(MemBudget.worker_count <= 128);
-
-    // The stream instance must be at least large enough to hold the
-    // mandatory inline buffers.
-    const minimum_stream_bytes = MemBudget.stream_header_fragments_bytes +
-        MemBudget.stream_request_body_bytes;
-    try std.testing.expect(MemBudget.stream_instance_bytes >= minimum_stream_bytes);
-
-    // Connection-level totals must exceed per-stream storage.
-    try std.testing.expect(MemBudget.connection_memory_bytes > MemBudget.stream_memory_per_connection);
+pub fn allocatorSnapshot() AllocatorSnapshot {
+    const static_allocator = staticAllocatorPtr();
+    return .{
+        .allocations_live = static_allocator.allocations_live,
+        .bytes_live = static_allocator.bytes_live,
+        .bytes_reserved = static_allocator.bytes_reserved,
+        .state = static_allocator.state,
+    };
 }
 
-test "StaticAllocator init → freeze → unfreeze → deinit lifecycle" {
-    const allocator = std.testing.allocator;
-
-    try initStaticAllocator(allocator);
-    defer deinitStaticAllocator();
-
-    const alloc = staticAllocatorPtr().allocator();
-    const mem = try alloc.alloc(u8, 64);
-
-    freezeStaticAllocator();
-
-    unfreezeStaticAllocator();
-    alloc.free(mem);
+fn validateCounts(connection_count: u32, io_buffer_size: u32, worker_count: u16) !void {
+    if (connection_count == 0) return error.InvalidConnectionCount;
+    if (connection_count > MemBudget.max_connections) return error.ConnectionCountExceedsBudget;
+    if (io_buffer_size < 1024) return error.InvalidIoBufferSize;
+    if (io_buffer_size > MemBudget.max_io_buffer_size_bytes) {
+        return error.IoBufferSizeExceedsBudget;
+    }
+    if (worker_count == 0) return error.InvalidWorkerCount;
+    if (worker_count > MemBudget.worker_count_max) return error.WorkerCountExceedsBudget;
 }
 
-test "StaticAllocator prevents alloc after freeze" {
-    const allocator = std.testing.allocator;
+fn eventLoopAllocatorBytesMax(
+    worker_count: u16,
+    fiber_count: u32,
+    wait_registration_count_per_thread: u32,
+) !usize {
+    if (comptime has_kqueue_backend) {
+        return Kqueue.allocatorBytesMax(.{
+            .n_threads = worker_count,
+            .max_concurrent_tasks = fiber_count,
+            .max_wait_registrations_per_thread = wait_registration_count_per_thread,
+        }) catch |err| switch (err) {
+            error.InvalidCapacity => error.InvalidWorkerCount,
+            error.Overflow => error.MemoryBudgetOverflow,
+        };
+    }
 
-    try initStaticAllocator(allocator);
-    defer deinitStaticAllocator();
+    const fiber_bytes = std.math.mul(
+        usize,
+        fiber_count,
+        MemBudget.event_loop_fiber_bytes_max,
+    ) catch return error.MemoryBudgetOverflow;
+    const registration_bytes = std.math.mul(
+        usize,
+        wait_registration_count_per_thread,
+        MemBudget.wait_registration_bytes_max,
+    ) catch return error.MemoryBudgetOverflow;
+    const map_bytes = try addBytes(
+        MemBudget.wait_map_fixed_bytes_max,
+        registration_bytes,
+    );
+    const all_map_bytes = std.math.mul(
+        usize,
+        worker_count,
+        map_bytes,
+    ) catch return error.MemoryBudgetOverflow;
+    const allocator_bytes = try addBytes(fiber_bytes, all_map_bytes);
+    return addBytes(allocator_bytes, MemBudget.event_loop_control_memory_bytes_max);
+}
 
-    const alloc = staticAllocatorPtr().allocator();
-    const mem = try alloc.alloc(u8, 64);
+fn workerStackBytesMax(worker_count: u16) !usize {
+    if (worker_count == 0) return error.InvalidWorkerCount;
+    const spawned_worker_count = worker_count - 1;
+    const bytes_per_worker = if (has_kqueue_backend)
+        Kqueue.worker_stack_reservation_bytes_max
+    else
+        MemBudget.worker_stack_reservation_bytes_max;
+    return std.math.mul(usize, spawned_worker_count, bytes_per_worker) catch {
+        return error.MemoryBudgetOverflow;
+    };
+}
+
+fn addBytes(a: usize, b: usize) !usize {
+    return std.math.add(usize, a, b) catch error.MemoryBudgetOverflow;
+}
+
+fn multiply3(a: u32, b: u32, c: u32) !usize {
+    const product_ab = std.math.mul(usize, a, b) catch {
+        return error.MemoryBudgetOverflow;
+    };
+    return std.math.mul(usize, product_ab, c) catch {
+        return error.MemoryBudgetOverflow;
+    };
+}
+
+test "runtime plan bounds HTTP/2 resources" {
+    const plan = try RuntimePlan.init(8, 16 * KiB, 2);
+
+    try std.testing.expectEqual(@as(u32, 8), plan.connection_count);
+    try std.testing.expectEqual(@as(u32, 8), plan.fiber_count);
+    try std.testing.expectEqual(@as(u32, 17), plan.wait_registration_count_per_thread);
+    try std.testing.expectEqual(@as(usize, 34), plan.wait_registration_count_total);
+    try std.testing.expectEqual(@as(usize, 256 * KiB), plan.io_buffer_bytes);
+    try std.testing.expect(plan.event_loop_allocator_bytes_max > 0);
+    try std.testing.expectEqual(
+        @as(usize, 2 * Hpack.scratch_buffer_size),
+        plan.hpack_thread_local_bytes_max,
+    );
+    try std.testing.expect(plan.core_memory_bytes_max <= MemBudget.total_required_bytes);
+}
+
+test "maximum runtime plan is covered by the published ceiling" {
+    const plan = try RuntimePlan.init(
+        MemBudget.max_connections,
+        MemBudget.max_io_buffer_size_bytes,
+        MemBudget.worker_count_max,
+    );
+
+    try std.testing.expectEqual(
+        MemBudget.event_loop_allocator_memory_bytes_max,
+        plan.event_loop_allocator_bytes_max,
+    );
+    try std.testing.expectEqual(MemBudget.total_required_bytes, plan.core_memory_bytes_max);
+}
+
+test "runtime plan rejects resources outside the static ceiling" {
+    try std.testing.expectError(
+        error.InvalidConnectionCount,
+        RuntimePlan.init(0, 16 * KiB, 2),
+    );
+    try std.testing.expectError(
+        error.ConnectionCountExceedsBudget,
+        RuntimePlan.init(MemBudget.max_connections + 1, 16 * KiB, 2),
+    );
+    try std.testing.expectError(
+        error.IoBufferSizeExceedsBudget,
+        RuntimePlan.init(1, MemBudget.max_io_buffer_size_bytes + 1, 2),
+    );
+    try std.testing.expectError(
+        error.WorkerCountExceedsBudget,
+        RuntimePlan.init(1, 16 * KiB, MemBudget.worker_count_max + 1),
+    );
+}
+
+test "static allocator lifecycle records startup bytes" {
+    try initStaticAllocator(std.testing.allocator);
+    try std.testing.expect(backingAllocatorMatches(std.testing.allocator));
+    try std.testing.expect(!backingAllocatorMatches(std.heap.page_allocator));
+    const allocator_instance = staticAllocatorPtr().allocator();
+    const allocation = try allocator_instance.alloc(u8, 64);
 
     freezeStaticAllocator();
-    // alloc after freeze would @panic; cannot test without process isolation.
-    unfreezeStaticAllocator();
-    alloc.free(mem);
+    const snapshot = allocatorSnapshot();
+    try std.testing.expectEqual(@as(usize, 64), snapshot.bytes_reserved);
+    try std.testing.expectEqual(StaticAllocator.State.static, snapshot.state);
+
+    beginStaticAllocatorDeinit();
+    allocator_instance.free(allocation);
+    deinitStaticAllocator();
 }

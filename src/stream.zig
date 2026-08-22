@@ -101,43 +101,6 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
         const HeaderBufferSize = memory_budget.MemBudget.max_header_size_bytes;
         const HeaderCountMax = 64;
 
-        // Per-stream scratch the dispatcher can format small response bodies
-        // into without touching the heap. 256 bytes covers numeric, status, or
-        // short text replies (the hot benchmark path); larger payloads must
-        // continue to use the request allocator. Sizing is a compile-time
-        // tradeoff between covering the common case and per-connection memory.
-        const ResponseBodyStorageSize: usize = 256;
-
-        // Static memory allocation for streams
-        const StreamPool = struct {
-            streams: [MaxStreamCount]?*Self.StreamInstance = [_]?*Self.StreamInstance{null} ** MaxStreamCount,
-            next_free: u32 = 0,
-
-            fn allocate(self: *StreamPool, allocator: std.mem.Allocator) !*Self.StreamInstance {
-                if (self.next_free >= MaxStreamCount) return error.StreamPoolExhausted;
-
-                const stream = try allocator.create(Self.StreamInstance);
-                self.streams[self.next_free] = stream;
-                const index = self.next_free;
-                self.next_free += 1;
-                return self.streams[index].?;
-            }
-
-            fn deallocate(self: *StreamPool, stream: *Self.StreamInstance, allocator: std.mem.Allocator) void {
-                for (self.streams[0..self.next_free], 0..) |s, i| {
-                    if (s == stream) {
-                        allocator.destroy(stream);
-                        self.streams[i] = null;
-                        // Compact the pool to maintain efficiency
-                        if (i == self.next_free - 1) {
-                            self.next_free -= 1;
-                        }
-                        return;
-                    }
-                }
-            }
-        };
-
         // Stream instance with static buffer allocation
         pub const StreamInstance = struct {
             // Core stream identification and state
@@ -169,10 +132,9 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
             total_data_received: usize,
             request_body_storage: [memory_budget.MemBudget.max_data_buffer_bytes]u8,
             request_body_len: usize,
-            // Scratch the request handler formats small response bodies into,
-            // owned by the stream so the body slice on `response` stays valid
-            // until the stream slot is released. See `ResponseBodyStorageSize`.
-            response_body_storage: [ResponseBodyStorageSize]u8,
+            // Scratch for a buffered body or in-place streaming source state.
+            // The two uses are mutually exclusive for a response.
+            response_body_storage: handler.StreamStateStorage,
             request_headers_complete: bool,
             request_complete: bool,
             response_writer: ResponseWriter,
@@ -215,7 +177,7 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     .total_data_received = 0,
                     .request_body_storage = undefined,
                     .request_body_len = 0,
-                    .response_body_storage = undefined,
+                    .response_body_storage = handler.StreamStateStorage.init(id),
                     .request_headers_complete = false,
                     .request_complete = false,
                     .response_writer = undefined,
@@ -373,37 +335,39 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 // Check for overflow - this can happen when window exceeds 2^31-1
                 if (overflowed != 0 or new_window > 2147483647) {
                     log.err("Stream {} flow control window overflow: FLOW_CONTROL_ERROR\n", .{self.id});
-                    try self.sendRstStream(0x3);
-                    return error.FlowControlError;
-                }
-                // Check for underflow (should not happen with positive increment, but be safe)
-                if (new_window < 0) {
-                    log.err("Stream {} flow control window underflow: {} below 0: FLOW_CONTROL_ERROR\n", .{ self.id, new_window });
-                    try self.sendRstStream(0x3);
                     return error.FlowControlError;
                 }
 
+                // SETTINGS_INITIAL_WINDOW_SIZE may make a stream window
+                // negative. A WINDOW_UPDATE can legally leave it negative.
                 self.send_window_size = new_window;
             }
 
-            // High-performance data sending with static buffers
-            pub fn sendData(self: *Self.StreamInstance, data: []const u8, end_stream: bool) !void {
-                // Exhaustive state validation
+            /// Low-level single-frame primitive for protocol/client machinery.
+            /// It does not enforce HEADERS sequencing or response ownership.
+            /// Server handlers must use `ResponseBuilder.stream()` instead.
+            pub fn sendDataFrameUnsafe(
+                self: *Self.StreamInstance,
+                data: []const u8,
+                end_stream: bool,
+            ) !void {
                 switch (self.state) {
                     .Open, .HalfClosedRemote => {},
                     else => return error.InvalidStreamState,
                 }
 
-                if (self.send_window_size <= 0) {
-                    return error.FlowControlError;
+                if (data.len > self.conn.settings.peer_max_frame_size) {
+                    return error.FrameSizeError;
                 }
-
-                const send_window_size: usize = @intCast(self.send_window_size);
-                if (data.len > send_window_size) {
-                    return error.FlowControlError;
+                if (data.len > 0) {
+                    if (self.send_window_size <= 0) return error.FlowControlError;
+                    if (self.conn.send_window_size <= 0) return error.FlowControlError;
+                    const stream_window: usize = @intCast(self.send_window_size);
+                    const connection_window: usize = @intCast(self.conn.send_window_size);
+                    if (data.len > stream_window or data.len > connection_window) {
+                        return error.FlowControlError;
+                    }
                 }
-
-                self.send_window_size -= @intCast(data.len);
 
                 const frame_flags = if (end_stream) FrameFlags.init(FrameFlags.END_STREAM) else FrameFlags.init(0);
 
@@ -419,6 +383,8 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 };
 
                 try frame.write(self.conn.writer);
+                self.send_window_size -= @intCast(data.len);
+                self.conn.send_window_size -= @intCast(data.len);
 
                 if (end_stream) {
                     self.state = transitionState(self.state, .SendEndStream);
@@ -652,7 +618,6 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 switch (self.state) {
                     .Idle => {
                         log.err("WINDOW_UPDATE received on idle stream {}: PROTOCOL_ERROR\n", .{self.id});
-                        try self.sendRstStream(0x1);
                         return error.ProtocolError;
                     },
                     .Closed => {
@@ -664,25 +629,22 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
                 if (frame.payload.len != 4) {
                     log.err("WINDOW_UPDATE frame with invalid payload length {} (expected 4): FRAME_SIZE_ERROR\n", .{frame.payload.len});
-                    try self.conn.send_goaway(0, 0x6, "WINDOW_UPDATE frame with invalid payload length: FRAME_SIZE_ERROR");
                     return error.FrameSizeError;
                 }
 
-                const increment = std.mem.readInt(u32, frame.payload[0..4], .big);
+                const increment =
+                    std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF;
 
                 if (increment == 0) {
                     log.err("WINDOW_UPDATE received with increment 0 on stream {}: PROTOCOL_ERROR\n", .{self.id});
                     try self.sendRstStream(0x1);
-                    return error.ProtocolError;
+                    return;
                 }
 
-                if (increment > 0x7FFFFFFF) {
-                    log.err("WINDOW_UPDATE increment {} exceeds maximum on stream {}: FLOW_CONTROL_ERROR\n", .{ increment, self.id });
+                self.updateSendWindow(@intCast(increment)) catch |err| {
+                    if (err != error.FlowControlError) return err;
                     try self.sendRstStream(0x3);
-                    return error.FlowControlError;
-                }
-
-                try self.updateSendWindow(@intCast(increment));
+                };
             }
 
             fn handleRstStream(self: *Self.StreamInstance, frame: Frame) !void {
@@ -1064,28 +1026,6 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                 self.priority.incremental = true;
             }
         };
-
-        // Public API for the generic Stream type
-        pool: StreamPool = StreamPool{},
-
-        pub fn createStream(self: *Self, allocator: std.mem.Allocator, conn: *Connection, id: u32) !*Self.StreamInstance {
-            const stream = try self.pool.allocate(allocator);
-            stream.init(conn, id);
-            return stream;
-        }
-
-        pub fn destroyStream(self: *Self, stream: *Self.StreamInstance, allocator: std.mem.Allocator) void {
-            stream.deinit();
-            self.pool.deallocate(stream, allocator);
-        }
-
-        // Static factory method for compatibility with connection code
-        pub fn init(allocator: std.mem.Allocator, conn: anytype, id: u32) !*Self.StreamInstance {
-            var pool = StreamPool{};
-            const stream = try pool.allocate(allocator);
-            stream.init(conn, id);
-            return stream;
-        }
     };
 }
 
@@ -1107,7 +1047,10 @@ fn isConnectionSpecificHeader(header_name: []const u8) bool {
     return false;
 }
 
-pub const DefaultStream = Stream(16, 1000); // 64KB window, 1000 max streams
+pub const DefaultStream = Stream(
+    16,
+    @intCast(memory_budget.MemBudget.max_streams_per_connection),
+);
 
 comptime {
     const Instance = DefaultStream.StreamInstance;
@@ -1177,7 +1120,7 @@ test "CONNECT defaults request priority to incremental" {
     var buffer: [1024]u8 = undefined;
     var test_io = TestIo.init(&.{}, &buffer);
 
-    var connection = try Connection.init(
+    var connection = try Connection.initOwnedForTesting(
         arena.allocator(),
         &test_io.reader,
         &test_io.writer,
@@ -1202,7 +1145,7 @@ test "CONNECT priority header overrides default incremental behavior" {
     var buffer: [1024]u8 = undefined;
     var test_io = TestIo.init(&.{}, &buffer);
 
-    var connection = try Connection.init(
+    var connection = try Connection.initOwnedForTesting(
         arena.allocator(),
         &test_io.reader,
         &test_io.writer,

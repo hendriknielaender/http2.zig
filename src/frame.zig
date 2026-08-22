@@ -104,7 +104,9 @@ pub const FrameHeader = struct {
         var buffer: [9]u8 = undefined;
         try reader.readSliceAll(&buffer);
         // Parse the 24-bit length from the first three bytes
-        const length: u32 = (@as(u32, buffer[0]) << 16) | (@as(u32, buffer[1]) << 8) | @as(u32, buffer[2]);
+        const length: u32 = (@as(u32, buffer[0]) << 16) |
+            (@as(u32, buffer[1]) << 8) |
+            @as(u32, buffer[2]);
         // Ensure the length is within 24 bits
         if (length > 0xFFFFFF) {
             return error.InvalidFrameLength;
@@ -153,11 +155,7 @@ pub const Frame = struct {
     pub fn init(header: FrameHeader, payload: []const u8) Frame {
         return Frame{ .header = header, .payload = payload };
     }
-    pub fn deinit(self: *Frame, allocator: std.mem.Allocator) void {
-        allocator.free(self.payload);
-        self.payload = &[_]u8{};
-    }
-    pub fn read(reader: *std.Io.Reader, allocator: std.mem.Allocator) !Frame {
+    pub fn read(reader: *std.Io.Reader, payload_buffer: []u8) !Frame {
         const header = try FrameHeader.read(reader);
         var payload_length = header.length;
         var padding_length: ?u8 = null;
@@ -168,7 +166,8 @@ pub const Frame = struct {
             }
             payload_length -= @as(u32, padding_length.? + 1); // Subtract padding length
         }
-        const payload = try allocator.alloc(u8, payload_length);
+        if (payload_length > payload_buffer.len) return error.FrameBufferTooSmall;
+        const payload = payload_buffer[0..payload_length];
         try reader.readSliceAll(payload);
         if (padding_length != null) {
             _ = try reader.discard(.limited(padding_length.?));
@@ -216,9 +215,7 @@ test "frame header read and write" {
     assert(read_header.stream_id == header.stream_id);
 }
 test "frame read and write" {
-    var allocator_buffer: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&allocator_buffer);
-    const allocator = fba.allocator();
+    var payload_buffer: [4096]u8 = undefined;
     var io_buffer: [4096]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&io_buffer);
     var payload: [16]u8 = undefined;
@@ -235,7 +232,7 @@ test "frame read and write" {
     try frame.write(&writer);
 
     var reader: std.Io.Reader = .fixed(writer.buffered());
-    const read_frame = try Frame.read(&reader, allocator);
+    const read_frame = try Frame.read(&reader, &payload_buffer);
     assert(read_frame.header.length == frame.header.length);
     assert(read_frame.header.frame_type == frame.header.frame_type);
     assert(read_frame.header.flags.value == frame.header.flags.value);

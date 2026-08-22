@@ -41,6 +41,7 @@ pub const ResponseWriter = struct {
     response_header_block_len: usize,
     response_headers_sent: bool,
     response_body_sent: usize,
+    response_stream_ended: bool,
 
     /// Points into the stream's `header_block_fragments_buf` so that the
     /// HPACK encoder reuses the same storage that receives request fragments.
@@ -56,6 +57,7 @@ pub const ResponseWriter = struct {
             .response_header_block_len = 0,
             .response_headers_sent = false,
             .response_body_sent = 0,
+            .response_stream_ended = false,
             .header_fragments_buffer = header_fragments_buffer,
         };
     }
@@ -75,6 +77,7 @@ pub const ResponseWriter = struct {
         if (!self.response_prepared) return false;
         if (!self.response_headers_sent) return false;
         const response = self.response orelse return false;
+        if (response.hasStream()) return self.response_stream_ended;
         return self.response_body_sent >= response.body.len;
     }
 
@@ -86,6 +89,7 @@ pub const ResponseWriter = struct {
             if (method == .head) return true;
         }
         if (!self.response_prepared) return false;
+        if (self.response.?.hasStream()) return false;
         return self.response.?.body.len == 0;
     }
 
@@ -96,6 +100,7 @@ pub const ResponseWriter = struct {
 
     pub fn body(self: *const ResponseWriter) []const u8 {
         assert(self.response_prepared);
+        assert(!self.response.?.hasStream());
         return self.response.?.body;
     }
 
@@ -105,12 +110,12 @@ pub const ResponseWriter = struct {
     /// directly to the transport without a copy.
     pub fn encode(
         self: *ResponseWriter,
-        response: *const handler.Response,
+        response: *handler.Response,
         encoder_table: *Hpack.DynamicTable,
-        allocator: std.mem.Allocator,
     ) !void {
         assert(!self.response_prepared);
         assert(response.body.len <= 1024 * 1024);
+        assert(!response.hasStream() or response.body.len == 0);
 
         var encoded = std.ArrayList(u8).initBuffer(self.header_fragments_buffer);
         var status_storage: [3]u8 = undefined;
@@ -124,19 +129,17 @@ pub const ResponseWriter = struct {
             .{ .name = ":status", .value = status_code },
             encoder_table,
             &encoded,
-            allocator,
         );
         for (response.headers()) |header_field| {
             try Hpack.encodeHeaderField(
                 .{ .name = header_field.name, .value = header_field.value },
                 encoder_table,
                 &encoded,
-                allocator,
             );
         }
 
         self.response_header_block_len = encoded.items.len;
-        self.response = response.*;
+        self.response = response.take();
         self.response_prepared = true;
     }
 };
@@ -154,6 +157,7 @@ pub fn sendResponseHeaders(
     conn: *Connection,
 ) !void {
     const writer = &stream.response_writer;
+    if (writer.response_headers_sent) return;
     const headers_block = writer.headersBlock();
     const end_stream = writer.shouldEndStreamWithHeaders(stream.request_method);
 
@@ -198,11 +202,16 @@ pub fn sendResponseBody(
     if (!writer.response_headers_sent) return;
     if (stream.request_method == .head) return;
 
+    if (writer.response.?.hasStream()) {
+        try sendStreamingResponseBody(stream, conn);
+        return;
+    }
+
     const body_slice = writer.body();
     if (writer.response_body_sent >= body_slice.len) return;
 
     const remaining_len = body_slice.len - writer.response_body_sent;
-    const frame_limit: usize = @intCast(conn.settings.max_frame_size);
+    const frame_limit: usize = @intCast(conn.settings.peer_max_frame_size);
     const conn_window = connectionResponseWindowAvailable(conn.send_window_size);
     const stream_window = connectionResponseWindowAvailable(stream.send_window_size);
     const response_len = @min(remaining_len, @min(frame_limit, @min(conn_window, stream_window)));
@@ -213,8 +222,7 @@ pub fn sendResponseBody(
     const end_stream = response_end == body_slice.len;
 
     log.debug("Sending DATA frame for stream {} ({} bytes)", .{ stream.id, response_len });
-    try stream.sendData(body_slice[response_start..response_end], end_stream);
-    conn.send_window_size -= @intCast(response_len);
+    try stream.sendDataFrameUnsafe(body_slice[response_start..response_end], end_stream);
     writer.response_body_sent = response_end;
 
     if (end_stream) {
@@ -222,6 +230,99 @@ pub fn sendResponseBody(
         assert(conn.completed_responses_pending < std.math.maxInt(u32));
         conn.completed_responses_pending += 1;
     }
+}
+
+fn sendStreamingResponseBody(
+    stream: *StreamInstanceType,
+    conn: *Connection,
+) !void {
+    const writer = &stream.response_writer;
+    if (writer.response_stream_ended) return;
+
+    const source = &writer.response.?.stream_source.?;
+    const finished_before_read = source.isFinished() catch |err| {
+        return resetStreamingResponse(stream, err);
+    };
+    if (finished_before_read) {
+        try finishStreamingResponse(stream, conn, "");
+        return;
+    }
+
+    const conn_window = connectionResponseWindowAvailable(conn.send_window_size);
+    const stream_window = connectionResponseWindowAvailable(stream.send_window_size);
+    const frame_limit: usize = @intCast(conn.settings.peer_max_frame_size);
+    const capacity = @min(
+        stream.header_block_fragments_buf.len,
+        @min(frame_limit, @min(conn_window, stream_window)),
+    );
+    if (capacity == 0) return;
+
+    const output = stream.header_block_fragments_buf[0..capacity];
+    const result = source.read(output) catch |err| {
+        return resetStreamingResponse(stream, err);
+    };
+    const finished = source.isFinished() catch |err| {
+        return resetStreamingResponse(stream, err);
+    };
+    const data = output[0..result.bytes_written];
+    try writeStreamingData(stream, conn, data, finished);
+}
+
+fn writeStreamingData(
+    stream: *StreamInstanceType,
+    conn: *Connection,
+    data: []const u8,
+    finished: bool,
+) !void {
+    const writer = &stream.response_writer;
+    const body_sent = checkedStreamBodySent(
+        writer.response_body_sent,
+        data.len,
+    ) catch return resetStreamingResponse(stream, error.StreamResponseTooLarge);
+
+    log.debug("Sending streaming DATA frame for stream {} ({} bytes)", .{
+        stream.id,
+        data.len,
+    });
+    try stream.sendDataFrameUnsafe(data, finished);
+    writer.response_body_sent = body_sent;
+
+    if (finished) markStreamingResponseComplete(stream, conn);
+}
+
+fn checkedStreamBodySent(body_sent: usize, data_len: usize) !usize {
+    return std.math.add(usize, body_sent, data_len) catch {
+        return error.StreamResponseTooLarge;
+    };
+}
+
+fn finishStreamingResponse(
+    stream: *StreamInstanceType,
+    conn: *Connection,
+    data: []const u8,
+) !void {
+    assert(data.len == 0);
+    try writeStreamingData(stream, conn, data, true);
+}
+
+fn markStreamingResponseComplete(
+    stream: *StreamInstanceType,
+    conn: *Connection,
+) void {
+    const writer = &stream.response_writer;
+    assert(!writer.response_stream_ended);
+    assert(stream.state == .Closed);
+    writer.response_stream_ended = true;
+    assert(conn.completed_responses_pending < std.math.maxInt(u32));
+    conn.completed_responses_pending += 1;
+}
+
+fn resetStreamingResponse(stream: *StreamInstanceType, err: anyerror) !void {
+    log.warn("Streaming response source failed on stream {d}: {s}", .{
+        stream.id,
+        @errorName(err),
+    });
+    try stream.sendRstStream(0x2);
 }
 
 // -----------------------------------------------------------------------
@@ -274,6 +375,17 @@ test "connectionResponseWindowAvailable returns uint for positive window" {
 test "connectionResponseWindowAvailable returns zero for non-positive window" {
     try std.testing.expectEqual(@as(usize, 0), connectionResponseWindowAvailable(0));
     try std.testing.expectEqual(@as(usize, 0), connectionResponseWindowAvailable(-1));
+}
+
+test "stream byte accounting rejects overflow" {
+    try std.testing.expectEqual(
+        @as(usize, 13),
+        try checkedStreamBodySent(8, 5),
+    );
+    try std.testing.expectError(
+        error.StreamResponseTooLarge,
+        checkedStreamBodySent(std.math.maxInt(usize), 1),
+    );
 }
 
 test "ResponseWriter isComplete false when not prepared" {

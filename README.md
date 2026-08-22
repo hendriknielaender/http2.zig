@@ -9,7 +9,7 @@
 
 **A high-performance HTTP/2 protocol implementation in Zig**
 
-Cross-platform • Zero allocations
+Cross-platform protocol core • Static Kqueue runtime
 
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
 [![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-orange.svg)](https://ziglang.org)
@@ -21,9 +21,9 @@ Cross-platform • Zero allocations
 
 ## Features
 
-- 🌍 **Cross-platform** support via Zig std.Io backends
-- 💾 **Zero runtime allocations** - all memory allocated at compile time
-- 🔒 **Lock-free** atomic operations for maximum concurrency
+- 🌍 **Cross-platform protocol core** with caller-owned readers, writers, and stream storage
+- 💾 **Static Zig memory on Kqueue** - bounded pools replace hot-path heap growth
+- 🔒 **Bounded concurrency** - fixed connection, stream, and event-loop task capacities
 - 🧩 **Bring your own router** - plug in any dispatcher or router you want
 - ✅ **HTTP/2 RFC 7540** compliant
 
@@ -90,6 +90,10 @@ pub fn main() !void {
 
     var server = try http2.Server.init(allocator, config);
     defer server.deinit();
+
+    // Seal the startup allocator after every server, client pool, and
+    // application resource has been created.
+    http2.freeze();
 
     std.log.info("HTTP/2 server listening on {f}", .{config.address});
 
@@ -179,6 +183,9 @@ pub fn main() !void {
 
     var server = try http2.Server.init(allocator, config);
     defer server.deinit();
+
+    // The router must also finish any startup allocation before this point.
+    http2.freeze();
     try server.run();
 }
 ```
@@ -196,11 +203,11 @@ passes the decrypted application-data stream into the core connection entry poin
 
 ```zig
 try http2.serveConnection(
-    allocator,
     tls_conn.reader(),
     tls_conn.writer(),
     .{
         .dispatcher = dispatcher,
+        .stream_storage = &connection_slots[slot_index].stream_storage,
     },
 );
 ```
@@ -215,6 +222,113 @@ this build passes the local `boringssl` checkout as its source by default; use
 `-Dboringssl-source-path=/path/to/boringssl` to point at another checkout.
 For pooled servers, the adapter can pass caller-owned stream storage through
 `http2.ServeConnectionOptions.stream_storage` to avoid per-connection stream-storage allocation.
+
+## Streaming Responses
+
+HTTP/2 does not use HTTP/1.1 `Transfer-Encoding: chunked`. An unknown-length response is a
+sequence of flow-controlled DATA frames, with `END_STREAM` on the final frame. Use the pull-based
+response API instead of calling the explicitly low-level `sendDataFrameUnsafe()` primitive:
+
+```zig
+const payload = "streamed body\n";
+
+const Source = struct {
+    bytes: [payload.len]u8 = payload.*,
+    offset: usize = 0,
+
+    pub fn read(self: *@This(), output: []u8) !http2.StreamReadResult {
+        const remaining = self.bytes[self.offset..];
+        const count = @min(output.len, remaining.len);
+        @memcpy(output[0..count], remaining[0..count]);
+        self.offset += count;
+        return .{ .bytes_written = count };
+    }
+
+    pub fn isFinished(self: *const @This()) bool {
+        return self.offset == self.bytes.len;
+    }
+};
+
+return ctx.response.stream(
+    .{ .status = .ok, .mime = .text },
+    Source{},
+);
+```
+
+The source value and all nested fields must fit inline in 256 bytes of aligned state owned by the
+HTTP/2 stream. Pointers, slices, allocators, and other reference-bearing fields are rejected
+recursively at comptime. All fallible checks precede the storage claim, so `stream()` leaves the
+state caller-owned on every error and does not invoke its optional `deinit()`; after success, the
+response owns cleanup. The response config is also comptime-only: custom header strings must be
+static, and headers cannot be appended after the stream source is installed.
+`read()` must fill the offered buffer unless that read finishes the source, must not block, and must
+always make progress. The connection bounds every pull by its fixed scratch, the peer frame limit,
+and both flow-control windows. It also owns scheduling, resets, and the single final `END_STREAM`.
+Application chunks are not wire-frame boundaries.
+
+Run the complete cleartext example with:
+
+```bash
+zig build run-streaming
+curl --http2-prior-knowledge --no-buffer http://127.0.0.1:8080/stream
+```
+
+This API is for finite, immediately-readable producers. A long-lived SSE or externally-driven
+source needs a bounded readiness/wakeup API; blocking or returning zero bytes before completion is
+rejected instead of being polled.
+
+## Static Memory Lifecycle
+
+The memory model follows
+[TigerBeetle's static-allocation design](https://tigerbeetle.com/blog/2022-10-12-a-database-without-dynamic-memory/)
+and [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md),
+adapted to an HTTP/2 server and client rather than a database. The bounded resources are HTTP/2
+connections, concurrent streams, frame/header/body buffers, HPACK state, event-loop fibers, wait
+registrations, and worker threads.
+
+`RuntimePlan` uses checked arithmetic for the configured connection, thread, fiber, I/O-buffer,
+and per-thread wait-registration counts. The published core ceiling covers the maximum accepted
+configuration, including all Kqueue allocator storage and OS worker-stack reservations—not just
+the default two threads. Per-thread HPACK scratch is also charged to the plan. The TLS example
+separately checks its larger, adapter-specific connection slot layout against the same system
+ceiling.
+
+The lifecycle has four explicit phases:
+
+1. Call `http2.init(backing_allocator)` to open startup allocation.
+2. Construct application state, server or client pools, TLS configuration, and support threads.
+   Server configuration determines the exact runtime resource counts.
+3. Call `http2.freeze()` before serving traffic. `Server.run()` also seals the allocator if the
+   application has not already done so. Allocation, resize, remap, or free through the HTTP/2
+   allocator after this point is an unconditional failure, including in `ReleaseFast` builds.
+4. Call `Server.stop()`, wait for `Server.run()` to return, destroy every server or client pool,
+   then call `http2.deinit()`. Teardown enters the deinitialization phase before releasing
+   startup-owned pools. Calling `Server.deinit()` while its run loop or tasks are live is a
+   release-safe panic rather than a use-after-free.
+
+`Server.stop()` interrupts the accept wait without closing the listener from another thread. The
+run thread unpublishes and closes the listener before `Server.run()` returns, so a stopped server
+can restart without inheriting a stale cancellation or descriptor.
+
+Capacity exhaustion is an overload condition, not permission to grow the heap. A server rejects
+connections when its connection slots or event-loop tasks are full; a connection rejects excess
+streams and oversized frames or header blocks through bounded protocol errors. Client code uses
+`Connection.initClientInPlace` with caller-owned `Connection.StreamStorage` allocated during
+startup.
+
+The static guarantee covers memory obtained through http2.zig's phase-gated Zig allocator. The
+in-tree Kqueue backend preallocates worker threads, fibers, and wait-registration maps before the
+freeze boundary. The bundled server fails with `StaticBackendUnavailable` on platforms without
+Kqueue; it does not silently fall back to `std.Io.Threaded` and its dynamic task pool. The protocol
+and in-place client APIs remain transport-neutral. Another server backend must provide an
+equivalent startup-allocation contract before it can make the same whole-runtime claim.
+
+TLS has a separate allocator boundary: the `http2-boring` example embeds each adapter connection
+and its fixed Zig I/O buffers in a startup-owned connection slot, and creates the I/O backend before
+freeze. BoringSSL still creates and releases internal per-connection state during TLS handshakes.
+BoringSSL's heap, operating-system resources, application dispatchers, and third-party routers are
+not covered by the http2.zig allocator guarantee. A process-wide no-heap claim requires those
+components to provide and verify their own bounded allocators.
 
 ## Performance
 
@@ -237,6 +351,9 @@ pub const Server.Config = struct {
     
     /// Buffer size per connection (default: 32KB)
     buffer_size: u32 = 32 * 1024,
+
+    /// Total event-loop threads, including the run thread (default: 2)
+    worker_count: u16 = 2,
 };
 ```
 
@@ -312,6 +429,9 @@ zig build
 
 # Run tests
 zig build test
+
+# Enforce formatting, line/function bounds, and the TigerStyle source gate
+zig build tigerstyle
 
 # Build with optimizations
 zig build -Doptimize=ReleaseFast

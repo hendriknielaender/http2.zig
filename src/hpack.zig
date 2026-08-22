@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const log = std.log.scoped(.hpack);
 const huffman = @import("huffman.zig").Huffman;
@@ -53,6 +54,8 @@ const fnv1a_hash = std.hash_map.hashString;
 /// - Thread-local scratch buffers
 /// - Memory safety guarantees
 pub const Hpack = struct {
+    pub const scratch_buffer_size = HPACK_SCRATCH_BUFFER_SIZE;
+
     pub fn resetScratchBuffer() void {
         ScratchBuffer.reset();
     }
@@ -184,8 +187,7 @@ pub const Hpack = struct {
             size: usize, // Cached size calculation
         };
 
-        pub fn init(allocator: std.mem.Allocator, max_size: usize) DynamicTable {
-            _ = allocator;
+        pub fn init(max_size: usize) DynamicTable {
             return DynamicTable{
                 .entries = [_]?OwnedHeaderField{null} ** MAX_DYNAMIC_TABLE_ENTRIES,
                 .head = 0,
@@ -458,7 +460,6 @@ pub const Hpack = struct {
         value: usize,
         prefix_size: u8,
         buffer: *std.ArrayList(u8),
-        allocator: std.mem.Allocator,
         prefix_value: u8,
     ) !void {
         assert(prefix_size >= 1);
@@ -469,23 +470,23 @@ pub const Hpack = struct {
         const max_prefix_value = (@as(usize, 1) << @intCast(prefix_size)) - 1;
         if (value < max_prefix_value) {
             const val: u8 = @intCast(value);
-            try buffer.append(allocator, prefix_value | val);
+            try appendByteBounded(buffer, prefix_value | val);
         } else {
             const max_val: u8 = @intCast(max_prefix_value);
-            try buffer.append(allocator, prefix_value | max_val);
+            try appendByteBounded(buffer, prefix_value | max_val);
             var remainder = value - max_prefix_value;
             while (remainder >= 128) {
-                try buffer.append(allocator, @as(u8, @intCast((remainder & 0x7F) | 0x80)));
+                const byte: u8 = @intCast((remainder & 0x7F) | 0x80);
+                try appendByteBounded(buffer, byte);
                 remainder >>= 7;
             }
-            try buffer.append(allocator, @intCast(remainder));
+            try appendByteBounded(buffer, @intCast(remainder));
         }
     }
 
     pub fn encodeString(
         str: []const u8,
         buffer: *std.ArrayList(u8),
-        allocator: std.mem.Allocator,
     ) !void {
         assert(str.len <= MAX_HEADER_LIST_SIZE);
         assert(@intFromPtr(buffer) != 0);
@@ -495,12 +496,12 @@ pub const Hpack = struct {
         if (use_huffman) {
             // Prefer the literal path until an encoder is in place that is both
             // bounded and measurably beneficial for this code path.
-            try Hpack.encodeInt(str.len, 7, buffer, allocator, 0);
-            try buffer.appendSlice(allocator, str);
+            try Hpack.encodeInt(str.len, 7, buffer, 0);
+            try appendSliceBounded(buffer, str);
         } else {
             // Literal string encoding
-            try Hpack.encodeInt(str.len, 7, buffer, allocator, huffman_bit);
-            try buffer.appendSlice(allocator, str);
+            try Hpack.encodeInt(str.len, 7, buffer, huffman_bit);
+            try appendSliceBounded(buffer, str);
         }
     }
 
@@ -508,7 +509,6 @@ pub const Hpack = struct {
         field: HeaderField,
         dynamic_table: *DynamicTable,
         buffer: *std.ArrayList(u8),
-        allocator: std.mem.Allocator,
     ) !void {
         assert(field.name.len > 0);
         assert(field.name.len <= MAX_HEADER_LIST_SIZE);
@@ -519,11 +519,11 @@ pub const Hpack = struct {
         if (static_index) |idx| {
             // Indexed Header Field Representation (Section 6.1)
             const prefix_value: u8 = 0x80; // First bit set to 1
-            try Hpack.encodeInt(idx, 7, buffer, allocator, prefix_value);
+            try Hpack.encodeInt(idx, 7, buffer, prefix_value);
         } else if (dynamic_table.getHpackIndex(field.name, field.value)) |idx| {
             // Indexed Header Field Representation (Section 6.1)
             const prefix_value: u8 = 0x80; // First bit set to 1
-            try Hpack.encodeInt(idx, 7, buffer, allocator, prefix_value);
+            try Hpack.encodeInt(idx, 7, buffer, prefix_value);
         } else {
             // Literal Header Field with Incremental Indexing (Section 6.2.1)
             // Check if name is in the static table
@@ -531,16 +531,16 @@ pub const Hpack = struct {
             if (name_index) |idx| {
                 // Name is indexed - encode with 01 prefix pattern
                 const prefix_value: u8 = 0x40; // '01' pattern in the first two bits
-                try Hpack.encodeInt(idx, 6, buffer, allocator, prefix_value);
+                try Hpack.encodeInt(idx, 6, buffer, prefix_value);
             } else {
                 // Name is a literal string
                 const prefix_value: u8 = 0x40; // '01' pattern in the first two bits
-                try buffer.append(allocator, prefix_value); // Index 0 for literal name
+                try appendByteBounded(buffer, prefix_value); // Index 0 for literal name
                 // Encode length and string
-                try Hpack.encodeString(field.name, buffer, allocator);
+                try Hpack.encodeString(field.name, buffer);
             }
             // Encode the header value
-            try Hpack.encodeString(field.value, buffer, allocator);
+            try Hpack.encodeString(field.value, buffer);
             // Add the header field to the dynamic table
             try dynamic_table.addEntry(field);
         }
@@ -549,24 +549,37 @@ pub const Hpack = struct {
     pub fn encodeHeaderFieldWithoutIndexing(
         field: HeaderField,
         buffer: *std.ArrayList(u8),
-        allocator: std.mem.Allocator,
     ) !void {
         assert(field.name.len > 0);
         assert(field.name.len <= MAX_HEADER_LIST_SIZE);
         assert(@intFromPtr(buffer) != 0);
 
         if (Hpack.StaticTable.getStaticIndex(field.name, field.value)) |index| {
-            try Hpack.encodeInt(index, 7, buffer, allocator, 0x80);
+            try Hpack.encodeInt(index, 7, buffer, 0x80);
             return;
         }
 
         if (Hpack.StaticTable.getNameIndex(field.name)) |index| {
-            try Hpack.encodeInt(index, 4, buffer, allocator, 0x00);
+            try Hpack.encodeInt(index, 4, buffer, 0x00);
         } else {
-            try buffer.append(allocator, 0x00);
-            try Hpack.encodeString(field.name, buffer, allocator);
+            try appendByteBounded(buffer, 0x00);
+            try Hpack.encodeString(field.name, buffer);
         }
-        try Hpack.encodeString(field.value, buffer, allocator);
+        try Hpack.encodeString(field.value, buffer);
+    }
+
+    fn appendByteBounded(
+        buffer: *std.ArrayList(u8),
+        byte: u8,
+    ) error{HpackEncodeBufferFull}!void {
+        buffer.appendBounded(byte) catch return error.HpackEncodeBufferFull;
+    }
+
+    fn appendSliceBounded(
+        buffer: *std.ArrayList(u8),
+        bytes: []const u8,
+    ) error{HpackEncodeBufferFull}!void {
+        buffer.appendSliceBounded(bytes) catch return error.HpackEncodeBufferFull;
     }
 
     pub const DecodedHeaderView = struct {
@@ -574,8 +587,7 @@ pub const Hpack = struct {
         bytes_consumed: usize,
     };
 
-    /// Result of decoding a header field, including bytes consumed.
-    /// The owned form is retained for tests and non-hot paths.
+    /// Test-only owned decode result. Production uses `DecodedHeaderView`.
     pub const DecodedHeader = struct {
         header: HeaderField,
         bytes_consumed: usize,
@@ -597,96 +609,94 @@ pub const Hpack = struct {
         ScratchBuffer.reset();
         if (payload.len == 0) return error.InvalidEncoding;
         const first_byte = payload[0];
-        var cursor: usize = 0;
-
         if ((first_byte & 0x80) != 0) {
-            const int_result = try Hpack.decodeIntWithCursor(7, payload);
-            cursor += int_result.bytes_consumed;
-            if (int_result.value == 0) return error.InvalidEncoding;
-
-            const header = if (int_result.value <= Hpack.StaticTable.entries.len)
-                Hpack.StaticTable.get(int_result.value - 1)
-            else
-                try dynamic_table.getEntryByHpackIndex(int_result.value);
-
-            return DecodedHeaderView{
-                .header = header,
-                .bytes_consumed = cursor,
-            };
+            return decodeIndexedHeaderView(payload, dynamic_table);
         }
-
         if ((first_byte & 0xC0) == 0x40) {
-            const int_result = try Hpack.decodeIntWithCursor(6, payload);
-            cursor += int_result.bytes_consumed;
-
-            const name = if (int_result.value == 0) blk: {
-                const name_result = try Hpack.decodeLengthAndStringView(payload[cursor..]);
-                cursor += name_result.bytes_consumed;
-                break :blk name_result.value;
-            } else if (int_result.value <= Hpack.StaticTable.entries.len)
-                Hpack.StaticTable.get(int_result.value - 1).name
-            else
-                (try dynamic_table.getEntryByHpackIndex(int_result.value)).name;
-
-            const value_result = try Hpack.decodeLengthAndStringView(payload[cursor..]);
-            cursor += value_result.bytes_consumed;
-
-            const header = HeaderField{
-                .name = name,
-                .value = value_result.value,
-            };
-            try dynamic_table.addEntry(header);
-
-            return DecodedHeaderView{
-                .header = header,
-                .bytes_consumed = cursor,
-            };
+            return decodeLiteralHeaderView(payload, dynamic_table, 6, true);
         }
-
         if ((first_byte & 0xF0) == 0x00 or (first_byte & 0xF0) == 0x10) {
-            const int_result = try Hpack.decodeIntWithCursor(4, payload);
-            cursor += int_result.bytes_consumed;
-
-            const name = if (int_result.value == 0) blk: {
-                const name_result = try Hpack.decodeLengthAndStringView(payload[cursor..]);
-                cursor += name_result.bytes_consumed;
-                break :blk name_result.value;
-            } else if (int_result.value <= Hpack.StaticTable.entries.len)
-                Hpack.StaticTable.get(int_result.value - 1).name
-            else
-                (try dynamic_table.getEntryByHpackIndex(int_result.value)).name;
-
-            const value_result = try Hpack.decodeLengthAndStringView(payload[cursor..]);
-            cursor += value_result.bytes_consumed;
-
-            return DecodedHeaderView{
-                .header = .{
-                    .name = name,
-                    .value = value_result.value,
-                },
-                .bytes_consumed = cursor,
-            };
+            return decodeLiteralHeaderView(payload, dynamic_table, 4, false);
         }
-
         if ((first_byte & 0xE0) == 0x20) {
-            const int_result = try Hpack.decodeIntWithCursor(5, payload);
-            cursor += int_result.bytes_consumed;
-            try dynamic_table.updateMaxSize(int_result.value);
-
-            return DecodedHeaderView{
-                .header = .{ .name = "", .value = "" },
-                .bytes_consumed = cursor,
-            };
+            return decodeDynamicTableSizeUpdateView(payload, dynamic_table);
         }
-
         return error.UnsupportedRepresentation;
     }
 
-    pub fn decodeHeaderField(
+    fn decodeIndexedHeaderView(
+        payload: []const u8,
+        dynamic_table: *DynamicTable,
+    ) !DecodedHeaderView {
+        const integer = try Hpack.decodeIntWithCursor(7, payload);
+        if (integer.value == 0) return error.InvalidEncoding;
+
+        const header = if (integer.value <= Hpack.StaticTable.entries.len)
+            Hpack.StaticTable.get(integer.value - 1)
+        else
+            try dynamic_table.getEntryByHpackIndex(integer.value);
+        return .{ .header = header, .bytes_consumed = integer.bytes_consumed };
+    }
+
+    fn decodeLiteralHeaderView(
+        payload: []const u8,
+        dynamic_table: *DynamicTable,
+        prefix_size: u8,
+        add_to_table: bool,
+    ) !DecodedHeaderView {
+        const integer = try Hpack.decodeIntWithCursor(prefix_size, payload);
+        var cursor = integer.bytes_consumed;
+        const name = try decodeHeaderNameView(
+            payload,
+            &cursor,
+            integer.value,
+            dynamic_table,
+        );
+        const value = try Hpack.decodeLengthAndStringView(payload[cursor..]);
+        cursor += value.bytes_consumed;
+
+        const header = HeaderField{ .name = name, .value = value.value };
+        if (add_to_table) try dynamic_table.addEntry(header);
+        return .{ .header = header, .bytes_consumed = cursor };
+    }
+
+    fn decodeHeaderNameView(
+        payload: []const u8,
+        cursor: *usize,
+        index: usize,
+        dynamic_table: *DynamicTable,
+    ) ![]const u8 {
+        if (index == 0) {
+            const name = try Hpack.decodeLengthAndStringView(payload[cursor.*..]);
+            cursor.* += name.bytes_consumed;
+            return name.value;
+        }
+        if (index <= Hpack.StaticTable.entries.len) {
+            return Hpack.StaticTable.get(index - 1).name;
+        }
+        return (try dynamic_table.getEntryByHpackIndex(index)).name;
+    }
+
+    fn decodeDynamicTableSizeUpdateView(
+        payload: []const u8,
+        dynamic_table: *DynamicTable,
+    ) !DecodedHeaderView {
+        const integer = try Hpack.decodeIntWithCursor(5, payload);
+        try dynamic_table.updateMaxSize(integer.value);
+        return .{
+            .header = .{ .name = "", .value = "" },
+            .bytes_consumed = integer.bytes_consumed,
+        };
+    }
+
+    pub fn decodeHeaderFieldOwnedForTesting(
         payload: []const u8,
         dynamic_table: *DynamicTable,
         allocator: std.mem.Allocator,
     ) !DecodedHeader {
+        if (!builtin.is_test) {
+            @compileError("production HPACK decoding must use decodeHeaderFieldView");
+        }
         const decoded_view = try Hpack.decodeHeaderFieldView(payload, dynamic_table);
 
         if (decoded_view.header.name.len == 0) {
@@ -784,22 +794,52 @@ pub const Hpack = struct {
     }
 };
 // Tests
+test "HPACK integer encoding respects fixed buffer capacity" {
+    var exact_storage: [2]u8 = undefined;
+    var exact = std.ArrayList(u8).initBuffer(&exact_storage);
+
+    try Hpack.encodeInt(128, 7, &exact, 0);
+    try std.testing.expectEqualSlices(u8, &.{ 0x7f, 0x01 }, exact.items);
+
+    var short_storage: [1]u8 = undefined;
+    var short = std.ArrayList(u8).initBuffer(&short_storage);
+
+    try std.testing.expectError(
+        error.HpackEncodeBufferFull,
+        Hpack.encodeInt(128, 7, &short, 0),
+    );
+}
+
+test "HPACK header encoding reports fixed buffer exhaustion" {
+    var table = Hpack.DynamicTable.init(4096);
+    defer table.deinit();
+
+    var storage: [1]u8 = undefined;
+    var encoded = std.ArrayList(u8).initBuffer(&storage);
+    const field = Hpack.HeaderField.init("x-test", "value");
+
+    try std.testing.expectError(
+        error.HpackEncodeBufferFull,
+        Hpack.encodeHeaderField(field, &table, &encoded),
+    );
+    try std.testing.expectEqual(@as(usize, 0), table.count);
+}
+
 test "Huffman decoding of www.example.com" {
-    var allocator = std.testing.allocator;
     const encoded = &[_]u8{
         0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a,
         0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
     };
     const expected = "www.example.com";
-    const decoded = try huffman.decode(encoded, allocator);
-    defer allocator.free(decoded);
+    var decoded_storage: [expected.len]u8 = undefined;
+    const decoded = try huffman.decodeBounded(encoded, &decoded_storage);
     try std.testing.expectEqualStrings(expected, decoded);
 }
 test "Dynamic table handles oversized entry correctly" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var dynamic_table = Hpack.DynamicTable.init(allocator, 100);
+    var dynamic_table = Hpack.DynamicTable.init(100);
     defer dynamic_table.deinit();
     // Create a larger value to exceed the dynamic table's max_size of 100
     const large_value = try allocator.alloc(u8, 101);
@@ -815,11 +855,8 @@ test "Dynamic table handles oversized entry correctly" {
     try std.testing.expect(dynamic_table.count == 0);
 }
 test "Dynamic table add and retrieve" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
     // Set a reasonable dynamic table size of 4096 for this test
-    var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
+    var dynamic_table = Hpack.DynamicTable.init(4096);
     defer dynamic_table.deinit();
     const field = Hpack.HeaderField.init("content-length", "1234");
     try dynamic_table.addEntry(field);
@@ -828,10 +865,7 @@ test "Dynamic table add and retrieve" {
     try std.testing.expect(std.mem.eql(u8, field.value, retrieved.value));
 }
 test "HPACK dynamic table missing field" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var dynamic_table = Hpack.DynamicTable.init(allocator, 10);
+    var dynamic_table = Hpack.DynamicTable.init(10);
     defer dynamic_table.deinit();
     // Try to get an entry from an empty dynamic table
     _ = dynamic_table.getEntry(0) catch |err| {
@@ -846,38 +880,46 @@ test "Dynamic table indexing conforms to HPACK specification" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
+    var dynamic_table = Hpack.DynamicTable.init(4096);
     defer dynamic_table.deinit();
     const field1 = Hpack.HeaderField.init("custom-header1", "value1");
     const field2 = Hpack.HeaderField.init("custom-header2", "value2");
     // Encode header fields
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
-    try Hpack.encodeHeaderField(field1, &dynamic_table, &buffer, allocator);
-    try Hpack.encodeHeaderField(field2, &dynamic_table, &buffer, allocator);
+    var buffer_storage: [256]u8 = undefined;
+    var buffer = std.ArrayList(u8).initBuffer(&buffer_storage);
+    try Hpack.encodeHeaderField(field1, &dynamic_table, &buffer);
+    try Hpack.encodeHeaderField(field2, &dynamic_table, &buffer);
     // Dynamic table should have 2 entries now
     try std.testing.expectEqual(@as(usize, 2), dynamic_table.count);
     // Check indices
     const index1 = Hpack.StaticTable.entries.len + 2; // First dynamic entry
     const index2 = Hpack.StaticTable.entries.len + 1; // Second dynamic entry
     // Decode header fields using their indices
-    var index_buffer: std.ArrayList(u8) = .empty;
-    defer index_buffer.deinit(allocator);
+    var index_storage: [16]u8 = undefined;
+    var index_buffer = std.ArrayList(u8).initBuffer(&index_storage);
     // Encode index2
     {
-        try Hpack.encodeInt(index2, 7, &index_buffer, allocator, 0x80);
-        const payload = try index_buffer.toOwnedSlice(allocator);
-        var decoded_field = try Hpack.decodeHeaderField(payload, &dynamic_table, allocator);
+        try Hpack.encodeInt(index2, 7, &index_buffer, 0x80);
+        const payload = index_buffer.items;
+        var decoded_field = try Hpack.decodeHeaderFieldOwnedForTesting(
+            payload,
+            &dynamic_table,
+            allocator,
+        );
         defer decoded_field.deinit();
         try std.testing.expectEqualStrings(field2.name, decoded_field.header.name);
         try std.testing.expectEqualStrings(field2.value, decoded_field.header.value);
-        try index_buffer.resize(allocator, 0);
+        index_buffer.clearRetainingCapacity();
     }
     // Encode index1
     {
-        try Hpack.encodeInt(index1, 7, &index_buffer, allocator, 0x80);
-        const payload = try index_buffer.toOwnedSlice(allocator);
-        var decoded_field = try Hpack.decodeHeaderField(payload, &dynamic_table, allocator);
+        try Hpack.encodeInt(index1, 7, &index_buffer, 0x80);
+        const payload = index_buffer.items;
+        var decoded_field = try Hpack.decodeHeaderFieldOwnedForTesting(
+            payload,
+            &dynamic_table,
+            allocator,
+        );
         defer decoded_field.deinit();
         try std.testing.expectEqualStrings(field1.name, decoded_field.header.name);
         try std.testing.expectEqualStrings(field1.value, decoded_field.header.value);
@@ -885,11 +927,7 @@ test "Dynamic table indexing conforms to HPACK specification" {
 }
 
 test "Dynamic table accepts peer limit larger than local storage cap" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-
-    var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
+    var dynamic_table = Hpack.DynamicTable.init(4096);
     defer dynamic_table.deinit();
 
     dynamic_table.setMaxAllowedSize(65536);
@@ -901,7 +939,7 @@ test "HPACK decoding of RFC 7541 C.3.1 First Request" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
+    var dynamic_table = Hpack.DynamicTable.init(4096);
     defer dynamic_table.deinit();
     const header_block = &[_]u8{
         0x82, // Indexed Header Field - Index 2 (:method: GET)
@@ -933,7 +971,7 @@ test "HPACK decoding of RFC 7541 C.3.1 First Request" {
     }
     var cursor: usize = 0;
     while (cursor < payload.len) {
-        var decoded_header = try Hpack.decodeHeaderField(
+        var decoded_header = try Hpack.decodeHeaderFieldOwnedForTesting(
             payload[cursor..],
             &dynamic_table,
             allocator,
@@ -960,10 +998,7 @@ test "HPACK decoding of RFC 7541 C.3.1 First Request" {
     try std.testing.expectEqualStrings("www.example.com", headers.items[3].value);
 }
 test "HPACK borrowed decoding of RFC 7541 C.3.1 First Request" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
+    var dynamic_table = Hpack.DynamicTable.init(4096);
     defer dynamic_table.deinit();
 
     const header_block = &[_]u8{
@@ -1023,27 +1058,27 @@ test "HPACK encoding and decoding of :status and content-length using static tab
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    var dynamic_table = Hpack.DynamicTable.init(allocator, 4096);
+    var dynamic_table = Hpack.DynamicTable.init(4096);
     defer dynamic_table.deinit();
     const status_field = Hpack.HeaderField.init(":status", "200");
     const content_length_field = Hpack.HeaderField.init("content-length", "13");
     // Encode :status and content-length headers
-    var buffer: std.ArrayList(u8) = .empty;
-    defer buffer.deinit(allocator);
+    var buffer_storage: [64]u8 = undefined;
+    var buffer = std.ArrayList(u8).initBuffer(&buffer_storage);
     // Check if :status is in the static table
     if (Hpack.StaticTable.getStaticIndex(status_field.name, status_field.value)) |idx| {
-        try Hpack.encodeInt(idx, 7, &buffer, allocator, 0x80); // Indexed Header Field (Section 6.1)
+        try Hpack.encodeInt(idx, 7, &buffer, 0x80); // Indexed Header Field (Section 6.1)
     } else {
-        try Hpack.encodeHeaderField(status_field, &dynamic_table, &buffer, allocator);
+        try Hpack.encodeHeaderField(status_field, &dynamic_table, &buffer);
     }
     // Check if content-length is in the static table
     if (Hpack.StaticTable.getStaticIndex(
         content_length_field.name,
         content_length_field.value,
     )) |idx| {
-        try Hpack.encodeInt(idx, 7, &buffer, allocator, 0x80); // Indexed Header Field (Section 6.1)
+        try Hpack.encodeInt(idx, 7, &buffer, 0x80); // Indexed Header Field (Section 6.1)
     } else {
-        try Hpack.encodeHeaderField(content_length_field, &dynamic_table, &buffer, allocator);
+        try Hpack.encodeHeaderField(content_length_field, &dynamic_table, &buffer);
     }
     // Ensure buffer contains encoded data
     try std.testing.expect(buffer.items.len > 0);
@@ -1058,7 +1093,7 @@ test "HPACK encoding and decoding of :status and content-length using static tab
     }
     var cursor: usize = 0;
     while (cursor < buffer.items.len) {
-        var decoded_header = try Hpack.decodeHeaderField(
+        var decoded_header = try Hpack.decodeHeaderFieldOwnedForTesting(
             buffer.items[cursor..],
             &dynamic_table,
             allocator,
