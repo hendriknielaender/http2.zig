@@ -22,7 +22,7 @@ const ExampleArtifacts = struct {
 
 // Project metadata
 const project_name = "http2";
-const project_version = "0.1.0";
+const project_version = "0.1.1";
 
 const tigerstyle_checked_paths = [_][]const u8{
     "src/static_allocator.zig",
