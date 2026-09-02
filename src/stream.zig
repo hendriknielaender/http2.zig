@@ -337,7 +337,10 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
 
                 // Check for overflow - this can happen when window exceeds 2^31-1
                 if (overflowed != 0 or new_window > 2147483647) {
-                    log.err("Stream {} flow control window overflow: FLOW_CONTROL_ERROR\n", .{self.id});
+                    log.err(
+                        "Stream {} flow control window overflow: FLOW_CONTROL_ERROR\n",
+                        .{self.id},
+                    );
                     return error.FlowControlError;
                 }
 
@@ -372,7 +375,10 @@ pub fn Stream(comptime WindowBits: u5, comptime MaxStreams: u31) type {
                     }
                 }
 
-                const frame_flags = if (end_stream) FrameFlags.init(FrameFlags.END_STREAM) else FrameFlags.init(0);
+                const frame_flags = if (end_stream)
+                    FrameFlags.init(FrameFlags.END_STREAM)
+                else
+                    FrameFlags.init(0);
 
                 var frame = Frame{
                     .header = FrameHeader{

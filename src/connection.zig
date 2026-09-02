@@ -699,26 +699,28 @@ pub const Connection = struct {
 
     pub fn handle_connection_optimized(self: *@This()) !void {
         var frame_buffer: [inbound_frame_buffer_size]u8 = undefined;
+        if (!try self.receiveInitialSettings(&frame_buffer)) return;
+        try self.processActiveFrames(&frame_buffer);
+        try self.flush_output();
+        log.debug("SIMD-optimized connection handler terminated gracefully.", .{});
+    }
 
+    fn receiveInitialSettings(
+        self: *@This(),
+        frame_buffer: *[inbound_frame_buffer_size]u8,
+    ) !bool {
         while (!self.client_settings_received) {
             if (try self.continue_ready_streams_before_read()) continue;
-            const frame = self.receiveFrameStatic(&frame_buffer) catch |err| {
+            const frame = self.receiveFrameStatic(frame_buffer) catch |err| {
                 self.handle_receive_frame_error(err) catch |handle_err| {
                     try self.flush_output();
                     return handle_err;
                 };
                 try self.flush_output();
-                return;
+                return false;
             };
 
-            self.dispatchFrameOptimized(frame) catch |err| {
-                if (self.goaway_sent) {
-                    try self.finishAfterGoaway();
-                    return;
-                }
-                try self.flush_output();
-                return err;
-            };
+            if (!try self.dispatchFrameForConnection(frame)) return false;
             try self.flush_ready_streams();
             try self.flush_output_if_idle_or_full();
             if (frame.header.frame_type == FrameType.SETTINGS) {
@@ -727,52 +729,19 @@ pub const Connection = struct {
                 }
             }
         }
+        return true;
+    }
 
+    fn processActiveFrames(
+        self: *@This(),
+        frame_buffer: *[inbound_frame_buffer_size]u8,
+    ) !void {
         while (!self.goaway_sent) {
             if (try self.continue_ready_streams_before_read()) continue;
-            if (self.connection_closed) {
-                break;
-            }
-            const frame = self.receiveFrameStatic(&frame_buffer) catch |err| switch (err) {
-                error.BufferTooSmall => {
-                    log.err("Frame exceeds the fixed inbound buffer: FRAME_SIZE_ERROR", .{});
-                    try self.send_goaway(0, 0x6, "Frame exceeds buffer: FRAME_SIZE_ERROR");
-                    self.goaway_sent = true;
-                    try self.flush_output();
-                    break;
-                },
-                error.UnexpectedEOF => {
-                    log.debug("Connection read error: UnexpectedEOF", .{});
-                    break;
-                },
-                error.FrameSizeError => {
-                    try self.flush_output();
-                    break;
-                },
-                else => {
-                    log.debug("Connection read error: {s}", .{@errorName(err)});
-                    break;
-                },
-            };
-
-            if (self.expecting_continuation_stream_id) |stream_id| {
-                if (frame.header.stream_id != stream_id or frame.header.frame_type != FrameType.CONTINUATION) {
-                    log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR", .{ @intFromEnum(frame.header.frame_type), frame.header.stream_id, stream_id });
-                    try self.send_goaway(self.highest_stream_id(), 0x1, "Expected CONTINUATION frame: PROTOCOL_ERROR");
-                    self.goaway_sent = true;
-                    try self.finishAfterGoaway();
-                    return error.ProtocolError;
-                }
-            }
-
-            self.dispatchFrameOptimized(frame) catch |err| {
-                if (self.goaway_sent) {
-                    try self.finishAfterGoaway();
-                    return;
-                }
-                try self.flush_output();
-                return err;
-            };
+            if (self.connection_closed) break;
+            const frame = (try self.receiveActiveFrame(frame_buffer)) orelse break;
+            try self.validateExpectedContinuation(frame);
+            if (!try self.dispatchFrameForConnection(frame)) return;
             try self.flush_ready_streams();
 
             // Coalesce TLS writes across pipelined requests. With h2load
@@ -791,8 +760,67 @@ pub const Connection = struct {
                 }
             }
         }
-        try self.flush_output();
-        log.debug("SIMD-optimized connection handler terminated gracefully.", .{});
+    }
+
+    fn receiveActiveFrame(
+        self: *@This(),
+        frame_buffer: *[inbound_frame_buffer_size]u8,
+    ) !?Frame {
+        return self.receiveFrameStatic(frame_buffer) catch |err| switch (err) {
+            error.BufferTooSmall => {
+                log.err("Frame exceeds the fixed inbound buffer: FRAME_SIZE_ERROR", .{});
+                try self.send_goaway(0, 0x6, "Frame exceeds buffer: FRAME_SIZE_ERROR");
+                self.goaway_sent = true;
+                try self.flush_output();
+                return null;
+            },
+            error.UnexpectedEOF => {
+                log.debug("Connection read error: UnexpectedEOF", .{});
+                return null;
+            },
+            error.FrameSizeError => {
+                try self.flush_output();
+                return null;
+            },
+            else => {
+                log.debug("Connection read error: {s}", .{@errorName(err)});
+                return null;
+            },
+        };
+    }
+
+    fn dispatchFrameForConnection(self: *@This(), frame: Frame) !bool {
+        self.dispatchFrameOptimized(frame) catch |err| {
+            if (self.goaway_sent) {
+                try self.finishAfterGoaway();
+                return false;
+            }
+            try self.flush_output();
+            return err;
+        };
+        return true;
+    }
+
+    fn validateExpectedContinuation(self: *@This(), frame: Frame) !void {
+        const stream_id = self.expecting_continuation_stream_id orelse return;
+        if (frame.header.stream_id == stream_id and
+            frame.header.frame_type == FrameType.CONTINUATION)
+        {
+            return;
+        }
+
+        log.err(
+            "Expected CONTINUATION on stream {d}; received type {d} on stream {d}",
+            .{ stream_id, @intFromEnum(frame.header.frame_type), frame.header.stream_id },
+        );
+        try self.send_goaway(
+            self.highest_stream_id(),
+            0x1,
+            "Expected CONTINUATION frame: PROTOCOL_ERROR",
+        );
+        self.goaway_sent = true;
+        try self.finishAfterGoaway();
+        return error.ProtocolError;
     }
 
     /// Flush only when there is no point holding the bytes back any longer:
@@ -844,25 +872,7 @@ pub const Connection = struct {
     pub fn handleFrameEventDriven(self: *@This(), frame: Frame) !void {
         // Validate CONTINUATION expectations before dispatch, matching the
         // per-frame guard in `handle_connection_optimized`.
-        if (self.expecting_continuation_stream_id) |stream_id| {
-            if (frame.header.stream_id != stream_id or
-                frame.header.frame_type != FrameType.CONTINUATION)
-            {
-                log.err("Received frame type {d} on stream {d} while expecting CONTINUATION frame on stream {d}: PROTOCOL_ERROR", .{
-                    @intFromEnum(frame.header.frame_type),
-                    frame.header.stream_id,
-                    stream_id,
-                });
-                try self.send_goaway(
-                    self.highest_stream_id(),
-                    0x1,
-                    "Expected CONTINUATION frame: PROTOCOL_ERROR",
-                );
-                self.goaway_sent = true;
-                try self.finishAfterGoaway();
-                return error.ProtocolError;
-            }
-        }
+        try self.validateExpectedContinuation(frame);
 
         self.dispatchFrameOptimized(frame) catch |err| {
             if (self.goaway_sent) {
