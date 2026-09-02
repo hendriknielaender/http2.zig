@@ -54,6 +54,12 @@ const max_idle_search = 4;
 const max_steal_ready_search = 4;
 const max_iovecs_len = 8;
 
+comptime {
+    assert(max_iovecs_len > 1);
+    assert(max_iovecs_len <= std.math.maxInt(u8));
+    if (@TypeOf(posix.IOV_MAX) != void) assert(max_iovecs_len <= posix.IOV_MAX);
+}
+
 const Thread = struct {
     thread: std.Thread,
     idle_context: Io.fiber.Context,
@@ -2601,31 +2607,8 @@ fn netWrite(
     splat: usize,
 ) net.Stream.Writer.Error!usize {
     const loop: *EventLoop = @ptrCast(@alignCast(userdata));
-
-    var iovecs_buffer: [max_iovecs_len + 2]posix.iovec_const = undefined;
-    var i: usize = 0;
-
-    if (header.len > 0) {
-        iovecs_buffer[i] = .{ .base = header.ptr, .len = header.len };
-        i += 1;
-    }
-
-    for (data) |buf| {
-        if (iovecs_buffer.len - i == 0) break;
-        if (buf.len != 0) {
-            iovecs_buffer[i] = .{ .base = buf.ptr, .len = buf.len };
-            i += 1;
-        }
-    }
-    for (0..@min(iovecs_buffer.len - i, splat)) |_| {
-        if (data.len == 0) break;
-        const last = data[data.len - 1];
-        if (last.len == 0) break;
-        iovecs_buffer[i] = .{ .base = last.ptr, .len = last.len };
-        i += 1;
-    }
-
-    const src = iovecs_buffer[0..i];
+    const write_vectors = buildNetWriteVectors(header, data, splat);
+    const src = write_vectors.slice();
     if (src.len == 0) return @as(usize, 0);
 
     while (true) {
@@ -2656,6 +2639,66 @@ fn netWrite(
             else => |err| return posix.unexpectedErrno(err),
         }
     }
+}
+
+const NetWriteVectors = struct {
+    items: [max_iovecs_len]posix.iovec_const = undefined,
+    count: u8 = 0,
+
+    fn append(self: *@This(), bytes: []const u8) void {
+        if (bytes.len == 0 or self.count == self.items.len) return;
+        assert(self.count < self.items.len);
+        self.items[self.count] = .{ .base = bytes.ptr, .len = bytes.len };
+        self.count += 1;
+    }
+
+    fn slice(self: *const @This()) []const posix.iovec_const {
+        return self.items[0..self.count];
+    }
+};
+
+fn buildNetWriteVectors(
+    header: []const u8,
+    data: []const []const u8,
+    splat: usize,
+) NetWriteVectors {
+    assert(data.len > 0);
+
+    var vectors = NetWriteVectors{};
+    vectors.append(header);
+    for (data[0 .. data.len - 1]) |bytes| vectors.append(bytes);
+
+    const pattern = data[data.len - 1];
+    const repetitions = @min(splat, vectors.items.len - vectors.count);
+    for (0..repetitions) |_| vectors.append(pattern);
+    return vectors;
+}
+
+test "net write vectors emit the final slice exactly splat times" {
+    const data_frame = [_][]const u8{"DATA payload"};
+    const data_vectors = buildNetWriteVectors("buffered frames", &data_frame, 1);
+    const actual_data_vectors = data_vectors.slice();
+
+    try std.testing.expectEqual(@as(usize, 2), actual_data_vectors.len);
+    try expectIovecEqual("buffered frames", actual_data_vectors[0]);
+    try expectIovecEqual("DATA payload", actual_data_vectors[1]);
+
+    const data = [_][]const u8{ "ordinary", "pattern" };
+    const vectors = buildNetWriteVectors("buffered", &data, 2);
+    const actual = vectors.slice();
+
+    try std.testing.expectEqual(@as(usize, 4), actual.len);
+    try expectIovecEqual("buffered", actual[0]);
+    try expectIovecEqual("ordinary", actual[1]);
+    try expectIovecEqual("pattern", actual[2]);
+    try expectIovecEqual("pattern", actual[3]);
+
+    const without_pattern = buildNetWriteVectors("buffered", &data, 0);
+    try std.testing.expectEqual(@as(usize, 2), without_pattern.slice().len);
+}
+
+fn expectIovecEqual(expected: []const u8, actual: posix.iovec_const) !void {
+    try std.testing.expectEqualStrings(expected, actual.base[0..actual.len]);
 }
 
 fn netClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {

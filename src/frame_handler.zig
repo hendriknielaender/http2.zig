@@ -392,10 +392,19 @@ fn handleStreamLevelFrameProcess(
     try queueStreamIfReady(ctx, stream);
 }
 
-fn handleStreamLevelFrameProcessError(ctx: *DispatchContext, stream_id: u32, err: anyerror) !void {
+fn handleStreamLevelFrameProcessError(
+    ctx: *DispatchContext,
+    stream_id: u32,
+    err: anyerror,
+) !void {
     switch (err) {
         error.FrameSizeError => {
-            try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x6, "Frame size error: FRAME_SIZE_ERROR");
+            try sendGoawayAndClose(
+                ctx,
+                ctx.last_stream_id.*,
+                0x6,
+                "Frame size error: FRAME_SIZE_ERROR",
+            );
         },
         error.CompressionError => {
             try sendGoawayAndClose(ctx, 0, 0x9, "Compression error: COMPRESSION_ERROR");
@@ -409,7 +418,12 @@ fn handleStreamLevelFrameProcessError(ctx: *DispatchContext, stream_id: u32, err
             try sendRstStream(ctx, stream_id, 0x3);
         },
         error.ProtocolError => {
-            try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x1, "Protocol error: PROTOCOL_ERROR");
+            try sendGoawayAndClose(
+                ctx,
+                ctx.last_stream_id.*,
+                0x1,
+                "Protocol error: PROTOCOL_ERROR",
+            );
             return err;
         },
         error.InvalidStreamState, error.IdleStreamError => {
@@ -450,12 +464,22 @@ fn handleGoawayFrame(ctx: *DispatchContext, frame: Frame) !void {
 fn handleWindowUpdate(ctx: *DispatchContext, frame: Frame) !void {
     assert(frame.header.stream_id == 0);
     if (frame.payload.len != 4) {
-        try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x6, "WINDOW_UPDATE with invalid payload: FRAME_SIZE_ERROR");
+        try sendGoawayAndClose(
+            ctx,
+            ctx.last_stream_id.*,
+            0x6,
+            "WINDOW_UPDATE with invalid payload: FRAME_SIZE_ERROR",
+        );
         return;
     }
     const increment = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF;
     if (increment == 0) {
-        try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x1, "WINDOW_UPDATE increment 0: PROTOCOL_ERROR");
+        try sendGoawayAndClose(
+            ctx,
+            ctx.last_stream_id.*,
+            0x1,
+            "WINDOW_UPDATE increment 0: PROTOCOL_ERROR",
+        );
         return;
     }
     updateSendWindow(ctx, ctx.send_window_size, increment) catch |err| {
