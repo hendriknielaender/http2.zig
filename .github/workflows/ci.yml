@@ -75,8 +75,8 @@ jobs:
       - name: Build release artifacts
         run: zig build -Doptimize=ReleaseFast -Dboringssl-lib-path=boringssl/build
 
-      - name: Run unit tests
-        run: zig build test -Dboringssl-lib-path=boringssl/build
+      - name: Run CI checks
+        run: zig build ci -Dboringssl-lib-path=boringssl/build -- test
 
   docs:
     name: Docs
@@ -114,6 +114,11 @@ jobs:
     env:
       PORT: "8081"
       TLS: "true"
+      # All h2spec sections but http2/5.3, which asserts the self-dependency rule
+      # RFC 9113 deleted (§ 5.3.2, § 6.3). h2spec has no exclude flag.
+      H2SPEC_SECTIONS: >-
+        generic http2/3 http2/4 http2/5.1 http2/5.4 http2/5.5
+        http2/6 http2/7 http2/8 hpack
 
     steps:
       - name: Checkout source
@@ -186,7 +191,8 @@ jobs:
             exit 1
           fi
 
-          if ! docker run --rm --network host summerwind/h2spec -h 127.0.0.1 -p "${PORT}" -t -k; then
+          if ! docker run --rm --network host summerwind/h2spec \
+              -S -h 127.0.0.1 -p "${PORT}" -t -k ${H2SPEC_SECTIONS}; then
             cat /tmp/http2-benchmark.log
             exit 1
           fi

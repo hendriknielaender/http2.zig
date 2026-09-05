@@ -35,6 +35,7 @@ comptime {
 /// lookup table.  All arrays are inline — no runtime allocation once the
 /// struct is instantiated.
 pub const StreamStorage = struct {
+    discarded_headers: @import("field_block.zig").Discarded = .{},
     slots: [max_streams_per_connection]DefaultStream.StreamInstance,
     ids: [max_streams_per_connection]u32,
     in_use: [max_streams_per_connection]bool,
@@ -136,6 +137,7 @@ pub const StreamStorage = struct {
 
     /// Reset all slots and the lookup table to the empty state.
     pub fn reset(self: *Self) void {
+        self.discarded_headers.reset();
         @memset(&self.lookup_ids, 0);
         @memset(&self.lookup_indices, slot_index_empty);
         self.in_use = [_]bool{false} ** max_streams_per_connection;

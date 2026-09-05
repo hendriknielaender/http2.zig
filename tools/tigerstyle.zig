@@ -213,5 +213,80 @@ fn functionLineCount(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) usi
     const last_token = tree.lastToken(body_node);
     const first = tree.tokenLocation(0, first_token);
     const last = tree.tokenLocation(0, last_token);
-    return last.line - first.line + 1;
+    const physical_lines = last.line - first.line + 1;
+    var buffer: [1]std.zig.Ast.Node.Index = undefined;
+    const proto = tree.fullFnProto(&buffer, node).?;
+    const return_type = proto.ast.return_type.unwrap() orelse return physical_lines;
+    if (!std.mem.eql(u8, tree.getNodeSource(return_type), "type")) return physical_lines;
+    const excluded = typeDeclarationLines(tree, tree.firstToken(body_node), last_token);
+    std.debug.assert(excluded < physical_lines);
+    return physical_lines - excluded;
+}
+
+/// Type factories contain declarations, not an imperative body of that size.
+/// Their nested methods are still checked individually by checkFunctionLengths.
+fn typeDeclarationLines(tree: *const std.zig.Ast, first: u32, last: u32) usize {
+    var excluded: usize = 0;
+    var token = first;
+    while (token <= last) : (token += 1) {
+        switch (tree.tokenTag(token)) {
+            .keyword_struct, .keyword_union, .keyword_enum, .keyword_opaque => {},
+            else => continue,
+        }
+        while (token <= last and tree.tokenTag(token) != .l_brace) : (token += 1) {}
+        if (token > last) break;
+        const open = token;
+        var depth: usize = 1;
+        token += 1;
+        while (token <= last) : (token += 1) {
+            switch (tree.tokenTag(token)) {
+                .l_brace => depth += 1,
+                .r_brace => {
+                    depth -= 1;
+                    if (depth == 0) break;
+                },
+                else => {},
+            }
+        }
+        std.debug.assert(token <= last);
+        excluded += tree.tokenLocation(0, token).line - tree.tokenLocation(0, open).line;
+    }
+    return excluded;
+}
+
+fn testFunctionLines(source: [:0]const u8, name: []const u8) !usize {
+    var tree = try std.zig.Ast.parse(std.testing.allocator, source, .zig);
+    defer tree.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
+    var index: usize = 1;
+    while (index < tree.nodes.len) : (index += 1) {
+        const node: std.zig.Ast.Node.Index = @enumFromInt(index);
+        if (tree.nodeTag(node) != .fn_decl) continue;
+        var buffer: [1]std.zig.Ast.Node.Index = undefined;
+        const proto = tree.fullFnProto(&buffer, node).?;
+        if (std.mem.eql(u8, tree.tokenSlice(proto.name_token.?), name)) {
+            return functionLineCount(&tree, node);
+        }
+    }
+    return error.FunctionNotFound;
+}
+
+test "type factory declarations do not hide long nested methods" {
+    const source = "fn Factory() type {\nreturn struct {\n" ++
+        "value: u8,\n" ** 80 ++ "fn nested() void {\n" ++
+        "_ = 0;\n" ** 75 ++ "}\n};\n}\n";
+    try std.testing.expect(try testFunctionLines(source, "Factory") <= max_function_lines);
+    try std.testing.expect(try testFunctionLines(source, "nested") > max_function_lines);
+}
+
+test "type factories retain the limit on outer executable statements" {
+    const source = "fn Factory() type {\n" ++ "_ = 0;\n" ** 75 ++
+        "return struct {\nvalue: u8,\n};\n}\n";
+    try std.testing.expect(try testFunctionLines(source, "Factory") > max_function_lines);
+}
+
+test "ordinary functions retain physical line accounting" {
+    const source = "fn ordinary() void {\nconst T = struct {\n" ++
+        "value: u8,\n" ** 80 ++ "};\n_ = T;\n}\n";
+    try std.testing.expect(try testFunctionLines(source, "ordinary") > max_function_lines);
 }

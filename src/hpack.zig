@@ -3,8 +3,9 @@ const builtin = @import("builtin");
 const assert = std.debug.assert;
 const log = std.log.scoped(.hpack);
 const huffman = @import("huffman.zig").Huffman;
-const MAX_HEADER_LIST_SIZE: usize = 16384; // 16KB default from HTTP/2 spec
-const MAX_DYNAMIC_TABLE_SIZE: usize = 4096; // 4KB default
+const protocol = @import("protocol.zig");
+const encoded_field_bytes_max: usize = 16 * 1024;
+const dynamic_table_bytes_max: usize = protocol.hpack_dynamic_table_size_default;
 const MAX_DYNAMIC_TABLE_ENTRIES: usize = 256; // Fixed number of entries
 const HPACK_SCRATCH_BUFFER_SIZE: usize = 8192; // 8KB scratch buffer
 threadlocal var hpack_scratch: [HPACK_SCRATCH_BUFFER_SIZE]u8 = undefined;
@@ -178,8 +179,9 @@ pub const Hpack = struct {
         current_size: usize, // Current size in bytes
         max_size: usize,
         max_allowed_size: usize,
-        storage: [MAX_DYNAMIC_TABLE_SIZE]u8,
+        storage: [dynamic_table_bytes_max]u8,
         storage_used: usize,
+        pending_encoder_size_min: ?usize = null,
 
         const OwnedHeaderField = struct {
             name: []const u8,
@@ -193,8 +195,8 @@ pub const Hpack = struct {
                 .head = 0,
                 .count = 0,
                 .current_size = 0,
-                .max_size = @min(max_size, MAX_DYNAMIC_TABLE_SIZE),
-                .max_allowed_size = @min(max_size, MAX_DYNAMIC_TABLE_SIZE),
+                .max_size = @min(max_size, dynamic_table_bytes_max),
+                .max_allowed_size = @min(max_size, dynamic_table_bytes_max),
                 .storage = undefined,
                 .storage_used = 0,
             };
@@ -322,7 +324,7 @@ pub const Hpack = struct {
             if (new_size > self.max_allowed_size) {
                 return error.InvalidDynamicTableSizeUpdate;
             }
-            self.max_size = @min(new_size, MAX_DYNAMIC_TABLE_SIZE);
+            self.max_size = @min(new_size, dynamic_table_bytes_max);
             while (self.current_size > self.max_size and self.count > 0) {
                 self.evictOldestEntry();
             }
@@ -331,12 +333,43 @@ pub const Hpack = struct {
 
         pub fn setMaxAllowedSize(self: *DynamicTable, new_size: usize) void {
             self.max_allowed_size = new_size;
-            self.max_size = @min(new_size, MAX_DYNAMIC_TABLE_SIZE);
+            self.max_size = @min(new_size, dynamic_table_bytes_max);
 
             while (self.current_size > self.max_size and self.count > 0) {
                 self.evictOldestEntry();
             }
             self.compactStorage();
+        }
+
+        /// SETTINGS reductions must be signaled even if another SETTINGS restores
+        /// the limit before the next field block (RFC 9113 § 4.3.1).
+        pub fn setEncoderMaxAllowedSize(self: *DynamicTable, new_size: usize) void {
+            const previous_size = self.max_size;
+            self.setMaxAllowedSize(new_size);
+            if (self.max_size == previous_size) return;
+            self.pending_encoder_size_min = if (self.pending_encoder_size_min) |minimum|
+                @min(minimum, self.max_size)
+            else
+                self.max_size;
+        }
+
+        /// Emit at most two updates. Commit pending state only once both fit.
+        pub fn encodePendingSizeUpdates(
+            self: *DynamicTable,
+            buffer: *std.ArrayList(u8),
+        ) !void {
+            const minimum = self.pending_encoder_size_min orelse return;
+            assert(minimum <= self.max_size);
+            assert(self.max_size <= dynamic_table_bytes_max);
+            assert(buffer.items.len == 0);
+            var storage: [6]u8 = undefined;
+            var updates = std.ArrayList(u8).initBuffer(&storage);
+            try Hpack.encodeInt(minimum, 5, &updates, 0x20);
+            if (minimum != self.max_size) {
+                try Hpack.encodeInt(self.max_size, 5, &updates, 0x20);
+            }
+            try appendSliceBounded(buffer, updates.items);
+            self.pending_encoder_size_min = null;
         }
 
         fn ensureStorageCapacity(self: *DynamicTable, bytes_needed: usize) !void {
@@ -368,7 +401,7 @@ pub const Hpack = struct {
                 return;
             }
 
-            var compacted: [MAX_DYNAMIC_TABLE_SIZE]u8 = undefined;
+            var compacted: [dynamic_table_bytes_max]u8 = undefined;
             var layouts: [MAX_DYNAMIC_TABLE_ENTRIES]EntryLayout = undefined;
             var layouts_count: usize = 0;
             var compacted_used: usize = 0;
@@ -488,7 +521,7 @@ pub const Hpack = struct {
         str: []const u8,
         buffer: *std.ArrayList(u8),
     ) !void {
-        assert(str.len <= MAX_HEADER_LIST_SIZE);
+        assert(str.len <= encoded_field_bytes_max);
         assert(@intFromPtr(buffer) != 0);
 
         const use_huffman = str.len > 16; // Threshold for Huffman benefit
@@ -511,10 +544,11 @@ pub const Hpack = struct {
         buffer: *std.ArrayList(u8),
     ) !void {
         assert(field.name.len > 0);
-        assert(field.name.len <= MAX_HEADER_LIST_SIZE);
+        assert(field.name.len <= encoded_field_bytes_max);
         assert(@intFromPtr(dynamic_table) != 0);
         assert(@intFromPtr(buffer) != 0);
 
+        try dynamic_table.encodePendingSizeUpdates(buffer);
         const static_index = Hpack.StaticTable.getStaticIndex(field.name, field.value);
         if (static_index) |idx| {
             // Indexed Header Field Representation (Section 6.1)
@@ -551,7 +585,7 @@ pub const Hpack = struct {
         buffer: *std.ArrayList(u8),
     ) !void {
         assert(field.name.len > 0);
-        assert(field.name.len <= MAX_HEADER_LIST_SIZE);
+        assert(field.name.len <= encoded_field_bytes_max);
         assert(@intFromPtr(buffer) != 0);
 
         if (Hpack.StaticTable.getStaticIndex(field.name, field.value)) |index| {
@@ -582,8 +616,13 @@ pub const Hpack = struct {
         buffer.appendSliceBounded(bytes) catch return error.HpackEncodeBufferFull;
     }
 
+    pub const DecodedRepresentation = union(enum) {
+        field: HeaderField,
+        table_size_update: usize,
+    };
+
     pub const DecodedHeaderView = struct {
-        header: HeaderField,
+        representation: DecodedRepresentation,
         bytes_consumed: usize,
     };
 
@@ -635,7 +674,10 @@ pub const Hpack = struct {
             Hpack.StaticTable.get(integer.value - 1)
         else
             try dynamic_table.getEntryByHpackIndex(integer.value);
-        return .{ .header = header, .bytes_consumed = integer.bytes_consumed };
+        return .{
+            .representation = .{ .field = header },
+            .bytes_consumed = integer.bytes_consumed,
+        };
     }
 
     fn decodeLiteralHeaderView(
@@ -657,7 +699,7 @@ pub const Hpack = struct {
 
         const header = HeaderField{ .name = name, .value = value.value };
         if (add_to_table) try dynamic_table.addEntry(header);
-        return .{ .header = header, .bytes_consumed = cursor };
+        return .{ .representation = .{ .field = header }, .bytes_consumed = cursor };
     }
 
     fn decodeHeaderNameView(
@@ -684,7 +726,7 @@ pub const Hpack = struct {
         const integer = try Hpack.decodeIntWithCursor(5, payload);
         try dynamic_table.updateMaxSize(integer.value);
         return .{
-            .header = .{ .name = "", .value = "" },
+            .representation = .{ .table_size_update = integer.value },
             .bytes_consumed = integer.bytes_consumed,
         };
     }
@@ -699,17 +741,18 @@ pub const Hpack = struct {
         }
         const decoded_view = try Hpack.decodeHeaderFieldView(payload, dynamic_table);
 
-        if (decoded_view.header.name.len == 0) {
-            return DecodedHeader{
-                .header = decoded_view.header,
+        const header = switch (decoded_view.representation) {
+            .field => |value| value,
+            .table_size_update => return .{
+                .header = .{ .name = "", .value = "" },
                 .bytes_consumed = decoded_view.bytes_consumed,
                 .allocator = allocator,
-            };
-        }
+            },
+        };
 
-        const owned_name = try allocator.dupe(u8, decoded_view.header.name);
+        const owned_name = try allocator.dupe(u8, header.name);
         errdefer allocator.free(owned_name);
-        const owned_value = try allocator.dupe(u8, decoded_view.header.value);
+        const owned_value = try allocator.dupe(u8, header.value);
 
         return DecodedHeader{
             .header = .{
@@ -1036,18 +1079,19 @@ test "HPACK borrowed decoding of RFC 7541 C.3.1 First Request" {
         );
         cursor += decoded_header.bytes_consumed;
 
-        if (decoded_header.header.name.len == 0) {
-            continue;
-        }
+        const header = switch (decoded_header.representation) {
+            .field => |value| value,
+            .table_size_update => continue,
+        };
 
         try std.testing.expect(expected_index < expected_headers.len);
         try std.testing.expectEqualStrings(
             expected_headers[expected_index].name,
-            decoded_header.header.name,
+            header.name,
         );
         try std.testing.expectEqualStrings(
             expected_headers[expected_index].value,
-            decoded_header.header.value,
+            header.value,
         );
         expected_index += 1;
     }
@@ -1115,4 +1159,23 @@ test "HPACK encoding and decoding of :status and content-length using static tab
     const decoded_content_length = headers_list.items[1];
     try std.testing.expectEqualStrings("content-length", decoded_content_length.name);
     try std.testing.expectEqualStrings("13", decoded_content_length.value);
+}
+
+test "pending encoder size updates survive output capacity failure" {
+    var table = Hpack.DynamicTable.init(4096);
+    table.setEncoderMaxAllowedSize(64);
+    table.setEncoderMaxAllowedSize(256);
+    var small: [1]u8 = undefined;
+    var output = std.ArrayList(u8).initBuffer(&small);
+    try std.testing.expectError(
+        error.HpackEncodeBufferFull,
+        table.encodePendingSizeUpdates(&output),
+    );
+    try std.testing.expectEqual(@as(usize, 0), output.items.len);
+    try std.testing.expectEqual(@as(?usize, 64), table.pending_encoder_size_min);
+    var storage: [6]u8 = undefined;
+    output = std.ArrayList(u8).initBuffer(&storage);
+    try table.encodePendingSizeUpdates(&output);
+    try std.testing.expectEqual(@as(?usize, null), table.pending_encoder_size_min);
+    try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0x21, 0x3f, 0xe1, 0x01 }, output.items);
 }

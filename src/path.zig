@@ -1,4 +1,5 @@
-//! HTTP request-target normalization as defined by RFC 9113 § 8.1.2.3.
+//! HTTP request-target normalization for the ":path" pseudo-header field
+//! defined by RFC 9113 § 8.3.1.
 //!
 //! The module normalises percent-encoded bytes, resolves `.` and `..` path
 //! segments, separates the query string, and rejects targets containing

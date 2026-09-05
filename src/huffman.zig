@@ -1,4 +1,6 @@
 const std = @import("std");
+
+const bounded_input_bytes_max: usize = 16 * 1024;
 const assert = std.debug.assert;
 
 pub const Huffman = struct {
@@ -335,7 +337,7 @@ pub const Huffman = struct {
     }
 
     pub fn encodeBounded(input: []const u8, output: []u8) ![]u8 {
-        std.debug.assert(input.len <= 16384);
+        std.debug.assert(input.len <= bounded_input_bytes_max);
         var bit_buffer: u64 = 0;
         var bit_count: u6 = 0;
         var output_used: usize = 0;
@@ -373,7 +375,7 @@ pub const Huffman = struct {
     }
 
     pub fn decodeBounded(input: []const u8, output: []u8) ![]u8 {
-        std.debug.assert(input.len <= 16384);
+        std.debug.assert(input.len <= bounded_input_bytes_max);
 
         var output_used: usize = 0;
         var code: u32 = 0;

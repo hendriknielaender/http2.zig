@@ -33,8 +33,15 @@ const tigerstyle_checked_paths = [_][]const u8{
     "src/io/poll/kqueue.zig",
     "src/io/poll/epoll.zig",
     "src/http2.zig",
+    "src/protocol.zig",
     "src/transport.zig",
     "src/frame.zig",
+    "src/field.zig",
+    "src/field_block.zig",
+    "src/connection.zig",
+    "src/frame_handler.zig",
+    "src/stream.zig",
+    "src/rfc9113_test.zig",
     "src/hpack.zig",
     "src/huffman.zig",
     "src/stream_storage.zig",
@@ -45,52 +52,6 @@ const tigerstyle_checked_paths = [_][]const u8{
     "benchmarks/benchmark.zig",
     "tools/static_allocator_probe.zig",
     "tools/tigerstyle.zig",
-};
-
-const TigerStyleRegion = struct {
-    path: []const u8,
-    start_marker: []const u8,
-    end_marker: []const u8,
-};
-
-// These legacy files predate project-wide TigerStyle. Keep the allocator-facing
-// startup surface gated without making validation depend on the working-tree diff.
-const tigerstyle_checked_regions = [_]TigerStyleRegion{
-    .{
-        .path = "src/connection.zig",
-        .start_marker = "pub const Connection = struct {",
-        .end_marker = "    pub fn bindRequestDispatcher(",
-    },
-    .{
-        .path = "src/frame_handler.zig",
-        .start_marker = "pub const DispatchContext = struct {",
-        .end_marker = "pub fn dispatchFrameOptimized(",
-    },
-    .{
-        .path = "src/connection.zig",
-        .start_marker = "    fn continue_ready_streams_before_read(",
-        .end_marker = "    const FlushReadyResult = struct {",
-    },
-    .{
-        .path = "src/connection.zig",
-        .start_marker = "test \"streaming scheduler bounds fair rounds and continues without input\" {",
-        .end_marker = "test \"event-driven PRIORITY frame rejects payload lengths other than five octets\" {",
-    },
-    .{
-        .path = "src/frame_handler.zig",
-        .start_marker = "fn handleStreamLevelFrameProcess(",
-        .end_marker = "fn handleStreamLevelFrameUpdateContinuationState(",
-    },
-    .{
-        .path = "src/frame_handler.zig",
-        .start_marker = "fn handleWindowUpdate(",
-        .end_marker = "pub fn handlePriorityUpdateFrame(",
-    },
-    .{
-        .path = "src/stream.zig",
-        .start_marker = "            pub fn updateSendWindow(",
-        .end_marker = "            pub fn sendRstStream(",
-    },
 };
 
 pub fn build(b: *std.Build) void {
@@ -560,7 +521,11 @@ fn add_tests(
 ) void {
     // Unit tests for core modules
     const test_modules = [_][]const u8{
+        "src/protocol.zig",
         "src/frame.zig",
+        "src/field.zig",
+        "src/field_block.zig",
+        "src/rfc9113_test.zig",
         "src/stream.zig",
         "src/budget_assertions.zig",
         "src/connection.zig",
@@ -740,12 +705,8 @@ fn add_code_quality_checks(b: *std.Build, ci: *CiDeps) void {
     for (tigerstyle_checked_paths) |path| {
         run_tigerstyle.addFileArg(b.path(path));
     }
-    for (tigerstyle_checked_regions) |region| {
-        run_tigerstyle.addArg("--region");
-        run_tigerstyle.addFileArg(b.path(region.path));
-        run_tigerstyle.addArg(region.start_marker);
-        run_tigerstyle.addArg(region.end_marker);
-    }
+    const checker_tests = b.addTest(.{ .root_module = tigerstyle_checker.root_module });
+    const run_checker_tests = b.addRunArtifact(checker_tests);
 
     const tigerstyle_step = b.step(
         "tigerstyle",
@@ -753,5 +714,6 @@ fn add_code_quality_checks(b: *std.Build, ci: *CiDeps) void {
     );
     tigerstyle_step.dependOn(&fmt_check.step);
     tigerstyle_step.dependOn(&run_tigerstyle.step);
+    tigerstyle_step.dependOn(&run_checker_tests.step);
     ci.tigerstyle = tigerstyle_step;
 }

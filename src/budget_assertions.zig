@@ -4,6 +4,7 @@
 //! budget fails the build before any test or deployment can run.
 const std = @import("std");
 const memory_budget = @import("memory_budget.zig");
+const protocol = @import("protocol.zig");
 const MemBudget = memory_budget.MemBudget;
 
 /// Validate resource counts are non-zero and within reasonable ceilings.
@@ -106,23 +107,20 @@ fn validatePerConnectionSizing() void {
 /// Validate HTTP/2 protocol constants embedded in the budget.
 fn validateProtocolConstants() void {
     comptime {
-        const http2_max_frame_size = 16 * memory_budget.MiB;
-        if (MemBudget.max_frame_size_bytes > http2_max_frame_size) {
+        if (MemBudget.max_frame_size_bytes > protocol.frame_payload_size_max) {
             @compileError(std.fmt.comptimePrint(
                 "Max frame size exceeds HTTP/2 limit: {d} > {d}",
-                .{ MemBudget.max_frame_size_bytes, http2_max_frame_size },
+                .{ MemBudget.max_frame_size_bytes, protocol.frame_payload_size_max },
             ));
         }
-        // RFC 7540 §4.2: frame payload minimum is 16384.
-        if (MemBudget.max_frame_size_bytes < 16384) {
+        if (MemBudget.max_frame_size_bytes < protocol.frame_payload_size_default) {
             @compileError(std.fmt.comptimePrint(
-                "Max frame size below HTTP/2 minimum: {d} < 16384",
-                .{MemBudget.max_frame_size_bytes},
+                "Max frame size below HTTP/2 minimum: {d} < {d}",
+                .{ MemBudget.max_frame_size_bytes, protocol.frame_payload_size_default },
             ));
         }
 
-        const max_window_size = 2_147_483_647;
-        if (MemBudget.max_data_buffer_bytes > max_window_size) {
+        if (MemBudget.max_data_buffer_bytes > protocol.flow_control_window_size_max) {
             @compileError("Stream data buffer exceeds the HTTP/2 flow-control limit");
         }
     }
