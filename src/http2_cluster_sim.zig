@@ -6,6 +6,7 @@
 //! checker is protocol-aware enough to catch stream/accounting violations.
 
 const std = @import("std");
+const protocol = @import("protocol.zig");
 const assert = std.debug.assert;
 
 pub const std_options: std.Options = .{
@@ -119,6 +120,8 @@ pub const Http2Peer = struct {
         self.connection.bindRequestDispatcher(
             handler.RequestDispatcher.fromHandlerWithoutHeaders(clusterHandler),
         );
+        const peer_settings = Packet.init(0, 0, .SETTINGS, 0, 0, "");
+        try self.connection.handleFrameEventDriven(frameFromPacket(&peer_settings));
     }
 
     fn deinit(self: *Http2Peer) void {
@@ -155,7 +158,7 @@ const ClientOracle = struct {
 
     fn init() ClientOracle {
         return .{
-            .decoder_table = Hpack.DynamicTable.init(4096),
+            .decoder_table = Hpack.DynamicTable.init(protocol.hpack_dynamic_table_size_default),
             .streams = undefined,
             .stream_count = 0,
             .completed_responses = 0,
@@ -218,7 +221,11 @@ const ClientOracle = struct {
                 &self.decoder_table,
             );
             cursor += decoded.bytes_consumed;
-            if (std.mem.eql(u8, decoded.header.name, ":status")) {
+            const header = switch (decoded.representation) {
+                .field => |value| value,
+                .table_size_update => continue,
+            };
+            if (std.mem.eql(u8, header.name, ":status")) {
                 status_seen = true;
             }
         }
@@ -443,7 +450,7 @@ pub const Http2Cluster = struct {
         const client_encoder_tables = try allocator.alloc(Hpack.DynamicTable, options.client_count);
         errdefer allocator.free(client_encoder_tables);
         for (client_encoder_tables) |*table| {
-            table.* = Hpack.DynamicTable.init(4096);
+            table.* = Hpack.DynamicTable.init(protocol.hpack_dynamic_table_size_default);
         }
         errdefer for (client_encoder_tables) |*table| table.deinit();
 

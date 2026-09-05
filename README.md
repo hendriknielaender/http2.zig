@@ -25,7 +25,7 @@ Cross-platform protocol core • Static event-loop runtime
 - 💾 **Static Zig memory on Linux and the BSDs** - bounded pools replace hot-path heap growth
 - 🔒 **Bounded concurrency** - fixed connection, stream, and event-loop task capacities
 - 🧩 **Bring your own router** - plug in any dispatcher or router you want
-- ✅ **HTTP/2 RFC 7540** compliant
+- ✅ **RFC 9113-aligned HTTP/2 server core**, with **RFC 9218** extensible prioritization
 
 ## Quick Start
 
@@ -508,5 +508,6 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 - Built with Zig 0.16 std.Io
 - Inspired by [TigerBeetle](https://tigerbeetle.com)'s zero-allocation principles
-- HTTP/2 Specification - [RFC 7540](https://tools.ietf.org/html/rfc7540)
-- HPACK Specification - [RFC 7541](https://tools.ietf.org/html/rfc7541)
+- HTTP/2 Specification - [RFC 9113](https://www.rfc-editor.org/rfc/rfc9113) (obsoletes RFC 7540)
+- HPACK Specification - [RFC 7541](https://www.rfc-editor.org/rfc/rfc7541)
+- Extensible Prioritization Scheme - [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218)

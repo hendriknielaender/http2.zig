@@ -41,14 +41,22 @@ run: cert build
 	@echo "Starting HTTP/2 TLS server on https://localhost:$(PORT)"
 	@./zig-out/bin/basic_tls_server
 
+# All h2spec sections but http2/5.3, which asserts the self-dependency rule
+# RFC 9113 deleted (see 5.3.2 and 6.3). h2spec has no exclude flag.
+H2SPEC_SECTIONS=generic http2/3 http2/4 http2/5.1 http2/5.4 http2/5.5 \
+	http2/6 http2/7 http2/8 hpack
+
 # Test with h2spec
 test-h2spec: cert build
 	@echo "Running h2spec tests against TLS server..."
 	@./zig-out/bin/basic_tls_server &
 	@SERVER_PID=$$!; \
 	sleep 2; \
-	h2spec -h localhost -p $(PORT) -t -k || true; \
-	kill $$SERVER_PID 2>/dev/null || true
+	STATUS=0; \
+	h2spec -S -h localhost -p $(PORT) -t -k $(H2SPEC_SECTIONS) || STATUS=$$?; \
+	kill $$SERVER_PID 2>/dev/null || true; \
+	wait $$SERVER_PID 2>/dev/null || true; \
+	exit $$STATUS
 
 # Run unit tests
 test: build

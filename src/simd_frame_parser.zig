@@ -8,6 +8,7 @@
 const std = @import("std");
 const frame = @import("frame.zig");
 const builtin = @import("builtin");
+const protocol = @import("protocol.zig");
 
 pub const FrameFlags = frame.FrameFlags;
 
@@ -32,14 +33,14 @@ pub const SIMDFrameParser = struct {
         InsufficientData,
         InvalidFrameLength,
     }!ParsedFrameHeader {
-        if (data.len < 9) {
+        if (data.len < protocol.frame_header_size) {
             return error.InsufficientData;
         }
 
         const length = (@as(u32, data[0]) << 16) |
             (@as(u32, data[1]) << 8) |
             @as(u32, data[2]);
-        if (length > 0xFFFFFF) {
+        if (length > protocol.frame_payload_size_max) {
             return error.InvalidFrameLength;
         }
 
@@ -49,8 +50,8 @@ pub const SIMDFrameParser = struct {
             .length = length,
             .frame_type = data[3],
             .flags = FrameFlags.init(data[4]),
-            .reserved = (stream_id_raw & 0x80000000) != 0,
-            .stream_id = stream_id_raw & 0x7FFFFFFF,
+            .reserved = (stream_id_raw & protocol.stream_identifier_reserved_bit) != 0,
+            .stream_id = stream_id_raw & protocol.stream_identifier_max,
         };
     }
 

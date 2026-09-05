@@ -9,6 +9,13 @@ const adapter_io_buffer_size: u32 = @intCast(@max(
     http2_boring.TlsBufferSize,
 ));
 const listener_handle_none = std.math.maxInt(usize);
+const http2_tls12_cipher_list: [:0]const u8 =
+    "ECDHE-ECDSA-AES128-GCM-SHA256:" ++
+    "ECDHE-RSA-AES128-GCM-SHA256:" ++
+    "ECDHE-ECDSA-AES256-GCM-SHA384:" ++
+    "ECDHE-RSA-AES256-GCM-SHA384:" ++
+    "ECDHE-ECDSA-CHACHA20-POLY1305:" ++
+    "ECDHE-RSA-CHACHA20-POLY1305";
 
 const RunState = enum(u8) {
     stopped,
@@ -183,6 +190,11 @@ pub const Server = struct {
 
         var builder = try boring.ssl.ContextBuilder.init(boring.ssl.Method.tls());
         defer builder.deinit();
+
+        // RFC 9113 § 9.2: HTTP/2 over TLS requires TLS 1.2 or newer and
+        // forbids the HTTP/2 cipher-suite blacklist from Appendix A.
+        try builder.setMinProtoVersion(boring.ssl.SslVersion.tlsV1_2);
+        try builder.setCipherList(http2_tls12_cipher_list);
 
         try builder.setCertificateChainFile(config.cert_file);
         try builder.setPrivateKeyFile(config.key_file, .pem);

@@ -5,11 +5,12 @@
 //! - Static memory allocation with compile-time budgets
 //! - Zero-copy operations where possible
 //! - Lock-free atomic operations
-//! - Full HTTP/2 RFC 7540 compliance
+//! - HTTP/2 per RFC 9113 (obsoletes RFC 7540), with RFC 9218 prioritization
 //! - 190k+ requests per second performance
 
 const std = @import("std");
 const builtin = @import("builtin");
+pub const protocol = @import("protocol.zig");
 
 // Statically allocating event loop (see `src/io/EventLoop.zig`), derived from
 // `std.Io.Kqueue` and reworked to preallocate fibers, worker stacks, and wait
@@ -53,6 +54,9 @@ pub const serveConnection = transport.serveConnection;
 // Request-target path normalization.
 pub const path = @import("path.zig");
 
+// HTTP field-name and field-value validation (RFC 9113 § 8.2.1, § 8.3.1).
+pub const field = @import("field.zig");
+
 // Per-connection stream slot storage with O(1) lookup.
 pub const stream_storage = @import("stream_storage.zig");
 
@@ -68,9 +72,10 @@ pub const Mime = handler.Mime;
 pub const Method = handler.Method;
 
 // Protocol Constants
-pub const max_frame_size_default = 16384;
+pub const EndpointRole = protocol.EndpointRole;
+pub const max_frame_size_default = protocol.frame_payload_size_default;
 pub const max_header_list_size_default = 8192;
-pub const initial_window_size_default = 65535;
+pub const initial_window_size_default = protocol.flow_control_window_size_default;
 
 pub const Server = @import("server.zig").Server;
 
@@ -129,10 +134,10 @@ comptime {
     budget_assertions.validateAll();
 
     // Assert HTTP/2 protocol constant relationships
-    std.debug.assert(max_frame_size_default >= 16384); // RFC 7540 minimum
-    std.debug.assert(max_frame_size_default <= 16777215); // RFC 7540 maximum
+    std.debug.assert(max_frame_size_default >= protocol.frame_payload_size_default);
+    std.debug.assert(max_frame_size_default <= protocol.frame_payload_size_max);
     std.debug.assert(initial_window_size_default >= 0);
-    std.debug.assert(initial_window_size_default <= 2147483647); // RFC 7540 maximum
+    std.debug.assert(initial_window_size_default <= protocol.flow_control_window_size_max);
     std.debug.assert(max_header_list_size_default > 0);
 
     // Assert memory layout assumptions

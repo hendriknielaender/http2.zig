@@ -6,6 +6,7 @@
 const std = @import("std");
 const Hpack = @import("hpack.zig").Hpack;
 const memory_budget = @import("memory_budget.zig");
+const field = @import("field.zig");
 
 /// HTTP status codes commonly used in responses.
 pub const Status = enum(u16) {
@@ -394,7 +395,10 @@ pub const Response = struct {
     pub fn addHeader(self: *Self, name: []const u8, value: []const u8) !void {
         std.debug.assert(name.len > 0);
         if (self.stream_source != null) return error.StreamHeadersMustBeConfigured;
-        if (!isAllLowercaseHeaderName(name)) return error.InvalidHeaderName;
+        // RFC 9113 § 8.2 and § 8.2.1: a response may not carry a name or value that
+        // HTTP field syntax forbids, the same rule applied to what arrives.
+        if (!field.nameIsValid(name)) return error.InvalidHeaderName;
+        if (!field.valueIsValid(value)) return error.InvalidHeaderValue;
         if (isConnectionSpecificResponseHeader(name)) {
             return error.ConnectionSpecificResponseHeader;
         }
@@ -414,6 +418,9 @@ pub const Response = struct {
     pub fn setBody(self: *Self, body: []const u8) !void {
         std.debug.assert(body.len <= 1024 * 1024);
         if (self.stream_source != null) return error.ResponseBodyAlreadySet;
+        if (body.len > 0 and responseStatusDisallowsBody(self.status)) {
+            return error.ResponseStatusDisallowsBody;
+        }
         self.body = body;
         try self.ensureContentLength();
     }
@@ -642,15 +649,6 @@ pub const RequestDispatcher = struct {
     }
 };
 
-pub fn isAllLowercaseHeaderName(name: []const u8) bool {
-    for (name) |byte| {
-        if (std.ascii.isUpper(byte)) {
-            return false;
-        }
-    }
-    return true;
-}
-
 fn responseStatusDisallowsBody(status: Status) bool {
     return status == .no_content or status == .not_modified;
 }
@@ -660,6 +658,7 @@ fn isConnectionSpecificResponseHeader(name: []const u8) bool {
         "connection",
         "keep-alive",
         "proxy-connection",
+        "te",
         "transfer-encoding",
         "upgrade",
     };
@@ -704,14 +703,14 @@ fn streamStateIsInlineOwned(comptime Value: type) bool {
         .optional => |optional| streamStateIsInlineOwned(optional.child),
         .error_union => |error_union| streamStateIsInlineOwned(error_union.payload),
         .@"struct" => |structure| owned: {
-            for (structure.fields) |field| {
-                if (!streamStateIsInlineOwned(field.type)) break :owned false;
+            for (structure.fields) |struct_field| {
+                if (!streamStateIsInlineOwned(struct_field.type)) break :owned false;
             }
             break :owned true;
         },
         .@"union" => |union_info| owned: {
-            for (union_info.fields) |field| {
-                if (!streamStateIsInlineOwned(field.type)) break :owned false;
+            for (union_info.fields) |union_field| {
+                if (!streamStateIsInlineOwned(union_field.type)) break :owned false;
             }
             break :owned true;
         },
@@ -966,5 +965,23 @@ test "stream builder rejects HTTP/1 transfer framing and content length" {
     try std.testing.expectError(
         error.StreamHeadersMustBeConfigured,
         response.addHeader("x-runtime", "forbidden"),
+    );
+}
+
+test "responses reject TE and bodies forbidden by status" {
+    var response = Response.init(.ok);
+    try std.testing.expectError(
+        error.ConnectionSpecificResponseHeader,
+        response.addHeader("te", "trailers"),
+    );
+
+    const builder = ResponseBuilder.init();
+    try std.testing.expectError(
+        error.ResponseStatusDisallowsBody,
+        builder.apply(.{ .status = .no_content, .body = "not allowed" }),
+    );
+    try std.testing.expectError(
+        error.ResponseStatusDisallowsBody,
+        builder.apply(.{ .status = .not_modified, .body = "not allowed" }),
     );
 }

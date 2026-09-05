@@ -16,6 +16,8 @@ const Hpack = @import("hpack.zig").Hpack;
 const resp = @import("response.zig");
 const HttpPriority = @import("http_priority.zig").Priority;
 const memory_budget = @import("memory_budget.zig");
+const protocol = @import("protocol.zig");
+const field_block = @import("field_block.zig");
 
 const stream_storage_module = @import("stream_storage.zig");
 const StreamStorage = stream_storage_module.StreamStorage;
@@ -27,12 +29,11 @@ const log = std.log.scoped(.frame_handler);
 
 const priority_frame_payload_size: usize = 5;
 const priority_update_payload_id_size: usize = 4;
-const settings_no_rfc7540_priorities_id: u16 = 0x9;
 
 comptime {
     assert(priority_frame_payload_size == 5);
     assert(priority_update_payload_id_size == 4);
-    assert(settings_no_rfc7540_priorities_id == 0x9);
+    assert(protocol.settings_no_rfc7540_priorities_id == 0x9);
 }
 
 const FrameHandler = enum(u8) {
@@ -67,12 +68,22 @@ const FrameHandler = enum(u8) {
 };
 
 pub const Settings = struct {
-    header_table_size: u32 = 4096,
-    enable_push: bool = true,
+    /// Largest HPACK dynamic table this endpoint decodes: what
+    /// SETTINGS_HEADER_TABLE_SIZE advertises, and what bounds the local decoder.
+    header_table_size: u32 = protocol.hpack_dynamic_table_size_default,
+    /// Largest table the peer decodes; bounds the local encoder. Separate from
+    /// `header_table_size` so the next SETTINGS cannot advertise the peer's number.
+    peer_header_table_size: u32 = protocol.hpack_dynamic_table_size_default,
+    /// SETTINGS received from the peer constrain what this endpoint sends.
+    peer_enable_push: bool = true,
+    peer_max_concurrent_streams: u32 = std.math.maxInt(u32),
+    peer_initial_window_size: u32 = protocol.flow_control_window_size_default,
+    peer_max_header_list_size: u32 = std.math.maxInt(u32),
+    /// SETTINGS sent by this endpoint constrain what the peer sends.
     max_concurrent_streams: u32 = max_streams_per_connection,
-    initial_window_size: u32 = 65535,
+    initial_window_size: u32 = protocol.flow_control_window_size_default,
     /// Maximum frame payload size advertised by the peer for outbound frames.
-    peer_max_frame_size: u32 = 16384,
+    peer_max_frame_size: u32 = protocol.frame_payload_size_default,
     max_header_list_size: u32 = 8192,
     no_rfc7540_priorities: bool = true,
 
@@ -111,17 +122,12 @@ pub const DispatchContext = struct {
     schedule_epoch_next: *u64,
     completed_responses_pending: *u32,
     connection_closed: *bool,
+    role: protocol.EndpointRole,
     conn_ptr: *anyopaque,
 };
 
 pub fn dispatchFrameOptimized(ctx: *DispatchContext, frame: Frame) !void {
-    if (frame.header.length == 0 and
-        frame.header.frame_type == .DATA and
-        frame.header.stream_id == 0 and
-        frame.payload.len == 0)
-    {
-        return;
-    }
+    if (frame.ignored_extension) return;
 
     const frame_type_u8 = @intFromEnum(frame.header.frame_type);
     const frame_handler = FrameHandler.fromFrameType(frame_type_u8) orelse {
@@ -156,6 +162,10 @@ fn handleDataFrameOptimized(ctx: *DispatchContext, frame: Frame) !void {
         return sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x1, "DATA frame on stream 0");
     }
 
+    // RFC 9113 § 6.9: every DATA payload consumes connection credit even if
+    // the stream is closed or the frame later causes a stream error.
+    try accountConnectionData(ctx, frame.header.length);
+
     if (ctx.stream_storage.find(frame.header.stream_id)) |stream| {
         switch (stream.state) {
             .Idle => {
@@ -164,24 +174,29 @@ fn handleDataFrameOptimized(ctx: *DispatchContext, frame: Frame) !void {
                 return error.ProtocolError;
             },
             .HalfClosedRemote => {
-                log.err("DATA on HalfClosedRemote stream {}: STREAM_CLOSED", .{frame.header.stream_id});
+                log.err(
+                    "DATA on HalfClosedRemote stream {}: STREAM_CLOSED",
+                    .{frame.header.stream_id},
+                );
                 return sendRstStream(ctx, frame.header.stream_id, 0x5);
             },
             .Closed => {
-                log.debug("DATA frame on closed stream {}: sending RST_STREAM", .{frame.header.stream_id});
+                log.debug(
+                    "DATA frame on closed stream {}: sending RST_STREAM",
+                    .{frame.header.stream_id},
+                );
                 return sendRstStream(ctx, frame.header.stream_id, 0x5);
             },
             else => {},
         }
 
-        if (frame.header.length > 0) {
-            try sendWindowUpdate(ctx, 0, @intCast(frame.header.length));
-        }
-
         try handleOptimizedStreamFrame(ctx, stream, frame);
     } else {
         if (frame.header.stream_id <= ctx.last_stream_id.*) {
-            log.debug("DATA frame on closed stream {}: sending RST_STREAM", .{frame.header.stream_id});
+            log.debug(
+                "DATA frame on closed stream {}: sending RST_STREAM",
+                .{frame.header.stream_id},
+            );
             return sendRstStream(ctx, frame.header.stream_id, 0x5);
         }
         log.err("DATA frame on idle stream {}: PROTOCOL_ERROR", .{frame.header.stream_id});
@@ -198,12 +213,18 @@ fn handleHeadersFrameOptimized(ctx: *DispatchContext, frame: Frame) !void {
     if (ctx.stream_storage.find(frame.header.stream_id)) |stream| {
         switch (stream.state) {
             .HalfClosedRemote => {
-                log.err("HEADERS on HalfClosedRemote stream {}: STREAM_CLOSED", .{frame.header.stream_id});
-                return sendRstStream(ctx, frame.header.stream_id, 0x5);
+                log.err(
+                    "HEADERS on HalfClosedRemote stream {}: STREAM_CLOSED",
+                    .{frame.header.stream_id},
+                );
+                return discardHeaders(ctx, frame, 0x5);
             },
             .Closed => {
-                log.debug("HEADERS frame on closed stream {}: sending RST_STREAM", .{frame.header.stream_id});
-                return sendRstStream(ctx, frame.header.stream_id, 0x5);
+                log.debug(
+                    "HEADERS frame on closed stream {}: sending RST_STREAM",
+                    .{frame.header.stream_id},
+                );
+                return discardHeaders(ctx, frame, 0x5);
             },
             else => {},
         }
@@ -212,17 +233,28 @@ fn handleHeadersFrameOptimized(ctx: *DispatchContext, frame: Frame) !void {
             frame.header.stream_id,
             ctx.last_stream_id.*,
         });
-        try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x1, "Stream ID decreased: PROTOCOL_ERROR");
+        try sendGoawayAndClose(
+            ctx,
+            ctx.last_stream_id.*,
+            0x1,
+            "Stream ID decreased: PROTOCOL_ERROR",
+        );
         return error.ProtocolError;
     } else if (frame.header.stream_id == ctx.last_stream_id.*) {
         log.debug("HEADERS on released stream {}: STREAM_CLOSED", .{frame.header.stream_id});
-        try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x5, "HEADERS on closed stream: STREAM_CLOSED");
+        try sendGoawayAndClose(
+            ctx,
+            ctx.last_stream_id.*,
+            0x5,
+            "HEADERS on closed stream: STREAM_CLOSED",
+        );
         return error.StreamClosed;
     }
 
     const stream = getStream(ctx, frame.header.stream_id) catch |err| {
         if (err == error.MaxConcurrentStreamsExceeded) {
-            return sendRstStream(ctx, frame.header.stream_id, 0x7);
+            ctx.last_stream_id.* = frame.header.stream_id;
+            return discardHeaders(ctx, frame, 0x7);
         }
         return err;
     };
@@ -242,12 +274,8 @@ fn handlePriorityFrameOptimized(ctx: *DispatchContext, frame: Frame) !void {
     if (ctx.stream_storage.find(frame.header.stream_id)) |stream| {
         try handleOptimizedStreamFrame(ctx, stream, frame);
     } else if (frame.header.stream_id > ctx.last_stream_id.*) {
-        const dep = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF;
-        if (dep == frame.header.stream_id) {
-            log.err("PRIORITY on idle stream {} depends on itself: PROTOCOL_ERROR", .{frame.header.stream_id});
-            try sendGoawayAndClose(ctx, 0, 0x1, "PRIORITY depends on itself: PROTOCOL_ERROR");
-            return error.ProtocolError;
-        }
+        // RFC 9113 § 6.3: PRIORITY may arrive in any stream state and changes none of
+        // it. The RFC 7540 self-dependency error is not carried over; see § 5.3.2.
         log.debug("Ignoring PRIORITY on idle stream {d}", .{frame.header.stream_id});
     } else {
         log.debug("Ignoring PRIORITY on closed stream {d}", .{frame.header.stream_id});
@@ -342,12 +370,51 @@ fn handleContinuationFrameOptimized(ctx: *DispatchContext, frame: Frame) !void {
         try sendGoawayAndClose(ctx, 0, 0x1, "CONTINUATION on wrong stream: PROTOCOL_ERROR");
         return error.ProtocolError;
     }
+    if (ctx.stream_storage.discarded_headers.stream_id != 0) {
+        return appendDiscardedHeaders(ctx, frame, frame.payload);
+    }
     const stream = ctx.stream_storage.find(frame.header.stream_id) orelse {
         log.err("CONTINUATION on idle stream {}: PROTOCOL_ERROR", .{frame.header.stream_id});
         try sendGoawayAndClose(ctx, 0, 0x1, "CONTINUATION on idle stream: PROTOCOL_ERROR");
         return error.ProtocolError;
     };
     try handleOptimizedStreamFrame(ctx, stream, frame);
+}
+
+fn discardHeaders(ctx: *DispatchContext, frame: Frame, error_code: u32) !void {
+    const fragment = field_block.headersFragment(frame) catch |err| {
+        const code: u32 = if (err == error.FrameSizeError) 0x6 else 0x1;
+        try sendGoawayAndClose(ctx, ctx.last_stream_id.*, code, "Invalid HEADERS framing");
+        return err;
+    };
+    ctx.stream_storage.discarded_headers.start(frame.header.stream_id, error_code);
+    return appendDiscardedHeaders(ctx, frame, fragment);
+}
+
+fn appendDiscardedHeaders(ctx: *DispatchContext, frame: Frame, fragment: []const u8) !void {
+    const discarded = &ctx.stream_storage.discarded_headers;
+    assert(discarded.stream_id == frame.header.stream_id);
+    discarded.append(fragment) catch return discardCompressionError(ctx);
+    if (!frame.header.flags.isEndHeaders()) {
+        ctx.expecting_continuation_stream_id.* = frame.header.stream_id;
+        return;
+    }
+    discarded.decode(ctx.hpack_decoder_table) catch return discardCompressionError(ctx);
+    try sendRstStream(ctx, discarded.stream_id, discarded.error_code);
+    if (ctx.stream_storage.findIndex(discarded.stream_id)) |index| {
+        const stream = ctx.stream_storage.findBySlotIndex(index);
+        stream.state = .Closed;
+        pendingStreamRemove(ctx, index);
+        stream.deinit();
+        ctx.stream_storage.releaseSlot(index);
+    }
+    discarded.reset();
+    ctx.expecting_continuation_stream_id.* = null;
+}
+
+fn discardCompressionError(ctx: *DispatchContext) !void {
+    try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x9, "Discarded field block not decoded");
+    return error.CompressionError;
 }
 
 fn handlePriorityUpdateFrameOptimized(ctx: *DispatchContext, frame: Frame) !void {
@@ -373,10 +440,17 @@ fn handleStreamLevelFrameProcess(
     frame: Frame,
 ) !void {
     stream.handleFrame(frame) catch |err| {
-        log.err("Error handling frame in stream {d}: {s}", .{
-            frame.header.stream_id,
-            @errorName(err),
-        });
+        if (ctx.goaway_sent.*) return;
+        // A malformed request is the peer's mistake and is answered per stream,
+        // so it stays at debug; anything else is worth an operator's attention.
+        if (err == error.MalformedRequest) {
+            log.debug("Malformed request on stream {d}", .{frame.header.stream_id});
+        } else {
+            log.err("Error handling frame in stream {d}: {s}", .{
+                frame.header.stream_id,
+                @errorName(err),
+            });
+        }
         if (ctx.goaway_sent.*) return;
         try handleStreamLevelFrameProcessError(ctx, frame.header.stream_id, err);
     };
@@ -417,6 +491,9 @@ fn handleStreamLevelFrameProcessError(
         error.FlowControlError => {
             try sendRstStream(ctx, stream_id, 0x3);
         },
+        // RFC 9113 § 8.1.1 makes a malformed message a stream error, and the
+        // stream has already sent its 400 and RST_STREAM. Other streams live on.
+        error.MalformedRequest => {},
         error.ProtocolError => {
             try sendGoawayAndClose(
                 ctx,
@@ -449,13 +526,16 @@ fn handleStreamLevelFrameUpdateContinuationState(ctx: *DispatchContext, frame: F
 
 fn handleGoawayFrame(ctx: *DispatchContext, frame: Frame) !void {
     if (frame.payload.len < 8) {
-        try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x1, "Invalid GOAWAY: PROTOCOL_ERROR");
-        return error.ProtocolError;
+        try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x6, "Invalid GOAWAY: FRAME_SIZE_ERROR");
+        return error.FrameSizeError;
     }
 
     const last_stream_id = std.mem.readInt(u32, frame.payload[0..4], .big) & 0x7FFFFFFF;
     const error_code = std.mem.readInt(u32, frame.payload[4..8], .big);
-    log.debug("Received GOAWAY with last_stream_id={d}, error_code={d}", .{ last_stream_id, error_code });
+    log.debug(
+        "Received GOAWAY with last_stream_id={d}, error_code={d}",
+        .{ last_stream_id, error_code },
+    );
 
     ctx.goaway_received.* = true;
     ctx.last_stream_id.* = last_stream_id;
@@ -511,7 +591,12 @@ pub fn handlePriorityUpdateFrame(ctx: *DispatchContext, frame: Frame) !void {
     const priority = HttpPriority.parse(
         frame.payload[priority_update_payload_id_size..],
     ) catch {
-        return sendGoawayAndClose(ctx, 0, 0x1, "Invalid PRIORITY_UPDATE field value: PROTOCOL_ERROR");
+        return sendGoawayAndClose(
+            ctx,
+            0,
+            0x1,
+            "Invalid PRIORITY_UPDATE field value: PROTOCOL_ERROR",
+        );
     };
 
     if (ctx.stream_storage.find(prioritized_id)) |stream| {
@@ -532,7 +617,12 @@ pub fn handlePriorityUpdateFrame(ctx: *DispatchContext, frame: Frame) !void {
 //  I/O helpers
 // -----------------------------------------------------------------------
 
-pub fn sendGoawayAndClose(ctx: *DispatchContext, last_stream_id: u32, error_code: u32, debug_msg: []const u8) !void {
+pub fn sendGoawayAndClose(
+    ctx: *DispatchContext,
+    last_stream_id: u32,
+    error_code: u32,
+    debug_msg: []const u8,
+) !void {
     if (!ctx.goaway_sent.*) {
         try sendGoaway(ctx, last_stream_id, error_code, debug_msg);
         ctx.goaway_sent.* = true;
@@ -555,7 +645,12 @@ fn sendRstStream(ctx: *DispatchContext, stream_id: u32, error_code: u32) !void {
     log.debug("Sent RST_STREAM with error code {d} for stream {d}", .{ error_code, stream_id });
 }
 
-fn sendGoaway(ctx: *DispatchContext, last_stream_id: u32, error_code: u32, debug_data: []const u8) !void {
+fn sendGoaway(
+    ctx: *DispatchContext,
+    last_stream_id: u32,
+    error_code: u32,
+    debug_data: []const u8,
+) !void {
     const debug_max = 96;
     const debug_len = @min(debug_data.len, debug_max);
     const payload_size = 8 + debug_len;
@@ -646,11 +741,36 @@ fn finishAfterGoaway(ctx: *DispatchContext) !void {
 //  Flow control
 // -----------------------------------------------------------------------
 
+fn accountConnectionData(ctx: *DispatchContext, length: u32) !void {
+    if (length == 0) return;
+    if (ctx.recv_window_size.* < 0 or length > @as(u32, @intCast(ctx.recv_window_size.*))) {
+        try sendGoawayAndClose(
+            ctx,
+            ctx.last_stream_id.*,
+            0x3,
+            "Connection receive window exceeded: FLOW_CONTROL_ERROR",
+        );
+        return error.FlowControlError;
+    }
+
+    const increment: i32 = @intCast(length);
+    ctx.recv_window_size.* -= increment;
+    try sendWindowUpdate(ctx, 0, length);
+    const restored = @addWithOverflow(ctx.recv_window_size.*, increment);
+    assert(restored[1] == 0);
+    ctx.recv_window_size.* = restored[0];
+}
+
 fn updateSendWindow(ctx: *DispatchContext, window: *i32, increment: u32) !void {
     const ov = @addWithOverflow(window.*, @as(i32, @intCast(increment)));
-    if (ov[0] > 2147483647 or ov[0] < 0) {
+    if (ov[0] > protocol.flow_control_window_size_max or ov[0] < 0) {
         if (!ctx.goaway_sent.*) {
-            sendGoaway(ctx, ctx.last_stream_id.*, 0x3, "Flow control window exceeded limits: FLOW_CONTROL_ERROR") catch {};
+            sendGoaway(
+                ctx,
+                ctx.last_stream_id.*,
+                0x3,
+                "Flow control window exceeded limits: FLOW_CONTROL_ERROR",
+            ) catch {};
             ctx.goaway_sent.* = true;
         }
         return error.FlowControlError;
@@ -682,8 +802,8 @@ fn getStream(ctx: *DispatchContext, stream_id: u32) !*StreamInstance {
     if (pendingPriorityUpdateTake(ctx, stream_id)) |priority| {
         stream_slot.applyPriority(priority);
     }
-    stream_slot.send_window_size = @intCast(ctx.settings.initial_window_size);
-    stream_slot.initial_window_size = ctx.settings.initial_window_size;
+    stream_slot.send_window_size = @intCast(ctx.settings.peer_initial_window_size);
+    stream_slot.initial_window_size = ctx.settings.peer_initial_window_size;
     return stream_slot;
 }
 
@@ -784,56 +904,54 @@ fn sendPriorityFrameSizeError(ctx: *DispatchContext) !void {
 //  SETTINGS frame handling
 // -----------------------------------------------------------------------
 
-fn applyFrameSettings(ctx: *DispatchContext, frame: Frame) !void {
-    assert(frame.header.frame_type == FrameType.SETTINGS);
-    assert(frame.header.stream_id == 0);
+pub fn applyFrameSettings(ctx: *DispatchContext, frame: Frame) !void {
+    assert(frame.header.frame_type == .SETTINGS);
     if (frame.header.stream_id != 0) {
-        if (!ctx.goaway_sent.*) {
-            try sendGoawayAndClose(ctx, 0, 0x1, "SETTINGS on non-zero stream: PROTOCOL_ERROR");
-        }
-        return;
+        try sendGoawayAndClose(ctx, ctx.last_stream_id.*, 0x1, "SETTINGS on non-zero stream");
+        return error.ProtocolError;
     }
     if ((frame.header.flags.value & FrameFlags.ACK) != 0) {
         if (frame.payload.len != 0) {
             if (!ctx.goaway_sent.*) {
                 try sendGoawayAndClose(ctx, 0, 0x6, "SETTINGS ACK with payload: FRAME_SIZE_ERROR");
             }
+            return error.FrameSizeError;
         }
         return;
     }
-    if (frame.payload.len % 6 != 0) {
+    if (frame.payload.len % protocol.settings_parameter_size != 0) {
         if (!ctx.goaway_sent.*) {
             try sendGoawayAndClose(ctx, 0, 0x6, "Invalid SETTINGS frame size: FRAME_SIZE_ERROR");
         }
-        return;
+        return error.FrameSizeError;
     }
 
     const buffer = frame.payload;
-    const buffer_len: u32 = @intCast(buffer.len);
-    var index: u32 = 0;
+    var index: usize = 0;
     var no_rfc7540: ?bool = null;
 
-    while (index + 6 <= buffer_len) {
+    while (index + protocol.settings_parameter_size <= buffer.len) {
         const setting_id = std.mem.readInt(u16, buffer[index..][0..2], .big);
         const setting_value = std.mem.readInt(u32, buffer[index + 2 ..][0..4], .big);
 
-        if (setting_id == settings_no_rfc7540_priorities_id) {
+        if (setting_id == protocol.settings_no_rfc7540_priorities_id) {
             if (setting_value == 0) {
                 no_rfc7540 = false;
             } else if (setting_value == 1) {
                 no_rfc7540 = true;
             } else {
                 if (!ctx.goaway_sent.*) {
-                    try sendGoawayAndClose(ctx, 0, 0x1, "Invalid SETTINGS_NO_RFC7540_PRIORITIES value: PROTOCOL_ERROR");
+                    try sendGoawayAndClose(
+                        ctx,
+                        0,
+                        0x1,
+                        "Invalid SETTINGS_NO_RFC7540_PRIORITIES value: PROTOCOL_ERROR",
+                    );
                 }
                 return error.ProtocolError;
             }
-        } else {
-            applySetting(ctx, setting_id, setting_value) catch |err| {
-                if (err == error.ProtocolError) return err;
-            };
-        }
-        index += 6;
+        } else try applySetting(ctx, setting_id, setting_value);
+        index += protocol.settings_parameter_size;
     }
 
     if (!ctx.peer_first_settings_received.*) {
@@ -841,48 +959,86 @@ fn applyFrameSettings(ctx: *DispatchContext, frame: Frame) !void {
             ctx.peer_no_rfc7540_priorities.* = val;
             ctx.peer_no_rfc7540_priorities_setting_received.* = true;
         }
+    } else if (no_rfc7540) |val| {
+        if (!ctx.peer_no_rfc7540_priorities_setting_received.* or
+            ctx.peer_no_rfc7540_priorities.* != val)
+        {
+            try sendGoawayAndClose(
+                ctx,
+                0,
+                0x1,
+                "SETTINGS_NO_RFC7540_PRIORITIES changed: PROTOCOL_ERROR",
+            );
+            return error.ProtocolError;
+        }
     }
     ctx.peer_first_settings_received.* = true;
 }
 
 fn applySetting(ctx: *DispatchContext, id: u16, value: u32) !void {
     switch (id) {
-        1 => {
-            ctx.settings.header_table_size = value;
-            ctx.hpack_encoder_table.setMaxAllowedSize(value);
+        protocol.settings_header_table_size_id => {
+            ctx.settings.peer_header_table_size = value;
+            ctx.hpack_encoder_table.setEncoderMaxAllowedSize(value);
         },
-        2 => {
+        protocol.settings_enable_push_id => {
             if (value != 0 and value != 1) {
                 if (!ctx.goaway_sent.*) {
-                    try sendGoawayAndClose(ctx, 0, 0x1, "Invalid SETTINGS_ENABLE_PUSH: PROTOCOL_ERROR");
+                    try sendGoawayAndClose(
+                        ctx,
+                        0,
+                        0x1,
+                        "Invalid SETTINGS_ENABLE_PUSH: PROTOCOL_ERROR",
+                    );
                 }
-                return;
+                return error.ProtocolError;
             }
-            ctx.settings.enable_push = value == 1;
-        },
-        3 => ctx.settings.max_concurrent_streams = value,
-        4 => {
-            if (value > 2147483647) {
+            // RFC 9113 § 6.5.2: a client treats ENABLE_PUSH=1 from a server
+            // as a connection-level PROTOCOL_ERROR.
+            if (ctx.role == .client and value == 1) {
                 if (!ctx.goaway_sent.*) {
-                    try sendGoawayAndClose(ctx, 0, 0x3, "SETTINGS_INITIAL_WINDOW_SIZE too large: FLOW_CONTROL_ERROR");
+                    try sendGoawayAndClose(ctx, 0, 0x1, "Server enabled push: PROTOCOL_ERROR");
                 }
-                return;
+                return error.ProtocolError;
             }
-            const old = ctx.settings.initial_window_size;
-            ctx.settings.initial_window_size = value;
+            ctx.settings.peer_enable_push = value == 1;
+        },
+        protocol.settings_max_concurrent_streams_id => ctx.settings.peer_max_concurrent_streams =
+            value,
+        protocol.settings_initial_window_size_id => {
+            if (value > protocol.flow_control_window_size_max) {
+                if (!ctx.goaway_sent.*) {
+                    try sendGoawayAndClose(
+                        ctx,
+                        0,
+                        0x3,
+                        "SETTINGS_INITIAL_WINDOW_SIZE too large: FLOW_CONTROL_ERROR",
+                    );
+                }
+                return error.FlowControlError;
+            }
+            const old = ctx.settings.peer_initial_window_size;
+            ctx.settings.peer_initial_window_size = value;
             const delta: i32 = @as(i32, @intCast(value)) - @as(i32, @intCast(old));
             try updateStreamWindows(ctx, delta);
         },
-        5 => {
-            if (value < 16384 or value > 16777215) {
+        protocol.settings_max_frame_size_id => {
+            if (value < protocol.frame_payload_size_default or
+                value > protocol.frame_payload_size_max)
+            {
                 if (!ctx.goaway_sent.*) {
-                    try sendGoawayAndClose(ctx, 0, 0x1, "Invalid SETTINGS_MAX_FRAME_SIZE: PROTOCOL_ERROR");
+                    try sendGoawayAndClose(
+                        ctx,
+                        0,
+                        0x1,
+                        "Invalid SETTINGS_MAX_FRAME_SIZE: PROTOCOL_ERROR",
+                    );
                 }
-                return;
+                return error.ProtocolError;
             }
             ctx.settings.peer_max_frame_size = value;
         },
-        6 => ctx.settings.max_header_list_size = value,
+        protocol.settings_max_header_list_size_id => ctx.settings.peer_max_header_list_size = value,
         else => {},
     }
 }
@@ -897,9 +1053,9 @@ fn updateStreamWindows(ctx: *DispatchContext, delta: i32) !void {
             if (!ctx.goaway_sent.*) {
                 try sendGoawayAndClose(ctx, 0, 0x3, "Stream window overflow: FLOW_CONTROL_ERROR");
             }
-            return;
+            return error.FlowControlError;
         }
         stream.send_window_size = @intCast(new_window);
-        stream.initial_window_size = ctx.settings.initial_window_size;
+        stream.initial_window_size = ctx.settings.peer_initial_window_size;
     }
 }

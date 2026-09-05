@@ -7,6 +7,7 @@
 //! simulated event.
 
 const std = @import("std");
+const protocol = @import("protocol.zig");
 const assert = std.debug.assert;
 const builtin = @import("builtin");
 
@@ -39,7 +40,7 @@ const max_trace_events = 256;
 const max_payload_size = 512;
 const max_response_body_size = 256;
 const max_reset_streams_tracked = 128;
-const min_frame_size = 16 * 1024;
+const min_frame_size = protocol.frame_payload_size_default;
 
 pub const FaultProfile = enum {
     perfect,
@@ -191,9 +192,9 @@ pub const Config = struct {
     packet_replay_probability: Prng.Ratio = Prng.Ratio.zero(),
     path_capacity: u8 = 8,
     packet_delay_ticks: u32 = 1,
-    max_frame_size: u32 = 16 * 1024,
-    hpack_table_size: usize = 4096,
-    initial_window_size: u32 = 65535,
+    max_frame_size: u32 = protocol.frame_payload_size_default,
+    hpack_table_size: usize = protocol.hpack_dynamic_table_size_default,
+    initial_window_size: u32 = protocol.flow_control_window_size_default,
     request_body_size: u16 = 0,
     response_body_size: u16 = 16,
     dpt_compare: bool = false,
@@ -232,9 +233,9 @@ fn optionsPerformance(seed: u64) Config {
         .packet_replay_probability = Prng.Ratio.zero(),
         .path_capacity = packet_sim.max_path_capacity,
         .packet_delay_ticks = 0,
-        .max_frame_size = 16 * 1024,
-        .hpack_table_size = 4096,
-        .initial_window_size = 65535,
+        .max_frame_size = protocol.frame_payload_size_default,
+        .hpack_table_size = protocol.hpack_dynamic_table_size_default,
+        .initial_window_size = protocol.flow_control_window_size_default,
         .request_body_size = 0,
         .response_body_size = 32,
         .dpt_thresholds = .{},
@@ -256,8 +257,16 @@ fn optionsSwarm(seed: u64, mode: Mode) Config {
         .path_capacity = random.range_inclusive(u8, 2, packet_sim.max_path_capacity),
         .packet_delay_ticks = random.range_inclusive(u32, 0, 8),
         .max_frame_size = random.range_inclusive(u32, min_frame_size, 32 * 1024),
-        .hpack_table_size = random.range_inclusive(usize, 128, 4096),
-        .initial_window_size = random.range_inclusive(u32, 1024, 65535),
+        .hpack_table_size = random.range_inclusive(
+            usize,
+            128,
+            protocol.hpack_dynamic_table_size_default,
+        ),
+        .initial_window_size = random.range_inclusive(
+            u32,
+            1024,
+            protocol.flow_control_window_size_default,
+        ),
         .request_body_size = random.range_inclusive(u16, 0, 256),
         .response_body_size = random.range_inclusive(u16, 0, max_response_body_size),
     };
@@ -435,8 +444,8 @@ const Simulator = struct {
         assert(config.max_frame_size >= min_frame_size);
         assert(config.request_body_size <= max_payload_size);
         assert(config.response_body_size <= max_response_body_size);
-        assert(config.hpack_table_size <= 4096);
-        assert(config.initial_window_size <= 65535);
+        assert(config.hpack_table_size <= protocol.hpack_dynamic_table_size_default);
+        assert(config.initial_window_size <= protocol.flow_control_window_size_default);
 
         self.allocator = allocator;
         self.random = Prng.init(config.seed);
@@ -474,6 +483,7 @@ const Simulator = struct {
         self.connection.hpack_encoder_table.setMaxAllowedSize(config.hpack_table_size);
         self.connection.settings.header_table_size = @intCast(config.hpack_table_size);
         self.connection.settings.initial_window_size = config.initial_window_size;
+        self.connection.settings.peer_initial_window_size = config.initial_window_size;
         self.connection.settings.peer_max_frame_size = config.max_frame_size;
         self.connection.recv_window_size = @intCast(config.initial_window_size);
         self.connection.send_window_size = @intCast(config.initial_window_size);
@@ -483,6 +493,7 @@ const Simulator = struct {
             &self.handler_state,
             SimHandlerState.dispatch,
         ));
+        try self.connection.handleFrameEventDriven(frame(.SETTINGS, 0, 0, ""));
 
         self.metrics.observeOutput(0, self.writer.written());
         try self.checkInvariants();
@@ -630,7 +641,7 @@ const Simulator = struct {
             stream_id,
             payload,
         ));
-        try self.applyWindowUpdate(0, 65535);
+        try self.applyWindowUpdate(0, protocol.flow_control_window_size_default);
     }
 
     fn applyPing(self: *Simulator) !void {

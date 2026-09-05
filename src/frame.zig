@@ -1,7 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
-const http2 = @import("http2.zig");
-const max_frame_size_default = http2.max_frame_size_default;
+const protocol = @import("protocol.zig");
+const max_frame_size_default = protocol.frame_payload_size_default;
 pub const FrameType = enum(u8) {
     DATA = 0x0,
     HEADERS = 0x1,
@@ -101,14 +101,14 @@ pub const FrameHeader = struct {
     reserved: bool,
     stream_id: u32,
     pub fn read(reader: *std.Io.Reader) !FrameHeader {
-        var buffer: [9]u8 = undefined;
+        var buffer: [protocol.frame_header_size]u8 = undefined;
         try reader.readSliceAll(&buffer);
         // Parse the 24-bit length from the first three bytes
         const length: u32 = (@as(u32, buffer[0]) << 16) |
             (@as(u32, buffer[1]) << 8) |
             @as(u32, buffer[2]);
         // Ensure the length is within 24 bits
-        if (length > 0xFFFFFF) {
+        if (length > protocol.frame_payload_size_max) {
             return error.InvalidFrameLength;
         }
         const frame_type_u8: u8 = buffer[3];
@@ -116,8 +116,8 @@ pub const FrameHeader = struct {
         const flags = FrameFlags.init(buffer[4]);
         // Parse the 31-bit stream ID from the last four bytes
         const stream_id_raw = std.mem.readInt(u32, buffer[5..9], .big);
-        const reserved: bool = (stream_id_raw & 0x80000000) != 0;
-        const stream_id: u32 = stream_id_raw & 0x7FFFFFFF;
+        const reserved: bool = (stream_id_raw & protocol.stream_identifier_reserved_bit) != 0;
+        const stream_id: u32 = stream_id_raw & protocol.stream_identifier_max;
         return FrameHeader{
             .length = length,
             .frame_type = frame_type,
@@ -127,9 +127,9 @@ pub const FrameHeader = struct {
         };
     }
     pub fn write(self: *FrameHeader, writer: *std.Io.Writer) !void {
-        var buffer: [9]u8 = undefined;
+        var buffer: [protocol.frame_header_size]u8 = undefined;
         // Ensure the length fits into 24 bits
-        if (self.length > 0xFFFFFF) {
+        if (self.length > protocol.frame_payload_size_max) {
             return error.InvalidFrameLength;
         }
         // Write the 24-bit length into the first three bytes
@@ -139,9 +139,9 @@ pub const FrameHeader = struct {
         buffer[3] = @intFromEnum(self.frame_type);
         buffer[4] = self.flags.value;
         // Combine the reserved bit and stream ID
-        var stream_id_raw: u32 = self.stream_id & 0x7FFFFFFF;
+        var stream_id_raw: u32 = self.stream_id & protocol.stream_identifier_max;
         if (self.reserved) {
-            stream_id_raw |= 0x80000000;
+            stream_id_raw |= protocol.stream_identifier_reserved_bit;
         }
         std.mem.writeInt(u32, buffer[5..9], stream_id_raw, .big);
         try writer.writeAll(&buffer);
@@ -152,6 +152,9 @@ pub const Frame = struct {
     header: FrameHeader,
     payload: []const u8,
     padding_length: ?u8 = null,
+    /// The wire type is unknown and its payload has already been consumed.
+    /// This keeps an ignored extension distinct from every valid frame.
+    ignored_extension: bool = false,
     pub fn init(header: FrameHeader, payload: []const u8) Frame {
         return Frame{ .header = header, .payload = payload };
     }
@@ -179,6 +182,7 @@ pub const Frame = struct {
         };
     }
     pub fn write(self: *Frame, writer: *std.Io.Writer) !void {
+        assert(!self.ignored_extension);
         // Write the frame header first
         try self.header.write(writer);
         // Write the payload only if it's not empty

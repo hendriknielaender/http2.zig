@@ -67,9 +67,10 @@ pub const MemBudget = struct {
     pub const stream_storage_lookup_bytes =
         256 * (@sizeOf(u32) + @sizeOf(u8)) +
         max_streams_per_connection * (@sizeOf(u32) + @sizeOf(bool));
+    pub const discarded_field_block_bytes = max_header_size_bytes + 32;
     pub const stream_storage_bytes =
         max_streams_per_connection * stream_instance_bytes +
-        stream_storage_lookup_bytes;
+        stream_storage_lookup_bytes + discarded_field_block_bytes;
 
     pub const connection_slot_overhead_bytes: usize = 64;
     pub const connection_slot_bytes =
