@@ -120,7 +120,7 @@ pub const Instance = struct {
     ) void {
         const changes = [_]posix.Kevent{.{
             .ident = ident,
-            .filter = @intFromEnum(filter),
+            .filter = @backingInt(filter),
             .flags = std.c.EV.ADD | std.c.EV.CLEAR,
             .fflags = 0,
             .data = 0,
@@ -135,12 +135,12 @@ pub const Instance = struct {
     /// any thread. Distinct signals never coalesce.
     pub fn signal(instance: *Instance, message: Signal) void {
         const changes = [_]posix.Kevent{.{
-            .ident = @intFromEnum(message),
+            .ident = @backingInt(message),
             .filter = std.c.EVFILT.USER,
             .flags = std.c.EV.ADD | std.c.EV.ONESHOT,
             .fflags = std.c.NOTE.TRIGGER,
             .data = 0,
-            .udata = @intFromEnum(message),
+            .udata = @backingInt(message),
         }};
         _ = kevent(instance.fd, &changes, &.{}, null) catch |err| {
             @panic(@errorName(err));
@@ -152,11 +152,11 @@ fn normalize(event: posix.Kevent) Event {
     // Signal idents are registered under EVFILT.USER and never collide with a
     // descriptor registration.
     if (event.filter == std.c.EVFILT.USER) {
-        return .{ .signal = @enumFromInt(event.udata) };
+        return .{ .signal = @fromBackingInt(@intCast(event.udata)) };
     }
     return .{ .ready = .{
         .ident = event.ident,
-        .filter = @enumFromInt(event.filter),
+        .filter = @fromBackingInt(@intCast(event.filter)),
         .completion = .{
             .flags = event.flags,
             .fflags = event.fflags,

@@ -50,7 +50,7 @@ comptime {
     assert(response_scheduler_rounds_per_flush > 0);
     assert(response_continuation_batches_per_turn > 0);
     assert(priority_frame_payload_size == 5);
-    assert(priority_update_frame_type == @intFromEnum(FrameType.PRIORITY_UPDATE));
+    assert(priority_update_frame_type == @backingInt(FrameType.PRIORITY_UPDATE));
     assert(priority_update_payload_id_size == 4);
     assert(protocol.settings_no_rfc7540_priorities_id == 0x9);
     assert(default_response_body.len == 68);
@@ -114,10 +114,10 @@ pub const Connection = struct {
             .stream_storage = stream_storage_ptr,
             .owned_stream_storage = null,
             .pending_stream_slots = undefined,
-            .pending_stream_queued = [_]bool{false} ** max_streams_per_connection,
+            .pending_stream_queued = @splat(false),
             .pending_stream_count = 0,
             .response_continuation_pending = false,
-            .pending_priority_updates = [_]PendingPriorityUpdate{.{}} ** max_streams_per_connection,
+            .pending_priority_updates = @splat(.{}),
             .completed_responses_pending = 0,
             .hpack_decoder_table = Hpack.DynamicTable.init(
                 protocol.hpack_dynamic_table_size_default,
@@ -298,7 +298,7 @@ pub const Connection = struct {
         self.stream_storage.in_use_count = 0;
         self.stream_storage.reset();
         self.pending_stream_count = 0;
-        self.pending_stream_queued = [_]bool{false} ** max_streams_per_connection;
+        self.pending_stream_queued = @splat(false);
         self.response_continuation_pending = false;
         self.completed_responses_pending = 0;
         self.hpack_decoder_table.deinit();
@@ -840,7 +840,7 @@ pub const Connection = struct {
 
         log.err(
             "Expected CONTINUATION on stream {d}; received type {d} on stream {d}",
-            .{ stream_id, @intFromEnum(frame.header.frame_type), frame.header.stream_id },
+            .{ stream_id, @backingInt(frame.header.frame_type), frame.header.stream_id },
         );
         try self.send_goaway(
             self.highest_stream_id(),
@@ -1602,14 +1602,12 @@ fn findSettingsValue(frame: []const u8, wanted_id: u16) ?u32 {
 }
 
 const streaming_test_counter_count = 2;
-threadlocal var streaming_test_read_counts =
-    [_]u32{0} ** streaming_test_counter_count;
-threadlocal var streaming_test_cleanup_counts =
-    [_]u32{0} ** streaming_test_counter_count;
+threadlocal var streaming_test_read_counts: [streaming_test_counter_count]u32 = @splat(0);
+threadlocal var streaming_test_cleanup_counts: [streaming_test_counter_count]u32 = @splat(0);
 
 fn resetStreamingTestCounters() void {
-    streaming_test_read_counts = [_]u32{0} ** streaming_test_counter_count;
-    streaming_test_cleanup_counts = [_]u32{0} ** streaming_test_counter_count;
+    streaming_test_read_counts = @splat(0);
+    streaming_test_cleanup_counts = @splat(0);
 }
 
 const StreamingTestSource = struct {
@@ -1694,14 +1692,14 @@ fn inspectResponseFrames(bytes: []const u8) !DataFrameStats {
         if (frame_end > bytes.len) return error.TruncatedTestFrame;
         const frame_type = bytes[offset + 3];
         const flags = bytes[offset + 4];
-        if (frame_type == @intFromEnum(FrameType.HEADERS)) stats.headers_count += 1;
-        if (frame_type == @intFromEnum(FrameType.DATA)) {
+        if (frame_type == @backingInt(FrameType.HEADERS)) stats.headers_count += 1;
+        if (frame_type == @backingInt(FrameType.DATA)) {
             stats.frame_count += 1;
             stats.body_bytes += payload_len;
             stats.maximum_frame_bytes = @max(stats.maximum_frame_bytes, payload_len);
             if ((flags & FrameFlags.END_STREAM) != 0) stats.end_stream_count += 1;
         }
-        if (frame_type == @intFromEnum(FrameType.RST_STREAM)) stats.rst_stream_count += 1;
+        if (frame_type == @backingInt(FrameType.RST_STREAM)) stats.rst_stream_count += 1;
         offset = frame_end;
     }
     return stats;
@@ -1891,7 +1889,7 @@ test "apply_frame_settings rejects oversized initial window with GOAWAY" {
 
     const written = test_io.written();
     try std.testing.expect(written.len >= 17);
-    try std.testing.expectEqual(@intFromEnum(FrameType.GOAWAY), written[3]);
+    try std.testing.expectEqual(@backingInt(FrameType.GOAWAY), written[3]);
 
     const goaway_error_code = std.mem.readInt(u32, written[13..17], .big);
     try std.testing.expectEqual(@as(u32, 0x3), goaway_error_code);
@@ -2193,9 +2191,9 @@ test "peer max frame size does not change local receive advertisement" {
 
 test "peer max frame size does not expand fixed inbound frame capacity" {
     const oversized_header = [_]u8{
-        0x00,                         0x40, 0x01,
-        @intFromEnum(FrameType.DATA), 0x00, 0x00,
-        0x00,                         0x00, 0x01,
+        0x00,                        0x40, 0x01,
+        @backingInt(FrameType.DATA), 0x00, 0x00,
+        0x00,                        0x00, 0x01,
     };
     var output: [1024]u8 = undefined;
     var test_io = TestIo.init(&oversized_header, &output);
@@ -2219,7 +2217,7 @@ test "peer max frame size does not expand fixed inbound frame capacity" {
     try std.testing.expect(connection.goaway_sent);
     const written = test_io.written();
     try std.testing.expect(written.len >= 17);
-    try std.testing.expectEqual(@intFromEnum(FrameType.GOAWAY), written[3]);
+    try std.testing.expectEqual(@backingInt(FrameType.GOAWAY), written[3]);
     try std.testing.expectEqual(
         @as(u32, 0x6),
         std.mem.readInt(u32, written[13..17], .big),
@@ -2530,7 +2528,7 @@ test "send_settings advertises SETTINGS_NO_RFC7540_PRIORITIES in first SETTINGS 
     const written = test_io.written();
     const settings_offset = http2_preface.len;
     try std.testing.expectEqual(
-        @as(u8, @intFromEnum(FrameType.SETTINGS)),
+        @as(u8, @backingInt(FrameType.SETTINGS)),
         written[settings_offset + 3],
     );
 
@@ -2631,7 +2629,7 @@ test "PRIORITY_UPDATE with prioritized stream ID zero sends PROTOCOL_ERROR" {
     const written = test_io.written();
     try std.testing.expect(written.len > write_offset_before + 16);
     try std.testing.expectEqual(
-        @intFromEnum(FrameType.GOAWAY),
+        @backingInt(FrameType.GOAWAY),
         written[write_offset_before + 3],
     );
 }
@@ -3042,7 +3040,7 @@ test "event-driven PRIORITY frame rejects payload lengths other than five octets
     const written = test_io.written();
     try std.testing.expect(written.len > write_offset_before + 16);
     try std.testing.expectEqual(
-        @intFromEnum(FrameType.GOAWAY),
+        @backingInt(FrameType.GOAWAY),
         written[write_offset_before + 3],
     );
     const goaway_error_code = (@as(u32, written[write_offset_before + 13]) << 24) |
@@ -3088,7 +3086,7 @@ test "optimized PRIORITY dispatch validates payload size before ignoring idle st
     const written = test_io.written();
     try std.testing.expect(written.len > write_offset_before + 16);
     try std.testing.expectEqual(
-        @intFromEnum(FrameType.GOAWAY),
+        @backingInt(FrameType.GOAWAY),
         written[write_offset_before + 3],
     );
     const goaway_error_code = (@as(u32, written[write_offset_before + 13]) << 24) |
@@ -3151,7 +3149,7 @@ test "RFC 9113 3.4 requires SETTINGS as the first peer frame" {
 
     var input = std.ArrayList(u8).initBuffer(try allocator.alloc(u8, 128));
     input.appendSliceBounded(http2_preface) catch unreachable;
-    appendTestFrame(&input, @intFromEnum(FrameType.PING), 0, 0, "12345678");
+    appendTestFrame(&input, @backingInt(FrameType.PING), 0, 0, "12345678");
 
     var output: [2048]u8 = undefined;
     var test_io = TestIo.init(input.items, &output);
@@ -3170,7 +3168,7 @@ test "RFC 9113 3.4 requires SETTINGS as the first peer frame" {
     while (offset + 9 <= written.len) {
         const length: usize = (@as(usize, written[offset]) << 16) |
             (@as(usize, written[offset + 1]) << 8) | written[offset + 2];
-        if (written[offset + 3] == @intFromEnum(FrameType.GOAWAY)) saw_goaway = true;
+        if (written[offset + 3] == @backingInt(FrameType.GOAWAY)) saw_goaway = true;
         offset += 9 + length;
     }
     try std.testing.expect(saw_goaway);
@@ -3243,7 +3241,7 @@ test "DATA exceeding connection receive credit sends FLOW_CONTROL_ERROR" {
     );
     try std.testing.expect(connection.goaway_sent);
     const written = test_io.written();
-    try std.testing.expectEqual(@intFromEnum(FrameType.GOAWAY), written[3]);
+    try std.testing.expectEqual(@backingInt(FrameType.GOAWAY), written[3]);
     try std.testing.expectEqual(
         @as(u32, 0x3),
         std.mem.readInt(u32, written[13..17], .big),
@@ -3299,7 +3297,7 @@ test "malformed trailer remains a stream error without a 400 or GOAWAY" {
 
     const written = test_io.written();
     try std.testing.expectEqual(@as(usize, 13), written.len);
-    try std.testing.expectEqual(@intFromEnum(FrameType.RST_STREAM), written[3]);
+    try std.testing.expectEqual(@backingInt(FrameType.RST_STREAM), written[3]);
     try std.testing.expect(!connection.goaway_sent);
 }
 
@@ -3345,7 +3343,7 @@ test "trailer section without END_STREAM remains a stream error" {
     });
     try std.testing.expectEqual(@as(usize, 13), test_io.written().len);
     try std.testing.expectEqual(
-        @intFromEnum(FrameType.RST_STREAM),
+        @backingInt(FrameType.RST_STREAM),
         test_io.written()[3],
     );
     try std.testing.expect(!connection.goaway_sent);

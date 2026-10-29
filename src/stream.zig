@@ -53,85 +53,85 @@ const StreamEvent = enum(u4) {
 
 // Generate state transition table at compile time
 const TRANSITION_TABLE = blk: {
-    const num_states = @typeInfo(StreamState).@"enum".fields.len;
-    const num_events = @typeInfo(StreamEvent).@"enum".fields.len;
+    const num_states = @typeInfo(StreamState).@"enum".field_names.len;
+    const num_events = @typeInfo(StreamEvent).@"enum".field_names.len;
 
     var table: [num_states][num_events]StreamState = undefined;
 
     // Initialize all transitions as invalid (same state)
     for (0..num_states) |s| {
         for (0..num_events) |e| {
-            table[s][e] = @enumFromInt(s);
+            table[s][e] = @fromBackingInt(@intCast(s));
         }
     }
 
     // Define valid HTTP/2 state transitions explicitly
     // From Idle
-    table[@intFromEnum(StreamState.Idle)][@intFromEnum(StreamEvent.RecvHeaders)] = StreamState.Open;
-    table[@intFromEnum(StreamState.Idle)][@intFromEnum(StreamEvent.SendHeaders)] = StreamState.Open;
+    table[@backingInt(StreamState.Idle)][@backingInt(StreamEvent.RecvHeaders)] = StreamState.Open;
+    table[@backingInt(StreamState.Idle)][@backingInt(StreamEvent.SendHeaders)] = StreamState.Open;
 
     // From Open
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.Open,
         )
-    ][@intFromEnum(StreamEvent.RecvEndStream)] = StreamState.HalfClosedRemote;
+    ][@backingInt(StreamEvent.RecvEndStream)] = StreamState.HalfClosedRemote;
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.Open,
         )
-    ][@intFromEnum(StreamEvent.SendEndStream)] = StreamState.HalfClosedLocal;
+    ][@backingInt(StreamEvent.SendEndStream)] = StreamState.HalfClosedLocal;
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.Open,
         )
-    ][@intFromEnum(StreamEvent.RecvRstStream)] = StreamState.Closed;
+    ][@backingInt(StreamEvent.RecvRstStream)] = StreamState.Closed;
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.Open,
         )
-    ][@intFromEnum(StreamEvent.SendRstStream)] = StreamState.Closed;
+    ][@backingInt(StreamEvent.SendRstStream)] = StreamState.Closed;
 
     // From HalfClosedLocal
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.HalfClosedLocal,
         )
-    ][@intFromEnum(StreamEvent.RecvEndStream)] = StreamState.Closed;
+    ][@backingInt(StreamEvent.RecvEndStream)] = StreamState.Closed;
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.HalfClosedLocal,
         )
-    ][@intFromEnum(StreamEvent.RecvRstStream)] = StreamState.Closed;
+    ][@backingInt(StreamEvent.RecvRstStream)] = StreamState.Closed;
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.HalfClosedLocal,
         )
-    ][@intFromEnum(StreamEvent.SendRstStream)] = StreamState.Closed;
+    ][@backingInt(StreamEvent.SendRstStream)] = StreamState.Closed;
 
     // From HalfClosedRemote
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.HalfClosedRemote,
         )
-    ][@intFromEnum(StreamEvent.SendEndStream)] = StreamState.Closed;
+    ][@backingInt(StreamEvent.SendEndStream)] = StreamState.Closed;
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.HalfClosedRemote,
         )
-    ][@intFromEnum(StreamEvent.RecvRstStream)] = StreamState.Closed;
+    ][@backingInt(StreamEvent.RecvRstStream)] = StreamState.Closed;
     table[
-        @intFromEnum(
+        @backingInt(
             StreamState.HalfClosedRemote,
         )
-    ][@intFromEnum(StreamEvent.SendRstStream)] = StreamState.Closed;
+    ][@backingInt(StreamEvent.SendRstStream)] = StreamState.Closed;
 
     break :blk table;
 };
 
 // Compile-time state machine transition function
 pub fn transitionState(current: StreamState, event: StreamEvent) StreamState {
-    return TRANSITION_TABLE[@intFromEnum(current)][@intFromEnum(event)];
+    return TRANSITION_TABLE[@backingInt(current)][@backingInt(event)];
 }
 
 // Compile-time stream configuration with assertions
@@ -1416,36 +1416,36 @@ pub const DefaultStream = Stream(
 comptime {
     const Instance = DefaultStream.StreamInstance;
     const Budget = memory_budget.MemBudget;
-    const fields = @typeInfo(Instance).@"struct".fields;
+    const info = @typeInfo(Instance).@"struct";
     var found_header_fragments: bool = false;
     var found_headers_storage: bool = false;
     var found_request_body: bool = false;
     var found_response_body: bool = false;
     var found_headers_array: bool = false;
-    for (fields) |struct_field| {
-        if (std.mem.eql(u8, struct_field.name, "header_block_fragments_buf")) {
+    for (info.field_names, info.field_types) |field_name, field_type| {
+        if (std.mem.eql(u8, field_name, "header_block_fragments_buf")) {
             found_header_fragments = true;
-            if (@sizeOf(struct_field.type) != Budget.stream_header_fragments_bytes) {
+            if (@sizeOf(field_type) != Budget.stream_header_fragments_bytes) {
                 @compileError("stream_header_fragments_bytes budget mismatch");
             }
-        } else if (std.mem.eql(u8, struct_field.name, "headers_bytes_storage")) {
+        } else if (std.mem.eql(u8, field_name, "headers_bytes_storage")) {
             found_headers_storage = true;
-            if (@sizeOf(struct_field.type) != Budget.stream_headers_storage_bytes) {
+            if (@sizeOf(field_type) != Budget.stream_headers_storage_bytes) {
                 @compileError("stream_headers_storage_bytes budget mismatch");
             }
-        } else if (std.mem.eql(u8, struct_field.name, "request_body_storage")) {
+        } else if (std.mem.eql(u8, field_name, "request_body_storage")) {
             found_request_body = true;
-            if (@sizeOf(struct_field.type) != Budget.stream_request_body_bytes) {
+            if (@sizeOf(field_type) != Budget.stream_request_body_bytes) {
                 @compileError("stream_request_body_bytes budget mismatch");
             }
-        } else if (std.mem.eql(u8, struct_field.name, "response_body_storage")) {
+        } else if (std.mem.eql(u8, field_name, "response_body_storage")) {
             found_response_body = true;
-            if (@sizeOf(struct_field.type) != Budget.stream_response_body_bytes) {
+            if (@sizeOf(field_type) != Budget.stream_response_body_bytes) {
                 @compileError("stream_response_body_bytes budget mismatch");
             }
-        } else if (std.mem.eql(u8, struct_field.name, "headers_storage")) {
+        } else if (std.mem.eql(u8, field_name, "headers_storage")) {
             found_headers_array = true;
-            if (@sizeOf(struct_field.type) != Budget.stream_headers_array_bytes) {
+            if (@sizeOf(field_type) != Budget.stream_headers_array_bytes) {
                 @compileError("stream_headers_array_bytes budget mismatch");
             }
         }

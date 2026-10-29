@@ -122,7 +122,7 @@ pub const ResponseWriter = struct {
         const status_code = try std.fmt.bufPrint(
             &status_storage,
             "{d}",
-            .{@intFromEnum(response.status)},
+            .{@backingInt(response.status)},
         );
 
         try Hpack.encodeHeaderField(

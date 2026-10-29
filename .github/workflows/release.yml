@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ZIG_VERSION: 0.16.0
+  ZIG_VERSION: 0.17.0
   ZLINT_VERSION: v0.7.9
   BORINGSSL_CACHE_VERSION: v1
 
@@ -145,7 +145,7 @@ jobs:
           path: boringssl/build
 
       - name: Run CI checks
-        run: zig build ci -- test
+        run: zig build ci -Dci-mode=test
 
       - name: Generate documentation
         run: zig build docs

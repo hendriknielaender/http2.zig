@@ -746,7 +746,7 @@ test "deterministic output with same seed" {
     var pipe_a_a = SimPipe.init(&net_a, 0);
     var pipe_b_a = SimPipe.init(&net_b, 0);
 
-    const data = [_]u8{0} ** 500;
+    const data: [500]u8 = @splat(0);
     try pipe_a_a.writer().writeAll(&data);
     try pipe_b_a.writer().writeAll(&data);
 

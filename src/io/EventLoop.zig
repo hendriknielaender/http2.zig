@@ -1521,7 +1521,7 @@ const GroupState = extern struct {
 comptime {
     assert(@sizeOf(GroupState) <= @sizeOf(usize));
     assert(@alignOf(GroupState) <= @alignOf(usize));
-    assert(@intFromEnum(std.atomic.Mutex.unlocked) == 0);
+    assert(@backingInt(std.atomic.Mutex.unlocked) == 0);
 }
 
 fn groupState(group: *Io.Group) *GroupState {
@@ -1586,9 +1586,8 @@ const vtable: Io.VTable = blk: {
     vt.netAccept = netAccept;
     vt.netBindIp = netBindIp;
     vt.netConnectIp = netConnectIp;
-    vt.netRead = netRead;
-    vt.netWrite = netWrite;
-    vt.netSend = netSend;
+    // Zig 0.17 routes socket reads, writes, and sends through `operate`.
+    vt.operate = operate;
     vt.netClose = netClose;
     vt.netShutdown = netShutdown;
 
@@ -2446,6 +2445,38 @@ fn netConnectUnix(
     @panic("TODO");
 }
 
+fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+    switch (operation) {
+        .net_read => |o| {
+            // Ancillary data is not supported by this backend.
+            assert(o.control.len == 0);
+            const data_len = netRead(userdata, o.socket_handle, o.data) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| return .{ .net_read = e },
+            };
+            return .{ .net_read = .{ .data_len = data_len } };
+        },
+        .net_write => |o| {
+            assert(o.control.len == 0);
+            const written = netWrite(
+                userdata,
+                o.socket_handle,
+                o.header,
+                o.data,
+                o.splat,
+            ) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| return .{ .net_write = e },
+            };
+            return .{ .net_write = written };
+        },
+        .net_send => |o| return .{
+            .net_send = netSend(userdata, o.socket_handle, o.messages, o.flags),
+        },
+        else => return Io.failing.vtable.operate(userdata, operation),
+    }
+}
+
 fn netSend(
     userdata: ?*anyopaque,
     handle: net.Socket.Handle,
@@ -2591,7 +2622,7 @@ fn netRead(
             .NOMEM => return error.SystemResources,
             .NOTCONN => return error.SocketUnconnected,
             .CONNRESET => return error.ConnectionResetByPeer,
-            .TIMEDOUT => return error.Timeout,
+            .TIMEDOUT => return error.ConnectionTimedOut,
             .PIPE => return error.SocketUnconnected,
             .NETDOWN => return error.NetworkDown,
             else => |err| return posix.unexpectedErrno(err),
@@ -2701,11 +2732,11 @@ fn expectIovecEqual(expected: []const u8, actual: posix.iovec_const) !void {
     try std.testing.expectEqualStrings(expected, actual.base[0..actual.len]);
 }
 
-fn netClose(userdata: ?*anyopaque, handles: []const net.Socket.Handle) void {
+fn netClose(userdata: ?*anyopaque, sockets: []const net.Socket) void {
     const loop: *EventLoop = @ptrCast(@alignCast(userdata));
-    for (handles) |handle| {
-        loop.wakeFd(handle);
-        closeFd(handle);
+    for (sockets) |socket| {
+        loop.wakeFd(socket.handle);
+        closeFd(socket.handle);
     }
 }
 
@@ -2829,9 +2860,15 @@ fn openSocketPosix(
     };
     errdefer closeFd(socket_fd);
 
-    if (options.ip6_only) {
+    if (options.ip6_only) |ip6_only| {
         if (posix.IPV6 == void) return error.OptionUnsupported;
-        try setSocketOption(loop, socket_fd, posix.IPPROTO.IPV6, posix.IPV6.V6ONLY, 0);
+        try setSocketOption(
+            loop,
+            socket_fd,
+            posix.IPPROTO.IPV6,
+            posix.IPV6.V6ONLY,
+            @intFromBool(ip6_only),
+        );
     }
 
     return socket_fd;

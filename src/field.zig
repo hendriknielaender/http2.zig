@@ -19,7 +19,7 @@ const value_byte_allowed: [256]bool = buildByteTable(valueByteIsAllowed);
 /// Validation runs per field on the request hot path, so the per-byte test is
 /// a load rather than a chain of comparisons.
 fn buildByteTable(comptime predicate: fn (u8) bool) [256]bool {
-    var table = [_]bool{false} ** 256;
+    var table: [256]bool = @splat(false);
     var byte: usize = 0;
     while (byte < table.len) : (byte += 1) {
         table[byte] = predicate(@intCast(byte));

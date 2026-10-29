@@ -136,7 +136,7 @@ pub const FrameHeader = struct {
         buffer[0] = @intCast((self.length >> 16) & 0xFF);
         buffer[1] = @intCast((self.length >> 8) & 0xFF);
         buffer[2] = @intCast(self.length & 0xFF);
-        buffer[3] = @intFromEnum(self.frame_type);
+        buffer[3] = @backingInt(self.frame_type);
         buffer[4] = self.flags.value;
         // Combine the reserved bit and stream ID
         var stream_id_raw: u32 = self.stream_id & protocol.stream_identifier_max;

@@ -256,7 +256,7 @@ test "shuffle preserves all elements" {
 
 test "index returns valid index" {
     var prng = Self.init(1);
-    const arr = [_]u8{0} ** 10;
+    const arr: [10]u8 = @splat(0);
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
         const idx = prng.index(&arr);
