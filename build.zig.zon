@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .boring = .{
-            .url = "https://github.com/hendriknielaender/boring/archive/8d052e54727e1f93d4540c14d9fe9b7e7adc16d0.tar.gz",
-            .hash = "boring-0.1.0-K6muvkJICQAXO7n4AjCxmchMTv3M5S7YELAfF5HD48rR",
+            .url = "https://github.com/hendriknielaender/boring/archive/d676c654cbfcc51ca7a7980b93be695d80ae997b.tar.gz",
+            .hash = "boring-0.1.0-K6muvgFICQA_ZdPABCoX51q2HYGzgFKF85YW6y3BabQm",
         },
         .turboapi_core = .{
             .url = "git+https://github.com/justrach/turboapi-core.git?ref=main#de313afac2f5f84132e85042bd9eead9c81dfba8",
