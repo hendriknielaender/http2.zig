@@ -56,7 +56,7 @@ jobs:
             exit 0
           fi
 
-          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Wno-discarded-qualifiers
           cmake --build boringssl/build --parallel
 
       - name: Upload BoringSSL artifact
