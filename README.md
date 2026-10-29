@@ -12,7 +12,7 @@
 Cross-platform protocol core • Static event-loop runtime
 
 [![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/hendriknielaender/http2.zig/blob/HEAD/LICENSE)
-[![Zig 0.16.0](https://img.shields.io/badge/zig-0.16.0-orange.svg)](https://ziglang.org)
+[![Zig 0.17.0](https://img.shields.io/badge/zig-0.17.0-orange.svg)](https://ziglang.org)
 [![std.Io](https://img.shields.io/badge/powered%20by-std.Io-brightgreen.svg)](https://ziglang.org/)
 
 </div>
@@ -432,7 +432,7 @@ pub const ServerStats = struct {
 
 ### Requirements
 
-- Zig v0.16.0
+- Zig v0.17.0
 
 ### Build Commands
 
@@ -506,7 +506,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Acknowledgments
 
-- Built with Zig 0.16 std.Io
+- Built with Zig 0.17 std.Io
 - Inspired by [TigerBeetle](https://tigerbeetle.com)'s zero-allocation principles
 - HTTP/2 Specification - [RFC 9113](https://www.rfc-editor.org/rfc/rfc9113) (obsoletes RFC 7540)
 - HPACK Specification - [RFC 7541](https://www.rfc-editor.org/rfc/rfc7541)

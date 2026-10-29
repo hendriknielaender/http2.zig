@@ -185,8 +185,8 @@ fn add_simulators(
 
     const run_dst = b.addRunArtifact(sim_exe);
     run_dst.addArg("--dst");
-    if (b.args) |args| run_dst.addArgs(args);
-    hide_stderr(run_dst);
+    run_dst.addPassthruArgs();
+    expect_success(run_dst);
     const dst_step = b.step("dst", "Run deterministic HTTP/2 simulation testing");
     dst_step.dependOn(&run_dst.step);
     ci.dst = dst_step;
@@ -194,16 +194,16 @@ fn add_simulators(
     const run_dst_swarm = b.addRunArtifact(sim_exe);
     run_dst_swarm.addArg("--dst");
     run_dst_swarm.addArg("--swarm");
-    if (b.args) |args| run_dst_swarm.addArgs(args);
-    hide_stderr(run_dst_swarm);
+    run_dst_swarm.addPassthruArgs();
+    expect_success(run_dst_swarm);
     const dst_swarm_step = b.step("dst-swarm", "Run deterministic HTTP/2 swarm simulation testing");
     dst_swarm_step.dependOn(&run_dst_swarm.step);
 
     const run_dpt = b.addRunArtifact(sim_exe);
     run_dpt.addArg("--dpt");
     run_dpt.addArg("--profile=hpack_pressure");
-    if (b.args) |args| run_dpt.addArgs(args);
-    hide_stderr(run_dpt);
+    run_dpt.addPassthruArgs();
+    expect_success(run_dpt);
     const dpt_step = b.step("dpt", "Run deterministic HTTP/2 performance testing");
     dpt_step.dependOn(&run_dpt.step);
 
@@ -211,8 +211,8 @@ fn add_simulators(
     run_dpt_baseline.addArg("--dpt");
     run_dpt_baseline.addArg("--dpt-baseline");
     run_dpt_baseline.addArg("--profile=hpack_pressure");
-    if (b.args) |args| run_dpt_baseline.addArgs(args);
-    hide_stderr(run_dpt_baseline);
+    run_dpt_baseline.addPassthruArgs();
+    expect_success(run_dpt_baseline);
     const dpt_baseline_step = b.step("dpt-baseline", "Print deterministic HTTP/2 performance baseline");
     dpt_baseline_step.dependOn(&run_dpt_baseline.step);
 
@@ -220,8 +220,8 @@ fn add_simulators(
     run_dpt_compare.addArg("--dpt");
     run_dpt_compare.addArg("--dpt-compare");
     run_dpt_compare.addArg("--profile=hpack_pressure");
-    if (b.args) |args| run_dpt_compare.addArgs(args);
-    hide_stderr(run_dpt_compare);
+    run_dpt_compare.addPassthruArgs();
+    expect_success(run_dpt_compare);
     const dpt_compare_step = b.step("dpt-compare", "Compare deterministic HTTP/2 performance against thresholds");
     dpt_compare_step.dependOn(&run_dpt_compare.step);
     ci.dpt_compare = dpt_compare_step;
@@ -320,7 +320,7 @@ fn add_streaming_example(
     build_streaming.dependOn(&executable.step);
 
     const run_streaming = b.addRunArtifact(executable);
-    if (b.args) |args| run_streaming.addArgs(args);
+    run_streaming.addPassthruArgs();
     const run_step = b.step(
         "run-streaming",
         "Run the static HTTP/2 streaming example",
@@ -617,16 +617,10 @@ fn add_ci(b: *std.Build, ci: CiDeps) void {
 
     const CIMode = enum { smoke, @"test", full };
 
-    const mode: CIMode = if (b.args) |args| mode: {
-        if (args.len != 1) {
-            step_ci.dependOn(&b.addFail("usage: zig build ci -- <smoke|test|full>").step);
-            return;
-        }
-        break :mode std.meta.stringToEnum(CIMode, args[0]) orelse {
-            step_ci.dependOn(&b.addFail("usage: zig build ci -- <smoke|test|full>").step);
-            return;
-        };
-    } else .@"test";
+    // Build scripts can no longer observe `-- <args>` at configure time, so the
+    // mode is a build option instead.
+    const mode = b.option(CIMode, "ci-mode", "CI suite to run: smoke, test, or full") orelse
+        .@"test";
 
     const all = mode == .full;
     const default = all or mode == .@"test";
@@ -641,38 +635,25 @@ fn add_ci(b: *std.Build, ci: CiDeps) void {
     }
 }
 
-// Hide a step's stderr unless it fails, keeping CI output clean.
-fn hide_stderr(run: *std.Build.Step.Run) void {
-    const b = run.step.owner;
+// Require a zero exit code and always rerun. Zig 0.17 splits the build into a
+// configurer and a maker, so a step's make function can no longer be wrapped
+// to hide stderr on success.
+fn expect_success(run: *std.Build.Step.Run) void {
     run.addCheck(.{ .expect_term = .{ .exited = 0 } });
     run.has_side_effects = true;
-
-    const Override = struct {
-        var global_map: std.AutoHashMapUnmanaged(usize, std.Build.Step.MakeFn) = .{};
-
-        fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
-            const original = global_map.get(@intFromPtr(step)).?;
-            try original(step, options);
-            step.result_stderr = "";
-        }
-    };
-
-    const original = run.step.makeFn;
-    Override.global_map.put(b.allocator, @intFromPtr(&run.step), original) catch @panic("OOM");
-    run.step.makeFn = &Override.make;
 }
 
 /// Add code quality and formatting checks
 fn add_code_quality_checks(b: *std.Build, ci: *CiDeps) void {
     // Format check
     const fmt_check = b.addFmt(.{
-        .paths = &[_][]const u8{
+        .paths = b.pathList(&.{
             "build.zig",
             "src/",
             "examples/",
             "benchmarks/",
             "tools/",
-        },
+        }),
         .check = true,
     });
     const fmt_check_step = b.step("fmt-check", "Check code formatting");
@@ -681,13 +662,13 @@ fn add_code_quality_checks(b: *std.Build, ci: *CiDeps) void {
 
     // Format fix
     const fmt_fix = b.addFmt(.{
-        .paths = &[_][]const u8{
+        .paths = b.pathList(&.{
             "build.zig",
             "src/",
             "examples/",
             "benchmarks/",
             "tools/",
-        },
+        }),
         .check = false,
     });
     const fmt_fix_step = b.step("fmt", "Fix code formatting");

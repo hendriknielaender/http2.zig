@@ -27,11 +27,11 @@ pub fn isExpectedError(err: anyerror) bool {
 }
 
 pub fn packetFrameType(frame_type: FrameType) packet_sim.FrameType {
-    return @enumFromInt(@intFromEnum(frame_type));
+    return @fromBackingInt(@intCast(@backingInt(frame_type)));
 }
 
 pub fn coreFrameType(frame_type: packet_sim.FrameType) FrameType {
-    return @enumFromInt(@intFromEnum(frame_type));
+    return @fromBackingInt(@intCast(@backingInt(frame_type)));
 }
 
 pub fn frameFromPacket(packet: *const Packet) Frame {

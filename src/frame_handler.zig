@@ -37,31 +37,31 @@ comptime {
 }
 
 const FrameHandler = enum(u8) {
-    data = @intFromEnum(FrameType.DATA),
-    headers = @intFromEnum(FrameType.HEADERS),
-    priority = @intFromEnum(FrameType.PRIORITY),
-    rst_stream = @intFromEnum(FrameType.RST_STREAM),
-    settings = @intFromEnum(FrameType.SETTINGS),
-    push_promise = @intFromEnum(FrameType.PUSH_PROMISE),
-    ping = @intFromEnum(FrameType.PING),
-    goaway = @intFromEnum(FrameType.GOAWAY),
-    window_update = @intFromEnum(FrameType.WINDOW_UPDATE),
-    continuation = @intFromEnum(FrameType.CONTINUATION),
-    priority_update = @intFromEnum(FrameType.PRIORITY_UPDATE),
+    data = @backingInt(FrameType.DATA),
+    headers = @backingInt(FrameType.HEADERS),
+    priority = @backingInt(FrameType.PRIORITY),
+    rst_stream = @backingInt(FrameType.RST_STREAM),
+    settings = @backingInt(FrameType.SETTINGS),
+    push_promise = @backingInt(FrameType.PUSH_PROMISE),
+    ping = @backingInt(FrameType.PING),
+    goaway = @backingInt(FrameType.GOAWAY),
+    window_update = @backingInt(FrameType.WINDOW_UPDATE),
+    continuation = @backingInt(FrameType.CONTINUATION),
+    priority_update = @backingInt(FrameType.PRIORITY_UPDATE),
 
     pub fn fromFrameType(frame_type: u8) ?FrameHandler {
         return switch (frame_type) {
-            @intFromEnum(FrameType.DATA) => .data,
-            @intFromEnum(FrameType.HEADERS) => .headers,
-            @intFromEnum(FrameType.PRIORITY) => .priority,
-            @intFromEnum(FrameType.RST_STREAM) => .rst_stream,
-            @intFromEnum(FrameType.SETTINGS) => .settings,
-            @intFromEnum(FrameType.PUSH_PROMISE) => .push_promise,
-            @intFromEnum(FrameType.PING) => .ping,
-            @intFromEnum(FrameType.GOAWAY) => .goaway,
-            @intFromEnum(FrameType.WINDOW_UPDATE) => .window_update,
-            @intFromEnum(FrameType.CONTINUATION) => .continuation,
-            @intFromEnum(FrameType.PRIORITY_UPDATE) => .priority_update,
+            @backingInt(FrameType.DATA) => .data,
+            @backingInt(FrameType.HEADERS) => .headers,
+            @backingInt(FrameType.PRIORITY) => .priority,
+            @backingInt(FrameType.RST_STREAM) => .rst_stream,
+            @backingInt(FrameType.SETTINGS) => .settings,
+            @backingInt(FrameType.PUSH_PROMISE) => .push_promise,
+            @backingInt(FrameType.PING) => .ping,
+            @backingInt(FrameType.GOAWAY) => .goaway,
+            @backingInt(FrameType.WINDOW_UPDATE) => .window_update,
+            @backingInt(FrameType.CONTINUATION) => .continuation,
+            @backingInt(FrameType.PRIORITY_UPDATE) => .priority_update,
             else => null,
         };
     }
@@ -129,7 +129,7 @@ pub const DispatchContext = struct {
 pub fn dispatchFrameOptimized(ctx: *DispatchContext, frame: Frame) !void {
     if (frame.ignored_extension) return;
 
-    const frame_type_u8 = @intFromEnum(frame.header.frame_type);
+    const frame_type_u8 = @backingInt(frame.header.frame_type);
     const frame_handler = FrameHandler.fromFrameType(frame_type_u8) orelse {
         log.debug("Ignoring unknown frame type {d} on stream {d}", .{
             frame_type_u8,

@@ -23,7 +23,7 @@ fn firstPayload(bytes: []const u8, kind: FrameType) ?[]const u8 {
         const size = (@as(usize, bytes[offset]) << 16) |
             (@as(usize, bytes[offset + 1]) << 8) | bytes[offset + 2];
         if (offset + 9 + size > bytes.len) return null;
-        if (bytes[offset + 3] == @intFromEnum(kind)) return bytes[offset + 9 .. offset + 9 + size];
+        if (bytes[offset + 3] == @backingInt(kind)) return bytes[offset + 9 .. offset + 9 + size];
         offset += 9 + size;
     }
     return null;
@@ -284,7 +284,7 @@ test "RFC 9113 discard buffer exhaustion closes with COMPRESSION_ERROR" {
     defer connection.deinit();
     try connection.handleFrameEventDriven(makeFrame(.SETTINGS, 0, 0, &.{}));
     connection.settings.max_concurrent_streams = 0;
-    const block = [_]u8{0x82} ** capacity;
+    const block: [capacity]u8 = @splat(0x82);
     try connection.handleFrameEventDriven(makeFrame(.HEADERS, 1, 1, &block));
     try connection.handleFrameEventDriven(makeFrame(.CONTINUATION, 4, 1, &.{0x82}));
     const goaway = firstPayload(test_io.written(), .GOAWAY).?;
@@ -350,7 +350,7 @@ test "RFC 9113 all representable HEADERS padding lengths permit an empty fragmen
         );
         defer connection.deinit();
         try connection.handleFrameEventDriven(makeFrame(.SETTINGS, 0, 0, &.{}));
-        var payload = [_]u8{0} ** 256;
+        var payload: [256]u8 = @splat(0);
         payload[0] = padding;
         const size = @as(usize, padding) + 1;
         try connection.handleFrameEventDriven(makeFrame(.HEADERS, 9, 1, payload[0..size]));

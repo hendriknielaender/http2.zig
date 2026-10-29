@@ -191,7 +191,7 @@ pub const Hpack = struct {
 
         pub fn init(max_size: usize) DynamicTable {
             return DynamicTable{
-                .entries = [_]?OwnedHeaderField{null} ** MAX_DYNAMIC_TABLE_ENTRIES,
+                .entries = @splat(null),
                 .head = 0,
                 .count = 0,
                 .current_size = 0,
@@ -250,7 +250,7 @@ pub const Hpack = struct {
         }
 
         fn clearTable(self: *DynamicTable) void {
-            self.entries = [_]?OwnedHeaderField{null} ** MAX_DYNAMIC_TABLE_ENTRIES;
+            self.entries = @splat(null);
             self.head = 0;
             self.count = 0;
             self.current_size = 0;
@@ -434,7 +434,7 @@ pub const Hpack = struct {
             }
 
             self.storage = compacted;
-            self.entries = [_]?OwnedHeaderField{null} ** MAX_DYNAMIC_TABLE_ENTRIES;
+            self.entries = @splat(null);
             self.storage_used = compacted_used;
 
             for (layouts[0..layouts_count]) |layout| {

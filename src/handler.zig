@@ -703,14 +703,14 @@ fn streamStateIsInlineOwned(comptime Value: type) bool {
         .optional => |optional| streamStateIsInlineOwned(optional.child),
         .error_union => |error_union| streamStateIsInlineOwned(error_union.payload),
         .@"struct" => |structure| owned: {
-            for (structure.fields) |struct_field| {
-                if (!streamStateIsInlineOwned(struct_field.type)) break :owned false;
+            for (structure.field_types) |field_type| {
+                if (!streamStateIsInlineOwned(field_type)) break :owned false;
             }
             break :owned true;
         },
         .@"union" => |union_info| owned: {
-            for (union_info.fields) |union_field| {
-                if (!streamStateIsInlineOwned(union_field.type)) break :owned false;
+            for (union_info.field_types) |field_type| {
+                if (!streamStateIsInlineOwned(field_type)) break :owned false;
             }
             break :owned true;
         },

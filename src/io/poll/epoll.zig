@@ -310,7 +310,7 @@ pub const Instance = struct {
 };
 
 fn signalBit(message: Signal) u32 {
-    return @as(u32, 1) << @intCast(@intFromEnum(message));
+    return @as(u32, 1) << @intCast(@backingInt(message));
 }
 
 fn readyEvent(ident: usize, filter: Filter, events: u32) Event {

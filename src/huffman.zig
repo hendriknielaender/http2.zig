@@ -17,7 +17,7 @@ pub const Huffman = struct {
         _,
 
         fn byte(symbol: DecodeSymbol) ?u8 {
-            const value = @intFromEnum(symbol);
+            const value = @backingInt(symbol);
             assert(value <= 256 or value == std.math.maxInt(u16));
             if (value < 256) {
                 return @intCast(value);
@@ -305,7 +305,7 @@ pub const Huffman = struct {
         @setEvalBranchQuota(10000);
 
         var trie = DecodeTrie{
-            .nodes = [_]DecodeNode{.{}} ** decode_nodes_max,
+            .nodes = @splat(.{}),
             .count = 1,
         };
 
@@ -326,7 +326,7 @@ pub const Huffman = struct {
             }
 
             const symbol: DecodeSymbol = switch (entry.symbol) {
-                .byte => |value| @enumFromInt(value),
+                .byte => |value| @fromBackingInt(@intCast(value)),
                 .eos => .eos,
             };
             assert(trie.nodes[node_index].symbol == .none);

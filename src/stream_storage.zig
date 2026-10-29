@@ -49,10 +49,10 @@ pub const StreamStorage = struct {
     pub fn init(self: *Self) void {
         self.* = .{
             .slots = undefined,
-            .ids = [_]u32{0} ** max_streams_per_connection,
-            .in_use = [_]bool{false} ** max_streams_per_connection,
-            .lookup_ids = [_]u32{0} ** lookup_capacity,
-            .lookup_indices = [_]u8{slot_index_empty} ** lookup_capacity,
+            .ids = @splat(0),
+            .in_use = @splat(false),
+            .lookup_ids = @splat(0),
+            .lookup_indices = @splat(slot_index_empty),
             .in_use_count = 0,
         };
     }
@@ -140,8 +140,8 @@ pub const StreamStorage = struct {
         self.discarded_headers.reset();
         @memset(&self.lookup_ids, 0);
         @memset(&self.lookup_indices, slot_index_empty);
-        self.in_use = [_]bool{false} ** max_streams_per_connection;
-        self.ids = [_]u32{0} ** max_streams_per_connection;
+        self.in_use = @splat(false);
+        self.ids = @splat(0);
         self.in_use_count = 0;
     }
 

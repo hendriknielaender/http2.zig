@@ -260,8 +260,8 @@ const ClientOracle = struct {
 };
 
 const ClusterChecker = struct {
-    highest_client_stream_id: [max_peers]u32 = [_]u32{0} ** max_peers,
-    last_goaway_stream_id: [max_peers]u32 = [_]u32{0} ** max_peers,
+    highest_client_stream_id: [max_peers]u32 = @splat(0),
+    last_goaway_stream_id: [max_peers]u32 = @splat(0),
     reset_streams: [max_reset_streams_tracked]StreamKey = undefined,
     reset_stream_count: u32 = 0,
     routes: [max_tracked_streams]StreamRoute = undefined,

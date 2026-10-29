@@ -51,12 +51,7 @@ pub const FaultProfile = enum {
     recovery_after_goaway,
 
     pub fn parse(name: []const u8) ?FaultProfile {
-        inline for (std.meta.fields(FaultProfile)) |field| {
-            if (std.mem.eql(u8, name, field.name)) {
-                return @enumFromInt(field.value);
-            }
-        }
-        return null;
+        return std.meta.stringToEnum(FaultProfile, name);
     }
 };
 
@@ -153,12 +148,12 @@ pub const Metrics = struct {
 
             self.frames_out += 1;
             switch (delta[offset + 3]) {
-                @intFromEnum(FrameType.GOAWAY) => self.goaway_sent += 1,
-                @intFromEnum(FrameType.RST_STREAM) => self.rst_stream_sent += 1,
-                @intFromEnum(FrameType.PING) => self.ping_sent += 1,
-                @intFromEnum(FrameType.WINDOW_UPDATE) => self.window_update_sent += 1,
-                @intFromEnum(FrameType.HEADERS) => self.response_headers_sent += 1,
-                @intFromEnum(FrameType.DATA) => self.response_data_sent += 1,
+                @backingInt(FrameType.GOAWAY) => self.goaway_sent += 1,
+                @backingInt(FrameType.RST_STREAM) => self.rst_stream_sent += 1,
+                @backingInt(FrameType.PING) => self.ping_sent += 1,
+                @backingInt(FrameType.WINDOW_UPDATE) => self.window_update_sent += 1,
+                @backingInt(FrameType.HEADERS) => self.response_headers_sent += 1,
+                @backingInt(FrameType.DATA) => self.response_data_sent += 1,
                 else => {},
             }
 
@@ -310,8 +305,7 @@ const Http2StateChecker = struct {
     highest_stream_id: u32 = 0,
     last_goaway_stream_id: u32 = 0,
     goaway_seen: bool = false,
-    reset_streams: [max_reset_streams_tracked]u32 =
-        [_]u32{0} ** max_reset_streams_tracked,
+    reset_streams: [max_reset_streams_tracked]u32 = @splat(0),
     reset_stream_count: u32 = 0,
 
     fn onRequest(self: *Http2StateChecker, stream_id: u32) void {
@@ -828,7 +822,7 @@ fn encodeRequestHeaders(
 
 pub fn run(allocator: std.mem.Allocator, config: Config) !Metrics {
     comptime {
-        assert(builtin.mode != .ReleaseSmall);
+        assert(builtin.mode != .small);
     }
 
     const sim = try allocator.create(Simulator);

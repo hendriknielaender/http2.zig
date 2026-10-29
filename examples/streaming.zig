@@ -8,11 +8,24 @@
 const std = @import("std");
 const http2 = @import("http2");
 
+/// Comptime string repetition; array multiplication was removed in Zig 0.17.
+fn repeat(comptime text: []const u8, comptime count: comptime_int) *const [text.len * count:0]u8 {
+    const result = comptime result: {
+        var buffer: [text.len * count:0]u8 = undefined;
+        for (0..count) |index| {
+            @memcpy(buffer[index * text.len ..][0..text.len], text);
+        }
+        buffer[text.len * count] = 0;
+        break :result buffer;
+    };
+    return &result;
+}
+
 const chunk_repetitions = 120;
 const chunks = [_][]const u8{
-    "first application chunk\n" ** chunk_repetitions,
-    "second application chunk\n" ** chunk_repetitions,
-    "third and final application chunk\n" ** chunk_repetitions,
+    repeat("first application chunk\n", chunk_repetitions),
+    repeat("second application chunk\n", chunk_repetitions),
+    repeat("third and final application chunk\n", chunk_repetitions),
 };
 
 const ChunkSource = struct {

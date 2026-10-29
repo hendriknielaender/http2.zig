@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  ZIG_VERSION: 0.16.0
+  ZIG_VERSION: 0.17.0
   BORINGSSL_CACHE_VERSION: v2
 
 defaults:
@@ -69,14 +69,14 @@ jobs:
             exit 0
           fi
 
-          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Wno-discarded-qualifiers
           cmake --build boringssl/build --target ssl crypto --parallel
 
       - name: Build release artifacts
         run: zig build -Doptimize=ReleaseFast -Dboringssl-lib-path=boringssl/build
 
       - name: Run CI checks
-        run: zig build ci -Dboringssl-lib-path=boringssl/build -- test
+        run: zig build ci -Dboringssl-lib-path=boringssl/build -Dci-mode=test
 
   docs:
     name: Docs
@@ -151,7 +151,7 @@ jobs:
             exit 0
           fi
 
-          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release
+          cmake -S boringssl -B boringssl/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS=-Wno-discarded-qualifiers
           cmake --build boringssl/build --target ssl crypto --parallel
 
       - name: Build benchmark server

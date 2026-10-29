@@ -2,6 +2,19 @@
 
 const std = @import("std");
 
+/// Comptime string repetition; array multiplication was removed in Zig 0.17.
+fn repeat(comptime text: []const u8, comptime count: comptime_int) *const [text.len * count:0]u8 {
+    const result = comptime result: {
+        var buffer: [text.len * count:0]u8 = undefined;
+        for (0..count) |index| {
+            @memcpy(buffer[index * text.len ..][0..text.len], text);
+        }
+        buffer[text.len * count] = 0;
+        break :result buffer;
+    };
+    return &result;
+}
+
 const max_columns: usize = 100;
 const max_function_lines: usize = 70;
 const max_source_bytes: usize = 2 * 1024 * 1024;
@@ -63,7 +76,7 @@ fn checkSource(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !usize {
     );
     defer gpa.free(source);
 
-    var tree = try std.zig.Ast.parse(gpa, source, .zig);
+    var tree = try std.zig.Ast.parse(gpa, source, .{ .mode = .zig });
     defer tree.deinit(gpa);
 
     var violations = checkColumns(path, source, .{ .start = 0, .end = source.len });
@@ -93,7 +106,7 @@ fn checkSourceRegion(
 
     const range = findSourceRange(path, source, start_marker, end_marker) orelse return 1;
 
-    var tree = try std.zig.Ast.parse(gpa, source, .zig);
+    var tree = try std.zig.Ast.parse(gpa, source, .{ .mode = .zig });
     defer tree.deinit(gpa);
 
     var violations = checkColumns(path, source, range);
@@ -186,7 +199,7 @@ fn checkFunctionLengths(
     var violations: usize = 0;
     var node_index: usize = 1;
     while (node_index < tree.nodes.len) : (node_index += 1) {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(node_index);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(node_index));
         if (tree.nodeTag(node) != .fn_decl) continue;
 
         const function_lines = functionLineCount(tree, node);
@@ -255,12 +268,12 @@ fn typeDeclarationLines(tree: *const std.zig.Ast, first: u32, last: u32) usize {
 }
 
 fn testFunctionLines(source: [:0]const u8, name: []const u8) !usize {
-    var tree = try std.zig.Ast.parse(std.testing.allocator, source, .zig);
+    var tree = try std.zig.Ast.parse(std.testing.allocator, source, .{ .mode = .zig });
     defer tree.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), tree.errors.len);
     var index: usize = 1;
     while (index < tree.nodes.len) : (index += 1) {
-        const node: std.zig.Ast.Node.Index = @enumFromInt(index);
+        const node: std.zig.Ast.Node.Index = @fromBackingInt(@intCast(index));
         if (tree.nodeTag(node) != .fn_decl) continue;
         var buffer: [1]std.zig.Ast.Node.Index = undefined;
         const proto = tree.fullFnProto(&buffer, node).?;
@@ -273,20 +286,20 @@ fn testFunctionLines(source: [:0]const u8, name: []const u8) !usize {
 
 test "type factory declarations do not hide long nested methods" {
     const source = "fn Factory() type {\nreturn struct {\n" ++
-        "value: u8,\n" ** 80 ++ "fn nested() void {\n" ++
-        "_ = 0;\n" ** 75 ++ "}\n};\n}\n";
+        repeat("value: u8,\n", 80) ++ "fn nested() void {\n" ++
+        repeat("_ = 0;\n", 75) ++ "}\n};\n}\n";
     try std.testing.expect(try testFunctionLines(source, "Factory") <= max_function_lines);
     try std.testing.expect(try testFunctionLines(source, "nested") > max_function_lines);
 }
 
 test "type factories retain the limit on outer executable statements" {
-    const source = "fn Factory() type {\n" ++ "_ = 0;\n" ** 75 ++
+    const source = "fn Factory() type {\n" ++ repeat("_ = 0;\n", 75) ++
         "return struct {\nvalue: u8,\n};\n}\n";
     try std.testing.expect(try testFunctionLines(source, "Factory") > max_function_lines);
 }
 
 test "ordinary functions retain physical line accounting" {
     const source = "fn ordinary() void {\nconst T = struct {\n" ++
-        "value: u8,\n" ** 80 ++ "};\n_ = T;\n}\n";
+        repeat("value: u8,\n", 80) ++ "};\n_ = T;\n}\n";
     try std.testing.expect(try testFunctionLines(source, "ordinary") > max_function_lines);
 }
